@@ -8,12 +8,13 @@
 
 use anyhow::Result;
 use fckdb::cache::RingCache;
-use fckdb::doc::{Doc, Filter, Hit, Id, Record};
+use fckdb::doc::{Doc, Filter, Hit, Id, Include, Op, Record};
 use fckdb::ops::{self, Pricing};
 use fckdb::server::{AppState, Auth, router, serve};
 use fckdb::store::{GroupCommit, Namespace, open_store};
 use fckdb::wire::{Consistency, QueryRequest};
 use fckdb::index;
+use fckdb::value::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -157,8 +158,9 @@ async fn run_e2e() -> Result<()> {
 
     print!("[4]  indexed query (cold) ..... ");
     let cold_ns = Namespace::new(store.clone(), ns.prefix.clone());
+    let t = Instant::now();
     let res = cold_ns.query(&QueryRequest::new(q.clone()).top_k(top_k).nprobe(nprobe)).await?;
-    let cold = Duration::from_millis(res.took_ms);
+    let cold = t.elapsed();
     println!(
         "{:.0?}  {} GETs  indexed={}  recall@{top_k}={:.0}%",
         cold,
@@ -192,8 +194,9 @@ async fn run_e2e() -> Result<()> {
     );
 
     print!("[7]  cached query ............. ");
+    let t = Instant::now();
     let res = warm_ns.query(&QueryRequest::new(q.clone()).top_k(top_k).nprobe(nprobe)).await?;
-    let warm = Duration::from_millis(res.took_ms);
+    let warm = t.elapsed();
     let (hits, misses, evictions) = cache.stats();
     println!(
         "{:.0?}  {} GETs  (cache {hits} hit / {misses} miss / {evictions} evict)",
@@ -245,17 +248,78 @@ async fn run_e2e() -> Result<()> {
         )
         .await?;
     let live = Namespace::materialize(ns.all_records().await?);
-    let clean = f.hits.iter().all(|h| live[&h.id].attrs["tenant"] == "a");
+    let clean = f.hits.iter().all(|h| live[&h.id].attrs["tenant"] == Value::from("a"));
     println!("{} hits, all tenant=a: {clean}", f.hits.len());
     assert!(clean, "filter leaked a foreign tenant");
 
+    // -------------------------------------------------- parity: typed attrs
+    print!("[11] typed filter + patch ..... ");
+    let base = fckdb::value::parse_datetime("2024-03-01T00:00:00Z")?;
+    let day = 86_400_000_000_000i64;
+    let typed: Vec<Record> = (0..40u64)
+        .map(|i| {
+            Record::Upsert(
+                Doc::new(1_000_000 + i, vec![1.0; dim])
+                    .with_attr("when", Value::Datetime(base + i as i64 * day))
+                    .with_attr("rank", Value::Uint(i))
+                    .with_attr("tags", Value::StringArray(vec![format!("t{}", i % 3)])),
+            )
+        })
+        .collect();
+    ns.write_records(&typed).await?;
+    let cutoff = Value::Datetime(base + 20 * day);
+    let tf = ns
+        .query(
+            &QueryRequest::new(vec![1.0; dim])
+                .top_k(100)
+                .nprobe(nprobe)
+                .include(Include::Only(vec!["rank".into()]))
+                .filter(Filter::And(vec![
+                    Filter::cmp("when", Op::Gte, cutoff),
+                    Filter::cmp("tags", Op::Contains, "t1"),
+                ])),
+        )
+        .await?;
+    let ranks: Vec<u64> = tf
+        .hits
+        .iter()
+        .filter_map(|h| match h.attrs.get("rank") {
+            Some(Value::Uint(r)) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    let ok_typed = !ranks.is_empty() && ranks.iter().all(|r| *r >= 20 && r % 3 == 1);
+
+    // Patch one of them and confirm it applies over the index.
+    ns.write_records(&[Record::Patch {
+        id: 1_000_000,
+        attrs: std::collections::BTreeMap::from([("rank".to_string(), Value::Uint(999))]),
+    }])
+    .await?;
+    let patched = ns
+        .query(
+            &QueryRequest::new(vec![1.0; dim])
+                .top_k(100)
+                .nprobe(nprobe)
+                .include(Include::All)
+                .filter(Filter::eq("rank", 999u64)),
+        )
+        .await?;
+    let ok_patch = patched.hits.iter().any(|h| h.id == 1_000_000);
+    println!(
+        "{} typed hits (all rank>=20 and rank%3==1: {ok_typed}), patch visible over index: {ok_patch}",
+        tf.hits.len()
+    );
+    assert!(ok_typed, "typed range/array filter selected the wrong documents");
+    assert!(ok_patch, "patch was not visible through the indexed query path");
+
     // -------------------------------------------------- phase 9: HTTP surface
-    print!("[11] HTTP surface ............. ");
+    print!("[12] HTTP surface ............. ");
     let http = http_smoke(store.clone()).await?;
     println!("{http}");
 
     // -------------------------------------------------- phase 10: operations
-    print!("[12] GC ....................... ");
+    print!("[13] GC ....................... ");
     let spared = ns.gc(Duration::from_secs(3600)).await?;
     let swept = ns.gc(Duration::ZERO).await?;
     println!(
@@ -265,7 +329,7 @@ async fn run_e2e() -> Result<()> {
     let post_gc = ns.query(&QueryRequest::new(q.clone()).top_k(top_k).nprobe(nprobe)).await?;
     assert_eq!(post_gc.hits.len(), top_k, "GC destroyed live data");
 
-    print!("[13] branch ................... ");
+    print!("[14] branch ................... ");
     let dest = format!("ns/e2e-{run}-branch");
     let copied = ns.branch(&dest).await?;
     let branched = Namespace::new(store.clone(), dest.clone());
@@ -273,7 +337,7 @@ async fn run_e2e() -> Result<()> {
     println!("{copied} objects copied, branch returns {} hits", bres.hits.len());
     assert_eq!(bres.hits, post_gc.hits, "branch is not a faithful copy");
 
-    print!("[14] metadata ................. ");
+    print!("[15] metadata ................. ");
     let md = ns.metadata().await?;
     println!(
         "{} indexed docs, {} clusters, {} unindexed, {} KiB total, backpressure={}",
@@ -288,10 +352,19 @@ async fn run_e2e() -> Result<()> {
     let snap = ns.metrics.snapshot();
     let cost = ops::estimate(&snap, md.total_bytes, started.elapsed(), &Pricing::from_env());
     println!("\nlatency  brute={:.0?}  cold-indexed={:.0?}  warm-cached={:.0?}", brute, cold, warm);
+    // Ratios are only meaningful once the measurements are above timer noise; an
+    // in-memory backend finishes in microseconds and would report nonsense.
+    let ratio = |a: Duration, b: Duration| {
+        if b.as_micros() < 200 || a.as_micros() < 200 {
+            "n/a (below timer noise)".to_string()
+        } else {
+            format!("{:.1}x", a.as_secs_f64() / b.as_secs_f64())
+        }
+    };
     println!(
-        "speedup  index {:.1}x over brute, cache {:.1}x over cold",
-        brute.as_secs_f64() / cold.as_secs_f64().max(1e-9),
-        cold.as_secs_f64() / warm.as_secs_f64().max(1e-9)
+        "speedup  index {} over brute, cache {} over cold",
+        ratio(brute, cold),
+        ratio(cold, warm)
     );
     println!(
         "requests {} GET / {} PUT / {} DELETE / {} LIST, {} CAS conflicts",

@@ -4,4 +4,5 @@ pub mod index;
 pub mod ops;
 pub mod server;
 pub mod store;
+pub mod value;
 pub mod wire;

@@ -79,10 +79,6 @@ impl Auth {
         if let Ok(single) = std::env::var("FCKDB_TOKEN") {
             return Self { tokens: vec![(single, "default".into())] };
         }
-        tracing::warn!(
-            "no FCKDB_TOKEN or FCKDB_TOKENS set: authentication is DISABLED and every \
-             request is treated as org 'default'. Do not expose this port."
-        );
         Self::default()
     }
 
@@ -579,6 +575,12 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(state: AppState, addr: &str) -> Result<()> {
     spawn_compactor(state.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    if state.auth.disabled() {
+        tracing::warn!(
+            "no FCKDB_TOKEN or FCKDB_TOKENS set: authentication is DISABLED and every \
+             request is treated as org 'default'. Do not expose this port."
+        );
+    }
     tracing::info!(
         "listening on {} (auth {})",
         listener.local_addr()?,
@@ -795,6 +797,125 @@ mod tests {
         .await;
         assert_eq!(res["indexed"], true);
         assert_eq!(res["hits"][0]["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn typed_attributes_and_tuple_filters_over_http() {
+        let state = test_state();
+        let body = json!({ "upsert": [
+            { "id": 1, "vector": [1.0, 0.0],
+              "attrs": { "lang": "id", "rank": 10, "public": true,
+                         "when": "2024-03-05T00:00:00Z", "tags": ["a", "b"] } },
+            { "id": 2, "vector": [0.9, 0.1],
+              "attrs": { "lang": "en", "rank": 20, "public": false,
+                         "when": "2024-01-01T00:00:00Z", "tags": ["b"] } },
+            { "id": 3, "vector": [0.8, 0.2],
+              "attrs": { "lang": "id", "rank": 30, "public": true,
+                         "when": "2024-06-01T00:00:00Z", "tags": ["c"] } },
+        ]});
+        let (status, res) =
+            call(&state, "POST", "/v1/namespaces/typed/write", Some(TOKEN_A), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        call(&state, "POST", "/v1/namespaces/typed/compact", Some(TOKEN_A), None).await;
+
+        // turbopuffer's tuple filter grammar, straight off the wire.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/typed/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "vector": [1.0, 0.0],
+                "top_k": 10,
+                "nprobe": 32,
+                "filter": ["And", [["lang", "Eq", "id"], ["rank", "Gte", 20]]],
+                "include_attributes": ["lang", "rank"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let hits = res["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "typed filter matched the wrong set: {res}");
+        assert_eq!(hits[0]["id"], 3);
+        // Projection: exactly what was asked for, and typed as sent.
+        assert_eq!(hits[0]["attrs"]["lang"], "id");
+        assert_eq!(hits[0]["attrs"]["rank"], 30);
+        assert_eq!(hits[0]["attrs"].as_object().unwrap().len(), 2);
+
+        // Or / Not / Glob / Contains all reachable from JSON.
+        let cases: Vec<(Value, Vec<u64>)> = vec![
+            (json!(["Or", [["rank", "Eq", 10], ["rank", "Eq", 30]]]), vec![1, 3]),
+            (json!(["Not", ["public", "Eq", true]]), vec![2]),
+            (json!(["lang", "Glob", "i*"]), vec![1, 3]),
+            (json!(["tags", "Contains", "b"]), vec![1, 2]),
+            (json!(["rank", "In", [10, 20]]), vec![1, 2]),
+        ];
+        for (filter, expected) in cases {
+            let (status, res) = call(
+                &state,
+                "POST",
+                "/v1/namespaces/typed/query",
+                Some(TOKEN_A),
+                Some(json!({ "vector": [1.0, 0.0], "top_k": 10, "nprobe": 32, "filter": filter })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "filter {filter} -> {res}");
+            let mut got: Vec<u64> =
+                res["hits"].as_array().unwrap().iter().map(|h| h["id"].as_u64().unwrap()).collect();
+            got.sort();
+            assert_eq!(got, expected, "filter {filter} selected the wrong documents");
+        }
+
+        // include_attributes: true returns everything.
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/typed/query",
+            Some(TOKEN_A),
+            Some(json!({ "vector": [1.0, 0.0], "top_k": 1, "include_attributes": true })),
+        )
+        .await;
+        assert_eq!(res["hits"][0]["attrs"].as_object().unwrap().len(), 5);
+        // A datetime sent as a string comes back as a string, unchanged, because
+        // nothing has declared it a datetime yet.
+        assert_eq!(res["hits"][0]["attrs"]["when"], "2024-03-05T00:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn malformed_filters_are_rejected_not_ignored() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v1/namespaces/badf/write",
+            Some(TOKEN_A),
+            Some(json!({ "upsert": [doc(1, vec![1.0, 0.0])] })),
+        )
+        .await;
+        for filter in [
+            json!("nonsense"),
+            json!([]),
+            json!(["And", []]),
+            json!(["Frobnicate", [["a", "Eq", 1]]]),
+            json!(["a", "Frobnicate", 1]),
+            json!([1, "Eq", 1]),
+        ] {
+            let (status, res) = call(
+                &state,
+                "POST",
+                "/v1/namespaces/badf/query",
+                Some(TOKEN_A),
+                Some(json!({ "vector": [1.0, 0.0], "filter": filter })),
+            )
+            .await;
+            // A filter that cannot be parsed must fail the request. Silently
+            // dropping it would return unfiltered data to a caller who believes
+            // it was filtered — the worst possible outcome for a tenancy filter.
+            assert!(
+                status.is_client_error(),
+                "filter {filter} was accepted with {status}: {res}"
+            );
+        }
     }
 
     #[tokio::test]

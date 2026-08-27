@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn recall_counts_overlap() {
-        let h = |id, score| Hit { id, score };
+        let h = |id, score| Hit::new(id, score);
         let exact = vec![h(1, 1.0), h(2, 0.9), h(3, 0.8), h(4, 0.7)];
         assert_eq!(recall(&exact, &exact), 1.0);
         assert_eq!(recall(&exact, &exact[..2]), 0.5);

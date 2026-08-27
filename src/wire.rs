@@ -4,7 +4,7 @@
 //! server cannot drift, and the e2e driver exercises the same shapes real
 //! clients send.
 
-use crate::doc::{Doc, Filter, Id};
+use crate::doc::{Doc, Filter, Id, Include};
 pub use crate::doc::Hit;
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,9 @@ pub struct QueryRequest {
     pub nprobe: usize,
     #[serde(default)]
     pub consistency: Consistency,
+    /// Which attributes to return: `true`, `false`, or a list of names.
+    #[serde(default)]
+    pub include_attributes: Include,
 }
 
 impl QueryRequest {
@@ -51,6 +54,7 @@ impl QueryRequest {
             filter: None,
             nprobe: default_nprobe(),
             consistency: Consistency::Strong,
+            include_attributes: Include::None,
         }
     }
     pub fn top_k(mut self, k: usize) -> Self {
@@ -67,6 +71,10 @@ impl QueryRequest {
     }
     pub fn consistency(mut self, c: Consistency) -> Self {
         self.consistency = c;
+        self
+    }
+    pub fn include(mut self, i: Include) -> Self {
+        self.include_attributes = i;
         self
     }
 }

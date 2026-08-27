@@ -186,7 +186,8 @@ another's data.
 curl -s -X POST localhost:8080/v1/namespaces/docs/query \
   -H 'authorization: Bearer $TOKEN' -H 'content-type: application/json' \
   -d '{"vector":[1,0],"top_k":2,
-       "filter":{"eq":["lang","id"]},
+       "filter":["And",[["lang","Eq","id"],["rank","Gte",20]]],
+       "include_attributes":["lang","rank"],
        "consistency":{"mode":"eventual","max_age_ms":60000}}'
 ```
 
@@ -195,7 +196,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 62 tests
+cargo test                       # 95 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -244,9 +245,10 @@ architecture*, not a drop-in replacement.
 | Write body | `upsert_rows`, `upsert_columns`, `patch_rows`, `patch_by_filter`, `deletes`, `delete_by_filter` | `upsert`, `delete` |
 | Query rank | `rank_by: ["vector","ANN",[…]]`; also kNN, BM25, SparseKNN, order-by-attr, `Embed` | `vector: […]`, cosine ANN only |
 | Result limit | `limit` | `top_k` |
-| Filters | `("And", (("ts","Gte",…),("public","Eq",true)))`; Gt/Lt/In/Glob/Regex | `{"eq":["k","v"]}`; Eq/Ne/And/Or, strings only |
+| Filters | `("And", (("ts","Gte",…),("public","Eq",true)))`; Gt/Lt/In/Glob/Regex | ✅ **same tuple grammar**: Eq/NotEq/Gt/Gte/Lt/Lte/In/NotIn/Glob/IGlob/Contains/Regex + And/Or/Not |
 | Score | `$dist` — a **distance**, lower is better | `score` — a **similarity**, higher is better |
-| Attributes | typed (uint, bool, array, uuid, datetime) + schema, `include_attributes` | `string → string`, and **never returned** |
+| Attributes | typed + schema, `include_attributes` | ✅ **typed** (bool, uint, int, f64, string, datetime, uuid, []string, []uint) + `include_attributes`; schema *declaration* still pending |
+| Partial update | `patch_rows`, `patch_columns` | ✅ `Record::Patch` — merge, with null removing an attribute |
 | Aggregations | `aggregate_by`, group-by | none |
 | Multi-vector, sharding, CMEK | yes | no |
 
@@ -255,6 +257,39 @@ Reaching the *common subset* (row upserts, deletes, ANN rank_by, simple filters,
 two real engine gaps: returning attributes at all, and typed attribute values for
 range filters. Everything past that — BM25, sparse vectors, aggregations,
 patches, filter-based writes — is new engine work, not adapter work.
+
+### Parity progress
+
+Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
+
+**Done**
+
+- Typed attribute values (`value.rs`): bool, uint, int, f64, string, datetime,
+  uuid, `[]string`, `[]uint` — with a binary codec, JSON inference, and ordering
+  that returns *incomparable* rather than equal across mismatched types
+- turbopuffer's tuple filter grammar, all operators, `And`/`Or`/`Not` nesting
+- `include_attributes`: `true`, `false`, or a list
+- `Record::Patch` — partial update, applied identically by compaction and by the
+  query-time WAL overlay
+
+**Next, in dependency order**
+
+1. Namespace **schema**: declared types in the manifest, type-consistency
+   enforcement, and coercion of the strings JSON cannot type (`uuid`, `datetime`)
+2. **Document ids** as uint *or* string *or* uuid (currently `u64` only)
+3. `distance_metric` per namespace, honoured by centroid assignment too
+4. `upsert_columns` / `patch_columns`, `patch_by_filter` / `delete_by_filter`
+5. The `/v2` compatibility router: endpoint paths, `rank_by`, `limit`, `$dist`
+   sign flip, `rows_affected`
+6. Order by attribute, `kNN` exact search (already the brute-force path)
+7. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
+   each its own project
+
+Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
+a similarity, so the conversion inverts ordering — that needs a test asserting
+the inversion, not just the field name. And a string that happens to look like a
+UUID stays a string until a schema says otherwise; inferring from content would
+make an attribute's type depend on which document you looked at first.
 
 ### Verify your backend first
 
@@ -277,7 +312,6 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Full-rewrite compaction, needs live set in RAM | `Namespace::compact` | leveled/tiered compaction |
 | Write throughput = `MAX_BATCH_LEN` ÷ commit latency | `store` | raise the cap; ~257 docs/s observed |
 | Filters evaluated per candidate during the scan | `doc::Filter` | inverted attribute index |
-| Attribute values are strings only | `doc::Doc` | typed values for range filters |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |
 | Blocking `pread` on the async runtime | `cache::RingCache` | `spawn_blocking` or io_uring |
 | Static tokens, no rotation or scopes | `server::Auth` | real key management |

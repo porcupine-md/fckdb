@@ -13,7 +13,7 @@
 //! failed CAS leaves garbage rather than corruption, and GC is a set difference.
 
 use crate::cache::RingCache;
-use crate::doc::{Doc, Filter, Id, Record};
+use crate::doc::{Doc, Filter, Id, Include, Record};
 use crate::index::{self, IndexMeta, IvfParams};
 use crate::wire::{
     CompactResponse, Consistency, GcResponse, Hit, NamespaceMetadata, QueryRequest, QueryResponse,
@@ -501,16 +501,9 @@ impl Namespace {
 
     /// Apply records in order: later upserts win, tombstones remove.
     pub fn materialize(records: Vec<Record>) -> HashMap<Id, Doc> {
-        let mut live = HashMap::new();
+        let mut live: HashMap<Id, Doc> = HashMap::new();
         for r in records {
-            match r {
-                Record::Upsert(d) => {
-                    live.insert(d.id, d);
-                }
-                Record::Delete(id) => {
-                    live.remove(&id);
-                }
-            }
+            apply(&mut live, r);
         }
         live
     }
@@ -524,7 +517,7 @@ impl Namespace {
         filter: Option<&Filter>,
     ) -> Result<Vec<Hit>> {
         let live = Self::materialize(self.all_records().await?);
-        Ok(crate::doc::top_k(live.values(), vector, k, filter))
+        Ok(crate::doc::top_k(live.values(), vector, k, filter, &Include::None))
     }
 
     /// The real query path.
@@ -563,7 +556,16 @@ impl Namespace {
                     m.segments.iter().map(|s| self.data_path(&s.name)).collect();
                 paths.extend(wal_paths);
                 let live = Self::materialize(self.read_records_parallel(paths).await?);
-                (crate::doc::top_k(live.values(), &req.vector, req.top_k, req.filter.as_ref()), false)
+                (
+                    crate::doc::top_k(
+                        live.values(),
+                        &req.vector,
+                        req.top_k,
+                        req.filter.as_ref(),
+                        &req.include_attributes,
+                    ),
+                    false,
+                )
             }
             Some(idx) => {
                 if idx.dim != req.vector.len() {
@@ -588,14 +590,7 @@ impl Namespace {
                 // upserts and tombstones win over whatever the index believes.
                 let mut candidates = Self::materialize(cluster_records);
                 for r in wal_records {
-                    match r {
-                        Record::Upsert(d) => {
-                            candidates.insert(d.id, d);
-                        }
-                        Record::Delete(id) => {
-                            candidates.remove(&id);
-                        }
-                    }
+                    apply(&mut candidates, r);
                 }
                 (
                     crate::doc::top_k(
@@ -603,6 +598,7 @@ impl Namespace {
                         &req.vector,
                         req.top_k,
                         req.filter.as_ref(),
+                        &req.include_attributes,
                     ),
                     true,
                 )
@@ -1015,6 +1011,33 @@ impl Namespace {
     }
 }
 
+/// Apply one record to a live set. The single definition of mutation semantics,
+/// shared by compaction and by the query-time WAL overlay — two copies of this
+/// would eventually disagree about what a patch means.
+fn apply(live: &mut HashMap<Id, Doc>, r: Record) {
+    match r {
+        Record::Upsert(d) => {
+            live.insert(d.id, d);
+        }
+        Record::Delete(id) => {
+            live.remove(&id);
+        }
+        Record::Patch { id, attrs } => {
+            // A patch on an absent document is a no-op, not a resurrection: there
+            // is no vector to attach, so the document would be unqueryable.
+            if let Some(doc) = live.get_mut(&id) {
+                for (k, v) in attrs {
+                    if v.is_null() {
+                        doc.attrs.remove(&k);
+                    } else {
+                        doc.attrs.insert(k, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- group commit
 
 /// One queued write: the payload, and where to report its commit.
@@ -1155,6 +1178,7 @@ pub fn open_store() -> Result<(Arc<dyn ObjectStore>, String)> {
 mod tests {
     use super::*;
     use crate::doc::Filter;
+    use crate::value::Value;
     use crate::wire::Consistency;
 
     fn mem() -> Arc<dyn ObjectStore> {
@@ -1348,8 +1372,191 @@ mod tests {
         assert!(!res.hits.is_empty());
         let live = Namespace::materialize(ns.all_records().await.unwrap());
         for h in &res.hits {
-            assert_eq!(live[&h.id].attrs["tenant"], "a", "filter leaked a foreign tenant");
+            assert_eq!(
+                live[&h.id].attrs["tenant"],
+                Value::from("a"),
+                "filter leaked a foreign tenant"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn patch_merges_attributes_and_null_removes_them() {
+        let ns = ns("t/patch");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1, vec![1.0, 0.0]).with_attr("tenant", "acme").with_attr("count", 1u64),
+        )])
+        .await
+        .unwrap();
+
+        ns.write_records(&[Record::Patch {
+            id: 1,
+            attrs: std::collections::BTreeMap::from([
+                ("count".to_string(), Value::Uint(9)),
+                ("added".to_string(), Value::Bool(true)),
+            ]),
+        }])
+        .await
+        .unwrap();
+
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        let d = &live[&1];
+        assert_eq!(d.attrs["count"], Value::Uint(9), "patch did not overwrite");
+        assert_eq!(d.attrs["added"], Value::Bool(true), "patch did not add");
+        assert_eq!(d.attrs["tenant"], Value::from("acme"), "patch clobbered an untouched attribute");
+        assert_eq!(d.vector, vec![1.0, 0.0], "patch disturbed the vector");
+
+        // Null removes.
+        ns.write_records(&[Record::Patch {
+            id: 1,
+            attrs: std::collections::BTreeMap::from([("tenant".to_string(), Value::Null)]),
+        }])
+        .await
+        .unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert!(!live[&1].attrs.contains_key("tenant"), "null did not remove the attribute");
+
+        // A patch against a document that does not exist is a no-op, never a
+        // resurrection — there would be no vector to attach.
+        ns.write_records(&[Record::Patch {
+            id: 999,
+            attrs: std::collections::BTreeMap::from([("x".to_string(), Value::Uint(1))]),
+        }])
+        .await
+        .unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert!(!live.contains_key(&999), "patch resurrected a missing document");
+    }
+
+    #[tokio::test]
+    async fn patch_survives_compaction_and_applies_over_the_index() {
+        let ns = ns("t/patch-compact");
+        let docs = synth(100, 8, 4);
+        ns.write_records(&docs.iter().cloned().map(Record::Upsert).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        ns.compact(true).await.unwrap();
+
+        // Patch lands only in the WAL, so it must be applied as an overlay on top
+        // of what the index still believes.
+        let target = docs[0].clone();
+        ns.write_records(&[Record::Patch {
+            id: target.id,
+            attrs: std::collections::BTreeMap::from([("tenant".to_string(), Value::from("z"))]),
+        }])
+        .await
+        .unwrap();
+
+        let res = ns
+            .query(
+                &QueryRequest::new(target.vector.clone())
+                    .top_k(1)
+                    .include(crate::doc::Include::All),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.hits[0].id, target.id);
+        assert_eq!(res.hits[0].attrs["tenant"], Value::from("z"), "patch not visible over index");
+
+        // After compaction the patch is folded in and the result is unchanged.
+        ns.compact(true).await.unwrap();
+        let after = ns
+            .query(
+                &QueryRequest::new(target.vector.clone())
+                    .top_k(1)
+                    .include(crate::doc::Include::All),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.hits[0].attrs["tenant"], Value::from("z"), "compaction dropped the patch");
+        let (m, _) = ns.load().await.unwrap();
+        assert!(m.wal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_range_filters_work_through_the_index() {
+        let ns = ns("t/typed-filter");
+        let base = crate::value::parse_datetime("2024-03-01T00:00:00Z").unwrap();
+        let day = 86_400_000_000_000i64;
+        let docs: Vec<Doc> = (0..60)
+            .map(|i| {
+                Doc::new(i as Id, vec![1.0 + i as f32 * 0.001, 0.0])
+                    .with_attr("when", Value::Datetime(base + i as i64 * day))
+                    .with_attr("rank", Value::Uint(i as u64))
+                    .with_attr("tags", Value::StringArray(vec![format!("t{}", i % 3)]))
+            })
+            .collect();
+        ns.write_records(&docs.iter().cloned().map(Record::Upsert).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        ns.compact(true).await.unwrap();
+
+        let q = vec![1.0f32, 0.0];
+        let cutoff = Value::Datetime(base + 30 * day);
+
+        let res = ns
+            .query(
+                &QueryRequest::new(q.clone())
+                    .top_k(100)
+                    .nprobe(64)
+                    .filter(Filter::cmp("when", crate::doc::Op::Gte, cutoff.clone())),
+            )
+            .await
+            .unwrap();
+        assert!(!res.hits.is_empty());
+        assert!(res.hits.iter().all(|h| h.id >= 30), "Gte on datetime leaked older docs");
+
+        let res = ns
+            .query(
+                &QueryRequest::new(q.clone()).top_k(100).nprobe(64).filter(Filter::And(vec![
+                    Filter::cmp("rank", crate::doc::Op::Gte, 10u64),
+                    Filter::cmp("rank", crate::doc::Op::Lt, 20u64),
+                    Filter::cmp("tags", crate::doc::Op::Contains, "t1"),
+                ])),
+            )
+            .await
+            .unwrap();
+        assert!(!res.hits.is_empty());
+        assert!(
+            res.hits.iter().all(|h| (10..20).contains(&h.id) && h.id % 3 == 1),
+            "compound typed filter admitted the wrong documents: {:?}",
+            res.hits.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn include_attributes_projects_through_the_query_path() {
+        let ns = ns("t/include");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1, vec![1.0, 0.0])
+                .with_attr("a", 1u64)
+                .with_attr("b", "two")
+                .with_attr("c", true),
+        )])
+        .await
+        .unwrap();
+        ns.compact(true).await.unwrap();
+        let q = vec![1.0f32, 0.0];
+
+        let none = ns.query(&QueryRequest::new(q.clone())).await.unwrap();
+        assert!(none.hits[0].attrs.is_empty(), "attributes returned without being asked for");
+
+        let all = ns
+            .query(&QueryRequest::new(q.clone()).include(crate::doc::Include::All))
+            .await
+            .unwrap();
+        assert_eq!(all.hits[0].attrs.len(), 3);
+        assert_eq!(all.hits[0].attrs["b"], Value::from("two"));
+
+        let some = ns
+            .query(
+                &QueryRequest::new(q)
+                    .include(crate::doc::Include::Only(vec!["a".into(), "nope".into()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(some.hits[0].attrs.len(), 1, "projection leaked or invented an attribute");
+        assert_eq!(some.hits[0].attrs["a"], Value::Uint(1));
     }
 
     #[tokio::test]
