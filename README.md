@@ -196,7 +196,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 95 tests
+cargo test                       # 104 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -247,7 +247,9 @@ architecture*, not a drop-in replacement.
 | Result limit | `limit` | `top_k` |
 | Filters | `("And", (("ts","Gte",…),("public","Eq",true)))`; Gt/Lt/In/Glob/Regex | ✅ **same tuple grammar**: Eq/NotEq/Gt/Gte/Lt/Lte/In/NotIn/Glob/IGlob/Contains/Regex + And/Or/Not |
 | Score | `$dist` — a **distance**, lower is better | `score` — a **similarity**, higher is better |
-| Attributes | typed + schema, `include_attributes` | ✅ **typed** (bool, uint, int, f64, string, datetime, uuid, []string, []uint) + `include_attributes`; schema *declaration* still pending |
+| Attributes | typed + schema, `include_attributes` | ✅ **typed** (bool, uint, int, f64, string, datetime, uuid, []string, []uint), inferred schema, `include_attributes` |
+| Document ids | uint / string / uuid | ✅ all three |
+| `distance_metric` | cosine, euclidean, … | ✅ cosine, euclidean-squared, dot product |
 | Partial update | `patch_rows`, `patch_columns` | ✅ `Record::Patch` — merge, with null removing an attribute |
 | Aggregations | `aggregate_by`, group-by | none |
 | Multi-vector, sharding, CMEK | yes | no |
@@ -272,17 +274,23 @@ Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
 - `Record::Patch` — partial update, applied identically by compaction and by the
   query-time WAL overlay
 
+- **Namespace schema** in the manifest: attribute types inferred from the first
+  write that carries each value, then enforced. A null never declares a type.
+  Vector dimension and id type fixed the same way
+- **Document ids** as uint, string, or UUID, with coercion to the declared type
+- **`distance_metric`** per namespace (cosine, euclidean-squared, dot product),
+  honoured by centroid assignment as well as ranking — building with one geometry
+  and querying with another puts a document's neighbours in a cluster the query
+  never probes
+
 **Next, in dependency order**
 
-1. Namespace **schema**: declared types in the manifest, type-consistency
-   enforcement, and coercion of the strings JSON cannot type (`uuid`, `datetime`)
-2. **Document ids** as uint *or* string *or* uuid (currently `u64` only)
-3. `distance_metric` per namespace, honoured by centroid assignment too
-4. `upsert_columns` / `patch_columns`, `patch_by_filter` / `delete_by_filter`
-5. The `/v2` compatibility router: endpoint paths, `rank_by`, `limit`, `$dist`
+1. `upsert_columns` / `patch_columns`, `patch_by_filter` / `delete_by_filter`
+2. The `/v2` compatibility router: endpoint paths, `rank_by`, `limit`, `$dist`
    sign flip, `rows_affected`
-6. Order by attribute, `kNN` exact search (already the brute-force path)
-7. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
+3. Inverted attribute index (filters are still evaluated per candidate)
+4. Order by attribute, `kNN` exact search (already the brute-force path)
+5. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
    each its own project
 
 Two traps to keep in mind while doing this. `$dist` is a distance and `score` is

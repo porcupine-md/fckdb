@@ -261,26 +261,13 @@ async fn write(
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
-    if body.upsert.is_empty() && body.delete.is_empty() {
-        return Err(bad("write requires at least one upsert or delete"));
+    if body.upsert.is_empty() && body.delete.is_empty() && body.patch.is_empty() {
+        return Err(bad("write requires at least one upsert, patch, or delete"));
     }
-    // Reject ragged vectors at the boundary rather than letting compaction fail
-    // later, when the caller is long gone.
-    if let Some(first) = body.upsert.first() {
-        let dim = first.vector.len();
-        if dim == 0 {
-            return Err(bad("vectors must have at least one dimension"));
-        }
-        if let Some(odd) = body.upsert.iter().find(|d| d.vector.len() != dim) {
-            return Err(bad(format!(
-                "inconsistent dimensions in batch: doc {} has {}, expected {dim}",
-                odd.id,
-                odd.vector.len()
-            )));
-        }
-        if body.upsert.iter().any(|d| d.vector.iter().any(|f| !f.is_finite())) {
-            return Err(bad("vectors must not contain NaN or infinity"));
-        }
+    // Cheap boundary check. Cross-document and cross-request consistency is the
+    // schema's job, since only it can see what the namespace already holds.
+    if let Some(empty) = body.upsert.iter().find(|d| d.vector.is_empty()) {
+        return Err(bad(format!("document {} has no vector", empty.id)));
     }
 
     let handle = state.resident(&org, &name);
@@ -312,9 +299,29 @@ async fn write(
 
     let t = Instant::now();
     let mut records: Vec<Record> = body.upsert.into_iter().map(Record::Upsert).collect();
+    records.extend(
+        body.patch.into_iter().map(|p| Record::Patch { id: p.id, attrs: p.attrs }),
+    );
     records.extend(body.delete.into_iter().map(Record::Delete));
     let count = records.len();
-    let seq = handle.commit.write_all(records).await?;
+    let seq = handle
+        .commit
+        .write_all(records, body.distance_metric)
+        .await
+        // A schema conflict is the caller's mistake, not a server fault: they
+        // sent a type that disagrees with what the namespace already holds.
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            if msg.contains("declared")
+                || msg.contains("dimensions")
+                || msg.contains("distance_metric")
+                || msg.contains("cannot interpret")
+            {
+                AppError(StatusCode::BAD_REQUEST, msg)
+            } else {
+                AppError(StatusCode::INTERNAL_SERVER_ERROR, msg)
+            }
+        })?;
 
     Ok(Json(WriteResponse { seq, records: count, took_ms: t.elapsed().as_millis() as u64 }))
 }
@@ -882,6 +889,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_conflicts_are_client_errors_over_http() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/sch/write",
+            Some(TOKEN_A),
+            Some(json!({ "upsert": [
+                { "id": 1, "vector": [1.0, 0.0], "attrs": { "count": 5, "name": "a" } }
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        // The namespace now declares count:uint. A string is a client error.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/sch/write",
+            Some(TOKEN_A),
+            Some(json!({ "upsert": [
+                { "id": 2, "vector": [1.0, 0.0], "attrs": { "count": "five" } }
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "type conflict accepted: {res}");
+
+        // So is a mismatched dimension.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/sch/write",
+            Some(TOKEN_A),
+            Some(json!({ "upsert": [{ "id": 3, "vector": [1.0, 0.0, 0.0] }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "dimension conflict accepted: {res}");
+
+        // Metadata reports the inferred schema.
+        let (_, md) = call(&state, "GET", "/v1/namespaces/sch", Some(TOKEN_A), None).await;
+        assert_eq!(md["schema"]["count"], "uint");
+        assert_eq!(md["schema"]["name"], "string");
+        assert_eq!(md["id_type"], "uint");
+        assert_eq!(md["distance_metric"], "cosine_distance");
+        assert_eq!(md["dim"], 2);
+    }
+
+    #[tokio::test]
+    async fn string_ids_patches_and_metric_over_http() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/mixed/write",
+            Some(TOKEN_A),
+            Some(json!({
+                "distance_metric": "euclidean_squared",
+                "upsert": [
+                    { "id": "doc-a", "vector": [1.0, 0.0], "attrs": { "n": 1 } },
+                    { "id": "doc-b", "vector": [0.0, 1.0], "attrs": { "n": 2 } },
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        let (_, md) = call(&state, "GET", "/v1/namespaces/mixed", Some(TOKEN_A), None).await;
+        assert_eq!(md["id_type"], "string");
+        assert_eq!(md["distance_metric"], "euclidean_squared");
+
+        // Patch merges without disturbing the vector.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/mixed/write",
+            Some(TOKEN_A),
+            Some(json!({ "patch": [{ "id": "doc-a", "n": 99 }] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/mixed/query",
+            Some(TOKEN_A),
+            Some(json!({ "vector": [1.0, 0.0], "top_k": 1, "include_attributes": true })),
+        )
+        .await;
+        assert_eq!(res["hits"][0]["id"], "doc-a", "string id did not round-trip");
+        assert_eq!(res["hits"][0]["attrs"]["n"], 99, "patch did not apply");
+
+        // Changing the metric afterwards is refused.
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/mixed/write",
+            Some(TOKEN_A),
+            Some(json!({
+                "distance_metric": "cosine_distance",
+                "upsert": [{ "id": "doc-c", "vector": [1.0, 1.0] }]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "metric was changed in place");
+    }
+
+    #[tokio::test]
     async fn malformed_filters_are_rejected_not_ignored() {
         let state = test_state();
         call(
@@ -1058,6 +1173,7 @@ mod tests {
             }],
             segments: vec![],
             index: None,
+            schema: Default::default(),
         };
         handle
             .ns

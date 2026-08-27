@@ -4,7 +4,8 @@
 //! server cannot drift, and the e2e driver exercises the same shapes real
 //! clients send.
 
-use crate::doc::{Doc, Filter, Id, Include};
+use crate::doc::{DistanceMetric, Doc, Filter, Id, IdType, Include};
+use crate::value::Type;
 pub use crate::doc::Hit;
 use serde::{Deserialize, Serialize};
 
@@ -100,8 +101,22 @@ pub struct QueryResponse {
 pub struct WriteRequest {
     #[serde(default)]
     pub upsert: Vec<Doc>,
+    /// Merge attributes into existing documents. A null value removes one.
+    #[serde(default)]
+    pub patch: Vec<PatchRow>,
     #[serde(default)]
     pub delete: Vec<Id>,
+    /// Settable on a namespace's first write only; a later change is rejected
+    /// because the index's cluster assignment depends on it.
+    #[serde(default)]
+    pub distance_metric: Option<DistanceMetric>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PatchRow {
+    pub id: Id,
+    #[serde(flatten)]
+    pub attrs: std::collections::BTreeMap<String, crate::value::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +145,13 @@ pub struct NamespaceMetadata {
     /// True when the unindexed tail is large enough that writes are being
     /// refused until compaction catches up.
     pub write_backpressure: bool,
+    /// Declared attribute types, inferred from the first write carrying each.
+    #[serde(default)]
+    pub schema: std::collections::BTreeMap<String, Type>,
+    #[serde(default)]
+    pub id_type: Option<IdType>,
+    #[serde(default)]
+    pub distance_metric: DistanceMetric,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

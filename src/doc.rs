@@ -11,8 +11,322 @@ use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub type Id = u64;
 pub type Attrs = BTreeMap<String, Value>;
+
+/// A document identifier: unsigned integer, string, or UUID.
+///
+/// Like attribute values, a string that happens to look like a UUID stays a
+/// string until the namespace schema says otherwise. Inferring from content
+/// would make a document's id type depend on which document arrived first.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Id {
+    Uint(u64),
+    Uuid(uuid::Uuid),
+    String(String),
+}
+
+/// The declared id type of a namespace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdType {
+    #[default]
+    Uint,
+    Uuid,
+    String,
+}
+
+const ID_UINT: u8 = 0;
+const ID_UUID: u8 = 1;
+const ID_STRING: u8 = 2;
+
+impl Id {
+    pub fn type_of(&self) -> IdType {
+        match self {
+            Id::Uint(_) => IdType::Uint,
+            Id::Uuid(_) => IdType::Uuid,
+            Id::String(_) => IdType::String,
+        }
+    }
+
+    /// Reinterpret a JSON-inferred id as the namespace's declared type.
+    pub fn coerce(self, ty: IdType) -> Result<Id> {
+        if self.type_of() == ty {
+            return Ok(self);
+        }
+        Ok(match (self, ty) {
+            (Id::String(s), IdType::Uuid) => Id::Uuid(uuid::Uuid::parse_str(&s)?),
+            (Id::String(s), IdType::Uint) => Id::Uint(s.parse()?),
+            (Id::Uint(u), IdType::String) => Id::String(u.to_string()),
+            (Id::Uuid(u), IdType::String) => Id::String(u.to_string()),
+            (v, ty) => bail!("document id {v:?} is not a {ty:?}"),
+        })
+    }
+
+    fn encode(&self, b: &mut BytesMut) {
+        match self {
+            Id::Uint(v) => {
+                b.put_u8(ID_UINT);
+                b.put_u64_le(*v);
+            }
+            Id::Uuid(u) => {
+                b.put_u8(ID_UUID);
+                b.put_slice(u.as_bytes());
+            }
+            Id::String(s) => {
+                b.put_u8(ID_STRING);
+                b.put_u32_le(s.len() as u32);
+                b.put_slice(s.as_bytes());
+            }
+        }
+    }
+
+    fn decode(buf: &[u8], pos: &mut usize) -> Result<Id> {
+        Ok(match take(buf, pos, 1)?[0] {
+            ID_UINT => Id::Uint(u64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap())),
+            ID_UUID => {
+                let b: [u8; 16] = take(buf, pos, 16)?.try_into().unwrap();
+                Id::Uuid(uuid::Uuid::from_bytes(b))
+            }
+            ID_STRING => {
+                let n = u32::from_le_bytes(take(buf, pos, 4)?.try_into().unwrap()) as usize;
+                Id::String(String::from_utf8(take(buf, pos, n)?.to_vec())?)
+            }
+            t => bail!("unknown id tag {t}"),
+        })
+    }
+}
+
+impl Id {
+    /// The integer value, when this id is one. Convenience for callers that know
+    /// the namespace uses integer ids.
+    pub fn as_uint(&self) -> Option<u64> {
+        match self {
+            Id::Uint(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Id::Uint(v) => write!(f, "{v}"),
+            Id::Uuid(u) => write!(f, "{u}"),
+            Id::String(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl From<u64> for Id {
+    fn from(v: u64) -> Self {
+        Id::Uint(v)
+    }
+}
+impl From<u32> for Id {
+    fn from(v: u32) -> Self {
+        Id::Uint(v as u64)
+    }
+}
+impl From<usize> for Id {
+    fn from(v: usize) -> Self {
+        Id::Uint(v as u64)
+    }
+}
+impl From<&str> for Id {
+    fn from(s: &str) -> Self {
+        Id::String(s.into())
+    }
+}
+impl From<String> for Id {
+    fn from(s: String) -> Self {
+        Id::String(s)
+    }
+}
+impl From<uuid::Uuid> for Id {
+    fn from(u: uuid::Uuid) -> Self {
+        Id::Uuid(u)
+    }
+}
+
+impl Serialize for Id {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Id::Uint(v) => s.serialize_u64(*v),
+            Id::Uuid(u) => s.serialize_str(&u.to_string()),
+            Id::String(v) => s.serialize_str(v),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Id, D::Error> {
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Number(n) => n
+                .as_u64()
+                .map(Id::Uint)
+                .ok_or_else(|| de::Error::custom("a numeric document id must be a u64")),
+            serde_json::Value::String(s) => Ok(Id::String(s)),
+            other => Err(de::Error::custom(format!(
+                "a document id must be a number or a string, got {other}"
+            ))),
+        }
+    }
+}
+
+/// A namespace's declared shape.
+///
+/// Inferred from the first write that carries each piece, then enforced. Living
+/// in the manifest means every consistency decision about types costs the same
+/// single small GET as everything else.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Schema {
+    #[serde(default)]
+    pub attributes: BTreeMap<String, Type>,
+    /// `None` until the first document fixes it.
+    #[serde(default)]
+    pub id_type: Option<IdType>,
+    #[serde(default)]
+    pub distance_metric: DistanceMetric,
+    #[serde(default)]
+    pub dim: Option<usize>,
+}
+
+impl Schema {
+    /// Fold a batch into the schema, coercing the records in place.
+    ///
+    /// Inference is one-way: the first non-null value for an attribute fixes its
+    /// type, and everything after is coerced to fit or rejected. Letting a later
+    /// document silently redefine a type would change the meaning of every
+    /// already-stored value.
+    pub fn absorb(&mut self, records: &mut [Record]) -> Result<()> {
+        for r in records.iter_mut() {
+            match r {
+                Record::Upsert(doc) => {
+                    self.absorb_id(&mut doc.id)?;
+                    self.absorb_vector(&doc.vector, &doc.id)?;
+                    let id = doc.id.clone();
+                    self.absorb_attrs(&mut doc.attrs, &id)?;
+                }
+                Record::Patch { id, attrs } => {
+                    self.absorb_id(id)?;
+                    let owned = id.clone();
+                    self.absorb_attrs(attrs, &owned)?;
+                }
+                Record::Delete(id) => self.absorb_id(id)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn absorb_id(&mut self, id: &mut Id) -> Result<()> {
+        match self.id_type {
+            None => self.id_type = Some(id.type_of()),
+            Some(ty) => {
+                let taken = std::mem::replace(id, Id::Uint(0));
+                *id = taken.coerce(ty).map_err(|e| {
+                    anyhow::anyhow!("namespace ids are declared {ty:?}: {e}")
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn absorb_vector(&mut self, vector: &[f32], id: &Id) -> Result<()> {
+        if vector.is_empty() {
+            if self.dim.is_some() {
+                bail!("document {id} has no vector, but this namespace is vector-indexed");
+            }
+            return Ok(());
+        }
+        match self.dim {
+            None => self.dim = Some(vector.len()),
+            Some(dim) if dim != vector.len() => bail!(
+                "document {id} has {} dimensions, this namespace has {dim}",
+                vector.len()
+            ),
+            Some(_) => {}
+        }
+        if vector.iter().any(|f| !f.is_finite()) {
+            bail!("document {id} has a non-finite vector component");
+        }
+        Ok(())
+    }
+
+    fn absorb_attrs(&mut self, attrs: &mut Attrs, id: &Id) -> Result<()> {
+        for (key, value) in attrs.iter_mut() {
+            match self.attributes.get(key) {
+                Some(&ty) => {
+                    let taken = std::mem::replace(value, Value::Null);
+                    *value = taken.coerce(ty).map_err(|e| {
+                        anyhow::anyhow!("document {id}, attribute {key:?}: {e}")
+                    })?;
+                }
+                // A null carries no type, so it never declares one. Otherwise the
+                // first document that happened to omit a value would poison it.
+                None => {
+                    if let Some(ty) = value.type_of() {
+                        self.attributes.insert(key.clone(), ty);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopt a caller-supplied distance metric, or reject a change to one that
+    /// is already set. Cluster assignment depends on it, so changing it would
+    /// invalidate the index without rebuilding it.
+    pub fn set_metric(&mut self, requested: DistanceMetric, has_data: bool) -> Result<()> {
+        if !has_data {
+            self.distance_metric = requested;
+            return Ok(());
+        }
+        if self.distance_metric != requested {
+            bail!(
+                "distance_metric is {:?} and cannot be changed to {requested:?} in place; \
+                 copy into a new namespace instead",
+                self.distance_metric
+            );
+        }
+        Ok(())
+    }
+}
+
+/// How similarity is measured in a namespace. Fixed at creation, because the
+/// index's cluster assignment depends on it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DistanceMetric {
+    #[default]
+    CosineDistance,
+    EuclideanSquared,
+    DotProduct,
+}
+
+impl DistanceMetric {
+    /// Higher is better. This is what ranking sorts on and what the native API
+    /// returns as `score`.
+    pub fn score(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            DistanceMetric::CosineDistance => cosine(a, b),
+            DistanceMetric::EuclideanSquared => -l2sq(a, b),
+            DistanceMetric::DotProduct => dot(a, b),
+        }
+    }
+
+    /// Lower is better. Used for centroid assignment, and what a
+    /// turbopuffer-compatible surface reports as `$dist`.
+    ///
+    /// Ordering is exactly the inverse of `score`, so an index built with one is
+    /// consistent with a query ranked by the other.
+    pub fn distance(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            DistanceMetric::CosineDistance => 1.0 - cosine(a, b),
+            DistanceMetric::EuclideanSquared => l2sq(a, b),
+            DistanceMetric::DotProduct => -dot(a, b),
+        }
+    }
+}
 
 /// One ranked result. The single hit shape used by the scan, the index, the
 /// recall harness and the HTTP surface — so nothing converts between two
@@ -27,8 +341,8 @@ pub struct Hit {
 }
 
 impl Hit {
-    pub fn new(id: Id, score: f32) -> Self {
-        Self { id, score, attrs: Attrs::new() }
+    pub fn new(id: impl Into<Id>, score: f32) -> Self {
+        Self { id: id.into(), score, attrs: Attrs::new() }
     }
 }
 
@@ -42,8 +356,8 @@ pub struct Doc {
 }
 
 impl Doc {
-    pub fn new(id: Id, vector: Vec<f32>) -> Self {
-        Self { id, vector, attrs: Attrs::new() }
+    pub fn new(id: impl Into<Id>, vector: Vec<f32>) -> Self {
+        Self { id: id.into(), vector, attrs: Attrs::new() }
     }
 
     pub fn with_attr(mut self, k: &str, v: impl Into<Value>) -> Self {
@@ -81,10 +395,22 @@ const TAG_DELETE: u8 = 1;
 const TAG_PATCH: u8 = 2;
 
 impl Record {
-    pub fn id(&self) -> Id {
+    pub fn id(&self) -> &Id {
         match self {
-            Record::Upsert(d) => d.id,
-            Record::Patch { id, .. } | Record::Delete(id) => *id,
+            Record::Upsert(d) => &d.id,
+            Record::Patch { id, .. } | Record::Delete(id) => id,
+        }
+    }
+
+    /// Approximate encoded size, for batch accounting without doing the encode.
+    pub fn encoded_len(&self) -> usize {
+        let attrs = |a: &Attrs| {
+            a.iter().map(|(k, _)| k.len() + 24).sum::<usize>() + 2
+        };
+        match self {
+            Record::Delete(_) => 32,
+            Record::Patch { attrs: a, .. } => 32 + attrs(a),
+            Record::Upsert(d) => 32 + d.vector.len() * 4 + attrs(&d.attrs),
         }
     }
 
@@ -93,16 +419,16 @@ impl Record {
         match self {
             Record::Delete(id) => {
                 b.put_u8(TAG_DELETE);
-                b.put_u64_le(*id);
+                id.encode(&mut b);
             }
             Record::Patch { id, attrs } => {
                 b.put_u8(TAG_PATCH);
-                b.put_u64_le(*id);
+                id.encode(&mut b);
                 put_attrs(&mut b, attrs);
             }
             Record::Upsert(d) => {
                 b.put_u8(TAG_UPSERT);
-                b.put_u64_le(d.id);
+                d.id.encode(&mut b);
                 b.put_u32_le(d.vector.len() as u32);
                 for f in &d.vector {
                     b.put_f32_le(*f);
@@ -117,13 +443,13 @@ impl Record {
         let mut pos = 0usize;
         let tag = take(buf, &mut pos, 1)?[0];
         Ok(match tag {
-            TAG_DELETE => Record::Delete(get_u64(buf, &mut pos)?),
+            TAG_DELETE => Record::Delete(Id::decode(buf, &mut pos)?),
             TAG_PATCH => {
-                let id = get_u64(buf, &mut pos)?;
+                let id = Id::decode(buf, &mut pos)?;
                 Record::Patch { id, attrs: get_attrs(buf, &mut pos)? }
             }
             TAG_UPSERT => {
-                let id = get_u64(buf, &mut pos)?;
+                let id = Id::decode(buf, &mut pos)?;
                 let dim = u32::from_le_bytes(take(buf, &mut pos, 4)?.try_into().unwrap()) as usize;
                 let raw = take(buf, &mut pos, dim.checked_mul(4).unwrap_or(usize::MAX))?;
                 let vector = raw
@@ -163,10 +489,6 @@ fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
     };
     *pos += n;
     Ok(s)
-}
-
-fn get_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
-    Ok(u64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap()))
 }
 
 // ---------------------------------------------------------------- distance
@@ -496,10 +818,15 @@ pub fn top_k<'a>(
     top_k: usize,
     filter: Option<&Filter>,
     include: &Include,
+    metric: DistanceMetric,
 ) -> Vec<Hit> {
     let mut scored: Vec<Hit> = docs
         .filter(|d| filter.is_none_or(|f| f.matches(&d.attrs)))
-        .map(|d| Hit { id: d.id, score: cosine(vector, &d.vector), attrs: include.project(&d.attrs) })
+        .map(|d| Hit {
+            id: d.id.clone(),
+            score: metric.score(vector, &d.vector),
+            attrs: include.project(&d.attrs),
+        })
         .collect();
     // Ties break by id, never by iteration order. Candidates arrive from a
     // HashMap, so without this an identical query returns a different top-k on
@@ -507,7 +834,7 @@ pub fn top_k<'a>(
     // pagination, result caching, and any attempt to debug a ranking change.
     // ponytail: full sort. Switch to select_nth_unstable_by when candidate sets
     // get large enough that O(n log n) shows up next to the distance math.
-    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    scored.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
     scored.truncate(top_k);
     scored
 }
@@ -519,11 +846,11 @@ mod tests {
     #[test]
     fn record_roundtrip() {
         for r in [
-            Record::Delete(42),
-            Record::Upsert(Doc::new(7, vec![1.0, -2.5, 3.25])),
-            Record::Upsert(Doc::new(0, vec![])),
+            Record::Delete(Id::Uint(42)),
+            Record::Upsert(Doc::new(7u64, vec![1.0, -2.5, 3.25])),
+            Record::Upsert(Doc::new(0u64, vec![])),
             Record::Upsert(
-                Doc::new(9, vec![0.5; 8])
+                Doc::new(9u64, vec![0.5; 8])
                     .with_attr("tenant", "acme")
                     .with_attr("count", 12u64)
                     .with_attr("ratio", -1.5f64)
@@ -534,8 +861,7 @@ mod tests {
                     .with_attr("who", Value::Uuid(uuid::Uuid::nil()))
                     .with_attr("missing", Value::Null),
             ),
-            Record::Patch {
-                id: 5,
+            Record::Patch { id: Id::Uint(5),
                 attrs: BTreeMap::from([
                     ("a".to_string(), Value::Uint(1)),
                     ("gone".to_string(), Value::Null),
@@ -549,7 +875,7 @@ mod tests {
 
     #[test]
     fn truncated_record_errors_not_panics() {
-        let enc = Record::Upsert(Doc::new(1, vec![1.0, 2.0]).with_attr("k", "v")).encode();
+        let enc = Record::Upsert(Doc::new(1u64, vec![1.0, 2.0]).with_attr("k", "v")).encode();
         for cut in 0..enc.len() {
             assert!(Record::decode(&enc[..cut]).is_err(), "accepted a truncated record at {cut}");
         }
@@ -759,10 +1085,10 @@ mod tests {
     #[test]
     fn top_k_breaks_ties_deterministically() {
         let docs: Vec<Doc> = [5u64, 1, 9, 3].iter().map(|i| Doc::new(*i, vec![1.0, 0.0])).collect();
-        let got = top_k(docs.iter(), &[1.0, 0.0], 3, None, &Include::None);
+        let got = top_k(docs.iter(), &[1.0, 0.0], 3, None, &Include::None, DistanceMetric::default());
         assert_eq!(
-            got.iter().map(|h| h.id).collect::<Vec<_>>(),
-            vec![1, 3, 5],
+            got.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
+            vec![Id::Uint(1), Id::Uint(3), Id::Uint(5)],
             "ties must resolve by id, not by iteration order"
         );
     }
@@ -770,12 +1096,12 @@ mod tests {
     #[test]
     fn top_k_respects_filter_order_and_projection() {
         let docs = vec![
-            Doc::new(1, vec![1.0, 0.0]).with_attr("t", "a").with_attr("n", 1u64),
-            Doc::new(2, vec![0.9, 0.1]).with_attr("t", "b").with_attr("n", 2u64),
-            Doc::new(3, vec![0.0, 1.0]).with_attr("t", "a").with_attr("n", 3u64),
+            Doc::new(1u64, vec![1.0, 0.0]).with_attr("t", "a").with_attr("n", 1u64),
+            Doc::new(2u64, vec![0.9, 0.1]).with_attr("t", "b").with_attr("n", 2u64),
+            Doc::new(3u64, vec![0.0, 1.0]).with_attr("t", "a").with_attr("n", 3u64),
         ];
-        let got = top_k(docs.iter(), &[1.0, 0.0], 2, None, &Include::None);
-        assert_eq!(got.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 2]);
+        let got = top_k(docs.iter(), &[1.0, 0.0], 2, None, &Include::None, DistanceMetric::default());
+        assert_eq!(got.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec![Id::Uint(1), Id::Uint(2)]);
         assert!(got[0].attrs.is_empty());
 
         let got = top_k(
@@ -784,15 +1110,16 @@ mod tests {
             2,
             Some(&Filter::eq("t", "a")),
             &Include::Only(vec!["n".into()]),
+            DistanceMetric::default(),
         );
-        assert_eq!(got.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(got.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec![Id::Uint(1), Id::Uint(3)]);
         assert_eq!(got[0].attrs["n"], Value::Uint(1));
         assert_eq!(got[0].attrs.len(), 1, "projection leaked an unrequested attribute");
     }
 
     #[test]
     fn schema_coercion_promotes_strings_to_declared_types() {
-        let mut d = Doc::new(1, vec![1.0])
+        let mut d = Doc::new(1u64, vec![1.0])
             .with_attr("when", "2024-03-01T00:00:00Z")
             .with_attr("who", "550e8400-e29b-41d4-a716-446655440000")
             .with_attr("plain", "left alone");
@@ -806,7 +1133,7 @@ mod tests {
         assert_eq!(d.attrs["plain"], Value::String("left alone".into()));
 
         // A value that cannot be coerced names the attribute and the document.
-        let mut bad = Doc::new(77, vec![1.0]).with_attr("when", "not a date");
+        let mut bad = Doc::new(77u64, vec![1.0]).with_attr("when", "not a date");
         let err = bad.coerce(&schema).unwrap_err().to_string();
         assert!(err.contains("when") && err.contains("77"), "unhelpful error: {err}");
     }

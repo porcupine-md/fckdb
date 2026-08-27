@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use fckdb::cache::RingCache;
-use fckdb::doc::{Doc, Filter, Hit, Id, Include, Op, Record};
+use fckdb::doc::{Doc, Filter, Hit, Include, Op, Record};
 use fckdb::ops::{self, Pricing};
 use fckdb::server::{AppState, Auth, router, serve};
 use fckdb::store::{GroupCommit, Namespace, open_store};
@@ -42,13 +42,13 @@ fn synth(n: usize, dim: usize, clusters: usize) -> Vec<Doc> {
         .map(|i| {
             let c = &centers[i % clusters];
             let v = c.iter().map(|x| x + rng() * 0.8).collect();
-            Doc::new(i as Id, v).with_attr("tenant", if i % 3 == 0 { "a" } else { "b" })
+            Doc::new(i as u64, v).with_attr("tenant", if i % 3 == 0 { "a" } else { "b" })
         })
         .collect()
 }
 
-fn ids(hits: &[Hit]) -> Vec<Id> {
-    hits.iter().map(|h| h.id).collect()
+fn ids(hits: &[Hit]) -> Vec<u64> {
+    hits.iter().filter_map(|h| h.id.as_uint()).collect()
 }
 
 #[tokio::main]
@@ -232,9 +232,9 @@ async fn run_e2e() -> Result<()> {
     ns.write_records(&[Record::Upsert(Doc::new(u64::MAX, q.clone()))]).await?;
     let seen = ns.query(&QueryRequest::new(q.clone()).top_k(top_k).nprobe(nprobe)).await?;
     let saw_new = ids(&seen.hits).contains(&u64::MAX);
-    ns.write_records(&[Record::Delete(docs[n / 2].id)]).await?;
+    ns.write_records(&[Record::Delete(docs[n / 2].id.clone())]).await?;
     let after = ns.query(&QueryRequest::new(q.clone()).top_k(top_k).nprobe(nprobe)).await?;
-    let hid_old = !ids(&after.hits).contains(&docs[n / 2].id);
+    let hid_old = !after.hits.iter().any(|h| h.id == docs[n / 2].id);
     println!("unindexed upsert visible={saw_new}, tombstone suppresses indexed doc={hid_old}");
     assert!(saw_new && hid_old, "WAL overlay is broken");
 
@@ -292,7 +292,7 @@ async fn run_e2e() -> Result<()> {
 
     // Patch one of them and confirm it applies over the index.
     ns.write_records(&[Record::Patch {
-        id: 1_000_000,
+        id: fckdb::doc::Id::Uint(1_000_000),
         attrs: std::collections::BTreeMap::from([("rank".to_string(), Value::Uint(999))]),
     }])
     .await?;
@@ -305,7 +305,7 @@ async fn run_e2e() -> Result<()> {
                 .filter(Filter::eq("rank", 999u64)),
         )
         .await?;
-    let ok_patch = patched.hits.iter().any(|h| h.id == 1_000_000);
+    let ok_patch = patched.hits.iter().any(|h| h.id == fckdb::doc::Id::Uint(1_000_000));
     println!(
         "{} typed hits (all rank>=20 and rank%3==1: {ok_typed}), patch visible over index: {ok_patch}",
         tf.hits.len()

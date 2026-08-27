@@ -13,7 +13,7 @@
 //! failed CAS leaves garbage rather than corruption, and GC is a set difference.
 
 use crate::cache::RingCache;
-use crate::doc::{Doc, Filter, Id, Include, Record};
+use crate::doc::{DistanceMetric, Doc, Filter, Id, Include, Record, Schema};
 use crate::index::{self, IndexMeta, IvfParams};
 use crate::wire::{
     CompactResponse, Consistency, GcResponse, Hit, NamespaceMetadata, QueryRequest, QueryResponse,
@@ -112,6 +112,16 @@ pub struct Manifest {
     pub wal: Vec<WalEntry>,
     pub segments: Vec<SegmentEntry>,
     pub index: Option<IndexMeta>,
+    #[serde(default)]
+    pub schema: Schema,
+}
+
+impl Manifest {
+    /// Whether anything has ever been written. Distinguishes "not configured
+    /// yet" from "configured and immutable" for namespace-level settings.
+    pub fn has_data(&self) -> bool {
+        !self.wal.is_empty() || !self.segments.is_empty()
+    }
 }
 
 impl Manifest {
@@ -481,7 +491,81 @@ impl Namespace {
     }
 
     pub async fn write_records(&self, records: &[Record]) -> Result<(u64, usize)> {
-        self.commit_batch(&records.iter().map(|r| r.encode()).collect::<Vec<_>>()).await
+        self.commit_records(records, None).await
+    }
+
+    /// Commit records with schema inference and enforcement.
+    ///
+    /// Coercion happens inside the CAS loop, not before it: a lost race means
+    /// another writer may have declared a type we have not seen, so the batch has
+    /// to be re-checked against the manifest we actually commit onto.
+    pub async fn commit_records(
+        &self,
+        records: &[Record],
+        metric: Option<DistanceMetric>,
+    ) -> Result<(u64, usize)> {
+        let mut optimistic = true;
+
+        for attempt in 1..=MAX_CAS_ATTEMPTS {
+            let (mut manifest, version) = match optimistic.then(|| self.snapshot_view()).flatten() {
+                Some(v) => v,
+                None => self.load().await?,
+            };
+
+            let mut batch = records.to_vec();
+            let mut schema = manifest.schema.clone();
+            if let Some(m) = metric {
+                schema.set_metric(m, manifest.has_data())?;
+            }
+            schema.absorb(&mut batch)?;
+
+            let blob = frame_records(&batch);
+            let seq = manifest.next_seq;
+            let name = format!("{seq:010}-{}.bin", uuid::Uuid::new_v4());
+            self.put_object(&self.wal_path(&name), blob.clone()).await?;
+
+            manifest.next_seq += 1;
+            manifest.wal.push(WalEntry {
+                name,
+                bytes: blob.len() as u64,
+                records: batch.len() as u32,
+            });
+            manifest.schema = schema;
+
+            let mode = match version {
+                Some(v) => PutMode::Update(v),
+                None => PutMode::Create,
+            };
+            let body = serde_json::to_vec(&manifest)?;
+            let n = body.len() as u64;
+            match self
+                .store
+                .put_opts(
+                    &self.manifest_path(),
+                    PutPayload::from(body),
+                    PutOptions { mode, ..Default::default() },
+                )
+                .await
+            {
+                Ok(res) => {
+                    self.metrics.put(n);
+                    self.metrics.writes.fetch_add(batch.len(), Ordering::Relaxed);
+                    self.remember(
+                        manifest,
+                        Some(UpdateVersion { e_tag: res.e_tag, version: res.version }),
+                    );
+                    return Ok((seq, attempt));
+                }
+                Err(OsError::Precondition { .. }) | Err(OsError::AlreadyExists { .. }) => {
+                    self.metrics.cas_conflicts.fetch_add(1, Ordering::Relaxed);
+                    self.forget_snapshot();
+                    optimistic = false;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        bail!("CAS contention: failed to commit after {MAX_CAS_ATTEMPTS} attempts")
     }
 
     // ------------------------------------------------------------ reads
@@ -516,8 +600,16 @@ impl Namespace {
         k: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<Hit>> {
+        let (m, _) = self.load().await?;
         let live = Self::materialize(self.all_records().await?);
-        Ok(crate::doc::top_k(live.values(), vector, k, filter, &Include::None))
+        Ok(crate::doc::top_k(
+            live.values(),
+            vector,
+            k,
+            filter,
+            &Include::None,
+            m.schema.distance_metric,
+        ))
     }
 
     /// The real query path.
@@ -563,6 +655,7 @@ impl Namespace {
                         req.top_k,
                         req.filter.as_ref(),
                         &req.include_attributes,
+                        m.schema.distance_metric,
                     ),
                     false,
                 )
@@ -578,7 +671,7 @@ impl Namespace {
                 )?;
                 let centroids = index::decode_centroids(&centroid_blob, idx.dim)?;
 
-                let probed = index::probe(&centroids, &req.vector, req.nprobe);
+                let probed = index::probe(&centroids, &req.vector, req.nprobe, m.schema.distance_metric);
                 let cluster_paths: Vec<Path> = probed
                     .iter()
                     .filter_map(|i| idx.clusters.get(*i))
@@ -599,6 +692,7 @@ impl Namespace {
                         req.top_k,
                         req.filter.as_ref(),
                         &req.include_attributes,
+                        m.schema.distance_metric,
                     ),
                     true,
                 )
@@ -652,7 +746,7 @@ impl Namespace {
 
         let mut docs: Vec<Doc> = live.into_values().collect();
         // Deterministic segment and index contents for a given live set.
-        docs.sort_unstable_by_key(|d| d.id);
+        docs.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         let docs_out = docs.len();
 
         let mut new_segments = Vec::new();
@@ -672,7 +766,7 @@ impl Namespace {
             });
 
             if build_index {
-                let params = IvfParams::for_docs(docs.len());
+                let params = IvfParams::for_docs(docs.len()).with_metric(m.schema.distance_metric);
                 let (flat, groups) = index::build(&docs, params)?;
 
                 let cen_name = format!("{}.cen", uuid::Uuid::new_v4());
@@ -786,8 +880,11 @@ impl Namespace {
             unindexed_bytes: m.unindexed_bytes(),
             index_bytes: m.index_bytes(),
             total_bytes: m.total_bytes(),
-            dim: m.index.as_ref().map(|i| i.dim),
+            dim: m.schema.dim.or_else(|| m.index.as_ref().map(|i| i.dim)),
             write_backpressure: m.unindexed_bytes() >= MAX_UNINDEXED_SCAN_BYTES,
+            schema: m.schema.attributes.clone(),
+            id_type: m.schema.id_type,
+            distance_metric: m.schema.distance_metric,
         }
     }
 
@@ -1017,7 +1114,7 @@ impl Namespace {
 fn apply(live: &mut HashMap<Id, Doc>, r: Record) {
     match r {
         Record::Upsert(d) => {
-            live.insert(d.id, d);
+            live.insert(d.id.clone(), d);
         }
         Record::Delete(id) => {
             live.remove(&id);
@@ -1040,8 +1137,13 @@ fn apply(live: &mut HashMap<Id, Doc>, r: Record) {
 
 // ---------------------------------------------------------------- group commit
 
-/// One queued write: the payload, and where to report its commit.
-type Req = (Bytes, oneshot::Sender<Result<u64, String>>);
+/// One queued write: the record, an optional namespace-level metric request, and
+/// where to report the commit.
+///
+/// Records rather than encoded bytes, because schema inference has to see the
+/// values before they are framed — and it has to see the whole coalesced batch,
+/// so two documents in one commit cannot disagree about a type.
+type Req = (Record, Option<DistanceMetric>, oneshot::Sender<Result<u64, String>>);
 
 /// Funnels every write for one namespace through a single committer.
 ///
@@ -1070,26 +1172,31 @@ impl GroupCommit {
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 let mut waiters = vec![first];
-                let mut bytes = waiters[0].0.len();
+                let mut bytes = waiters[0].0.encoded_len();
                 while waiters.len() < MAX_BATCH_LEN && bytes < MAX_BATCH_BYTES {
                     match rx.try_recv() {
                         Ok(item) => {
-                            bytes += item.0.len();
+                            bytes += item.0.encoded_len();
                             waiters.push(item);
                         }
                         Err(_) => break,
                     }
                 }
 
-                let payloads: Vec<Bytes> = waiters.iter().map(|(d, _)| d.clone()).collect();
+                let records: Vec<Record> = waiters.iter().map(|(r, _, _)| r.clone()).collect();
+                // A namespace-level setting only has to be requested once; the
+                // first request in the batch carries it and the rest agree by
+                // construction, since a conflicting value is rejected by the
+                // schema rather than silently applied.
+                let metric = waiters.iter().find_map(|(_, m, _)| *m);
                 b.fetch_add(1, Ordering::Relaxed);
-                let result = ns.commit_batch(&payloads).await;
+                let result = ns.commit_records(&records, metric).await;
                 if let Ok((_, n)) = &result {
                     a.fetch_add(*n, Ordering::Relaxed);
                 }
 
                 let reply = result.map(|(seq, _)| seq).map_err(|e| e.to_string());
-                for (_, done) in waiters {
+                for (_, _, done) in waiters {
                     let _ = done.send(reply.clone());
                 }
             }
@@ -1098,28 +1205,36 @@ impl GroupCommit {
         Self { tx, batches, attempts }
     }
 
-    pub async fn append(&self, data: Bytes) -> Result<u64> {
+    pub async fn submit(&self, record: Record, metric: Option<DistanceMetric>) -> Result<u64> {
         let (done, wait) = oneshot::channel();
-        self.tx.send((data, done)).map_err(|_| anyhow::anyhow!("committer stopped"))?;
+        self.tx
+            .send((record, metric, done))
+            .map_err(|_| anyhow::anyhow!("committer stopped"))?;
         wait.await.context("committer dropped the request")?.map_err(|e| anyhow::anyhow!(e))
     }
 
     pub async fn upsert(&self, doc: Doc) -> Result<u64> {
-        self.append(Record::Upsert(doc).encode()).await
+        self.submit(Record::Upsert(doc), None).await
     }
 
     pub async fn delete(&self, id: Id) -> Result<u64> {
-        self.append(Record::Delete(id).encode()).await
+        self.submit(Record::Delete(id), None).await
     }
 
     /// Submit many records and wait for all of them, so a caller's whole batch
     /// rides one commit instead of one commit each.
-    pub async fn write_all(&self, records: Vec<Record>) -> Result<u64> {
+    pub async fn write_all(
+        &self,
+        records: Vec<Record>,
+        metric: Option<DistanceMetric>,
+    ) -> Result<u64> {
         let waits: Vec<_> = records
             .into_iter()
             .map(|r| {
                 let (done, wait) = oneshot::channel();
-                self.tx.send((r.encode(), done)).map_err(|_| anyhow::anyhow!("committer stopped"))?;
+                self.tx
+                    .send((r, metric, done))
+                    .map_err(|_| anyhow::anyhow!("committer stopped"))?;
                 Ok::<_, anyhow::Error>(wait)
             })
             .collect::<Result<_>>()?;
@@ -1178,6 +1293,7 @@ pub fn open_store() -> Result<(Arc<dyn ObjectStore>, String)> {
 mod tests {
     use super::*;
     use crate::doc::Filter;
+    use crate::doc::Id;
     use crate::value::Value;
     use crate::wire::Consistency;
 
@@ -1211,13 +1327,15 @@ mod tests {
             .map(|i| {
                 let c = &centers[i % clusters];
                 let v = c.iter().map(|x| x + rng() * 0.5).collect();
-                Doc::new(i as Id, v).with_attr("tenant", if i % 3 == 0 { "a" } else { "b" })
+                Doc::new(i as u64, v).with_attr("tenant", if i % 3 == 0 { "a" } else { "b" })
             })
             .collect()
     }
 
-    fn ids(hits: &[Hit]) -> Vec<Id> {
-        hits.iter().map(|h| h.id).collect()
+    /// Integer ids, so assertions read as `vec![1, 2]`. Every test namespace here
+    /// uses integer ids.
+    fn ids(hits: &[Hit]) -> Vec<u64> {
+        hits.iter().map(|h| h.id.as_uint().expect("test ids are integers")).collect()
     }
 
     // -------------------------------------------------------- phase 3: queries
@@ -1226,9 +1344,9 @@ mod tests {
     async fn upsert_and_query_brute() {
         let ns = ns("t/basic");
         ns.write_records(&[
-            Record::Upsert(Doc::new(1, vec![1.0, 0.0])),
-            Record::Upsert(Doc::new(2, vec![0.9, 0.1])),
-            Record::Upsert(Doc::new(3, vec![0.0, 1.0])),
+            Record::Upsert(Doc::new(1u64, vec![1.0, 0.0])),
+            Record::Upsert(Doc::new(2u64, vec![0.9, 0.1])),
+            Record::Upsert(Doc::new(3u64, vec![0.0, 1.0])),
         ])
         .await
         .unwrap();
@@ -1239,14 +1357,14 @@ mod tests {
     #[tokio::test]
     async fn later_upsert_wins_and_tombstone_removes() {
         let ns = ns("t/mutate");
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0, 0.0]))]).await.unwrap();
-        ns.write_records(&[Record::Upsert(Doc::new(2, vec![0.0, 1.0]))]).await.unwrap();
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![-1.0, 0.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0, 0.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(2u64, vec![0.0, 1.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![-1.0, 0.0]))]).await.unwrap();
 
         let got = ns.query_brute(&[1.0, 0.0], 3, None).await.unwrap();
-        assert_eq!(got[0].id, 2, "the newer version of doc 1 was not applied");
+        assert_eq!(got[0].id.as_uint().unwrap(), 2, "the newer version of doc 1 was not applied");
 
-        ns.write_records(&[Record::Delete(2)]).await.unwrap();
+        ns.write_records(&[Record::Delete(Id::Uint(2))]).await.unwrap();
         let got = ns.query_brute(&[1.0, 0.0], 3, None).await.unwrap();
         assert!(!ids(&got).contains(&2), "tombstone did not remove doc 2");
         assert_eq!(got.len(), 1);
@@ -1264,7 +1382,7 @@ mod tests {
             ns.write_records(&[Record::Upsert(Doc::new(i, vec![9.0; 8]))]).await.unwrap();
         }
         for i in 20..30u64 {
-            ns.write_records(&[Record::Delete(i)]).await.unwrap();
+            ns.write_records(&[Record::Delete(Id::Uint(i))]).await.unwrap();
         }
 
         let before = ns.query_brute(&[9.0; 8], 5, None).await.unwrap();
@@ -1291,13 +1409,13 @@ mod tests {
         }
         let (m, _) = ns.load().await.unwrap();
         let before = m.wal.len();
-        ns.write_records(&[Record::Upsert(Doc::new(999, vec![1.0; 4]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(999u64, vec![1.0; 4]))]).await.unwrap();
 
         let stats = ns.compact(false).await.unwrap();
         assert_eq!(stats.wal_consumed, before + 1);
 
         let live = Namespace::materialize(ns.all_records().await.unwrap());
-        assert!(live.contains_key(&999), "the concurrent write was lost");
+        assert!(live.contains_key(&Id::Uint(999)), "the concurrent write was lost");
         assert_eq!(live.len(), 11);
     }
 
@@ -1342,16 +1460,16 @@ mod tests {
         ns.compact(true).await.unwrap();
         let target = docs[0].vector.clone();
 
-        ns.write_records(&[Record::Upsert(Doc::new(9999, target.clone()))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(9999u64, target.clone()))]).await.unwrap();
         let res = ns.query(&QueryRequest::new(target.clone()).top_k(3).nprobe(4)).await.unwrap();
         assert!(ids(&res.hits).contains(&9999), "indexed query missed a doc still in the WAL");
         assert_eq!(res.unindexed_records, 1);
         assert!(res.unindexed_bytes > 0);
 
-        ns.write_records(&[Record::Delete(docs[0].id)]).await.unwrap();
+        ns.write_records(&[Record::Delete(docs[0].id.clone())]).await.unwrap();
         let res = ns.query(&QueryRequest::new(target).top_k(3).nprobe(4)).await.unwrap();
         assert!(
-            !ids(&res.hits).contains(&docs[0].id),
+            !ids(&res.hits).contains(&docs[0].id.as_uint().unwrap()),
             "WAL tombstone did not suppress an indexed doc"
         );
     }
@@ -1384,13 +1502,13 @@ mod tests {
     async fn patch_merges_attributes_and_null_removes_them() {
         let ns = ns("t/patch");
         ns.write_records(&[Record::Upsert(
-            Doc::new(1, vec![1.0, 0.0]).with_attr("tenant", "acme").with_attr("count", 1u64),
+            Doc::new(1u64, vec![1.0, 0.0]).with_attr("tenant", "acme").with_attr("count", 1u64),
         )])
         .await
         .unwrap();
 
         ns.write_records(&[Record::Patch {
-            id: 1,
+            id: Id::Uint(1),
             attrs: std::collections::BTreeMap::from([
                 ("count".to_string(), Value::Uint(9)),
                 ("added".to_string(), Value::Bool(true)),
@@ -1400,7 +1518,7 @@ mod tests {
         .unwrap();
 
         let live = Namespace::materialize(ns.all_records().await.unwrap());
-        let d = &live[&1];
+        let d = &live[&Id::Uint(1)];
         assert_eq!(d.attrs["count"], Value::Uint(9), "patch did not overwrite");
         assert_eq!(d.attrs["added"], Value::Bool(true), "patch did not add");
         assert_eq!(d.attrs["tenant"], Value::from("acme"), "patch clobbered an untouched attribute");
@@ -1408,24 +1526,24 @@ mod tests {
 
         // Null removes.
         ns.write_records(&[Record::Patch {
-            id: 1,
+            id: Id::Uint(1),
             attrs: std::collections::BTreeMap::from([("tenant".to_string(), Value::Null)]),
         }])
         .await
         .unwrap();
         let live = Namespace::materialize(ns.all_records().await.unwrap());
-        assert!(!live[&1].attrs.contains_key("tenant"), "null did not remove the attribute");
+        assert!(!live[&Id::Uint(1)].attrs.contains_key("tenant"), "null did not remove the attribute");
 
         // A patch against a document that does not exist is a no-op, never a
         // resurrection — there would be no vector to attach.
         ns.write_records(&[Record::Patch {
-            id: 999,
+            id: Id::Uint(999),
             attrs: std::collections::BTreeMap::from([("x".to_string(), Value::Uint(1))]),
         }])
         .await
         .unwrap();
         let live = Namespace::materialize(ns.all_records().await.unwrap());
-        assert!(!live.contains_key(&999), "patch resurrected a missing document");
+        assert!(!live.contains_key(&Id::Uint(999)), "patch resurrected a missing document");
     }
 
     #[tokio::test]
@@ -1441,7 +1559,7 @@ mod tests {
         // of what the index still believes.
         let target = docs[0].clone();
         ns.write_records(&[Record::Patch {
-            id: target.id,
+            id: target.id.clone(),
             attrs: std::collections::BTreeMap::from([("tenant".to_string(), Value::from("z"))]),
         }])
         .await
@@ -1480,7 +1598,7 @@ mod tests {
         let day = 86_400_000_000_000i64;
         let docs: Vec<Doc> = (0..60)
             .map(|i| {
-                Doc::new(i as Id, vec![1.0 + i as f32 * 0.001, 0.0])
+                Doc::new(i as u64, vec![1.0 + i as f32 * 0.001, 0.0])
                     .with_attr("when", Value::Datetime(base + i as i64 * day))
                     .with_attr("rank", Value::Uint(i as u64))
                     .with_attr("tags", Value::StringArray(vec![format!("t{}", i % 3)]))
@@ -1504,7 +1622,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!res.hits.is_empty());
-        assert!(res.hits.iter().all(|h| h.id >= 30), "Gte on datetime leaked older docs");
+        assert!(
+            res.hits.iter().all(|h| h.id.as_uint().unwrap() >= 30),
+            "Gte on datetime leaked older docs"
+        );
 
         let res = ns
             .query(
@@ -1518,9 +1639,12 @@ mod tests {
             .unwrap();
         assert!(!res.hits.is_empty());
         assert!(
-            res.hits.iter().all(|h| (10..20).contains(&h.id) && h.id % 3 == 1),
+            res.hits.iter().all(|h| {
+                let n = h.id.as_uint().unwrap();
+                (10..20).contains(&n) && n % 3 == 1
+            }),
             "compound typed filter admitted the wrong documents: {:?}",
-            res.hits.iter().map(|h| h.id).collect::<Vec<_>>()
+            ids(&res.hits)
         );
     }
 
@@ -1528,7 +1652,7 @@ mod tests {
     async fn include_attributes_projects_through_the_query_path() {
         let ns = ns("t/include");
         ns.write_records(&[Record::Upsert(
-            Doc::new(1, vec![1.0, 0.0])
+            Doc::new(1u64, vec![1.0, 0.0])
                 .with_attr("a", 1u64)
                 .with_attr("b", "two")
                 .with_attr("c", true),
@@ -1576,9 +1700,223 @@ mod tests {
     #[tokio::test]
     async fn dimension_mismatch_is_rejected_not_silently_wrong() {
         let ns = ns("t/dims");
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0; 8]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0; 8]))]).await.unwrap();
         ns.compact(true).await.unwrap();
         assert!(ns.query(&QueryRequest::new(vec![1.0; 4])).await.is_err());
+    }
+
+    // -------------------------------------------------------- phase 12: schema
+
+    #[tokio::test]
+    async fn schema_is_inferred_from_the_first_write_then_enforced() {
+        let ns = ns("t/schema");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0, 0.0])
+                .with_attr("name", "a")
+                .with_attr("count", 1u64)
+                .with_attr("live", true),
+        )])
+        .await
+        .unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.attributes["name"], crate::value::Type::String);
+        assert_eq!(m.schema.attributes["count"], crate::value::Type::Uint);
+        assert_eq!(m.schema.attributes["live"], crate::value::Type::Bool);
+        assert_eq!(m.schema.dim, Some(2));
+        assert_eq!(m.schema.id_type, Some(crate::doc::IdType::Uint));
+
+        // A later document that disagrees is rejected, not silently reinterpreted.
+        let err = ns
+            .write_records(&[Record::Upsert(
+                Doc::new(2u64, vec![1.0, 0.0]).with_attr("count", "not a number"),
+            )])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("count"), "unhelpful schema error: {err}");
+
+        // Widening within the numeric family is allowed and stores the declared type.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(3u64, vec![1.0, 0.0]).with_attr("count", 7u64),
+        )])
+        .await
+        .unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert_eq!(live[&Id::Uint(3)].attrs["count"], Value::Uint(7));
+    }
+
+    #[tokio::test]
+    async fn a_null_never_declares_a_type() {
+        let ns = ns("t/schema-null");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0]).with_attr("maybe", Value::Null),
+        )])
+        .await
+        .unwrap();
+        let (m, _) = ns.load().await.unwrap();
+        assert!(
+            !m.schema.attributes.contains_key("maybe"),
+            "a null poisoned the attribute's type"
+        );
+
+        // So a later real value is still free to declare it.
+        ns.write_records(&[Record::Upsert(Doc::new(2u64, vec![1.0]).with_attr("maybe", 5u64))])
+            .await
+            .unwrap();
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.attributes["maybe"], crate::value::Type::Uint);
+    }
+
+    #[tokio::test]
+    async fn declared_types_promote_the_strings_json_cannot_type() {
+        let ns = ns("t/schema-coerce");
+        // Declare by writing the typed values first.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0])
+                .with_attr("when", Value::Datetime(0))
+                .with_attr("who", Value::Uuid(uuid::Uuid::nil())),
+        )])
+        .await
+        .unwrap();
+
+        // Now a client sends them as strings, as JSON forces it to.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(2u64, vec![1.0])
+                .with_attr("when", "2024-03-01T00:00:00Z")
+                .with_attr("who", "550e8400-e29b-41d4-a716-446655440000"),
+        )])
+        .await
+        .unwrap();
+
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        let d = &live[&Id::Uint(2)];
+        assert!(matches!(d.attrs["when"], Value::Datetime(_)), "datetime not promoted");
+        assert!(matches!(d.attrs["who"], Value::Uuid(_)), "uuid not promoted");
+
+        // And a range filter over the promoted values works.
+        let cutoff = Value::Datetime(crate::value::parse_datetime("2020-01-01").unwrap());
+        let res = ns
+            .query(
+                &QueryRequest::new(vec![1.0])
+                    .filter(Filter::cmp("when", crate::doc::Op::Gte, cutoff)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&res.hits), vec![2], "range filter missed the promoted datetime");
+    }
+
+    #[tokio::test]
+    async fn vector_dimensions_are_enforced_across_writes() {
+        let ns = ns("t/dim-enforce");
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0, 2.0]))]).await.unwrap();
+        let err = ns
+            .write_records(&[Record::Upsert(Doc::new(2u64, vec![1.0, 2.0, 3.0]))])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dimensions"), "unhelpful dimension error: {err}");
+
+        // A vectorless document in a vector namespace is also refused.
+        assert!(ns.write_records(&[Record::Upsert(Doc::new(3u64, vec![]))]).await.is_err());
+        // As is a non-finite component.
+        assert!(
+            ns.write_records(&[Record::Upsert(Doc::new(4u64, vec![1.0, f32::NAN]))]).await.is_err()
+        );
+    }
+
+    // -------------------------------------------------------- phase 13: ids
+
+    #[tokio::test]
+    async fn string_ids_work_end_to_end() {
+        let ns = ns("t/string-ids");
+        let docs: Vec<Record> = ["alpha", "beta", "gamma"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Record::Upsert(Doc::new(*name, vec![1.0 - i as f32 * 0.1, i as f32 * 0.1]))
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.id_type, Some(crate::doc::IdType::String));
+
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(2)).await.unwrap();
+        assert_eq!(res.hits[0].id, Id::String("alpha".into()));
+
+        // Delete and tombstone by string id.
+        ns.write_records(&[Record::Delete(Id::String("alpha".into()))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(3)).await.unwrap();
+        assert!(!res.hits.iter().any(|h| h.id == Id::String("alpha".into())));
+
+        // A numeric id in a string namespace is coerced, not rejected.
+        ns.write_records(&[Record::Upsert(Doc::new(42u64, vec![1.0, 0.0]))]).await.unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert!(live.contains_key(&Id::String("42".into())), "numeric id was not coerced");
+    }
+
+    #[tokio::test]
+    async fn uuid_ids_survive_a_roundtrip() {
+        let ns = ns("t/uuid-ids");
+        let u = uuid::Uuid::from_u128(0x1234_5678);
+        ns.write_records(&[Record::Upsert(Doc::new(u, vec![1.0, 0.0]))]).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.id_type, Some(crate::doc::IdType::Uuid));
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(1)).await.unwrap();
+        assert_eq!(res.hits[0].id, Id::Uuid(u));
+
+        // A string form of the same uuid addresses the same document.
+        ns.write_records(&[Record::Delete(Id::String(u.to_string()))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(1)).await.unwrap();
+        assert!(res.hits.is_empty(), "uuid string did not resolve to the same document");
+    }
+
+    // -------------------------------------------------------- phase 14: metric
+
+    #[tokio::test]
+    async fn distance_metric_changes_ranking_and_is_immutable() {
+        let store = mem();
+
+        // Two documents: one closer by angle, the other closer by magnitude.
+        let docs = vec![
+            Record::Upsert(Doc::new(1u64, vec![10.0, 0.0])),
+            Record::Upsert(Doc::new(2u64, vec![1.0, 0.1])),
+        ];
+        let q = vec![1.0f32, 0.0];
+
+        let cos = Namespace::new(store.clone(), "t/metric-cos");
+        cos.commit_records(&docs, Some(DistanceMetric::CosineDistance)).await.unwrap();
+        cos.compact(true).await.unwrap();
+        let by_angle = cos.query(&QueryRequest::new(q.clone()).top_k(2)).await.unwrap();
+
+        let euc = Namespace::new(store.clone(), "t/metric-euc");
+        euc.commit_records(&docs, Some(DistanceMetric::EuclideanSquared)).await.unwrap();
+        euc.compact(true).await.unwrap();
+        let by_distance = euc.query(&QueryRequest::new(q.clone()).top_k(2)).await.unwrap();
+
+        // Cosine ignores magnitude, so the collinear vector wins. Euclidean does
+        // not, so the nearby one wins. If the metric were not honoured these
+        // would agree.
+        assert_eq!(by_angle.hits[0].id, Id::Uint(1), "cosine did not rank by angle");
+        assert_eq!(by_distance.hits[0].id, Id::Uint(2), "euclidean did not rank by distance");
+
+        let (m, _) = euc.load().await.unwrap();
+        assert_eq!(m.schema.distance_metric, DistanceMetric::EuclideanSquared);
+
+        // Changing it later is refused: the index's clusters were assigned with it.
+        let err = euc
+            .commit_records(
+                &[Record::Upsert(Doc::new(3u64, vec![1.0, 0.0]))],
+                Some(DistanceMetric::CosineDistance),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("distance_metric"), "unhelpful metric error: {err}");
     }
 
     // -------------------------------------------------------- phase 7: cache
@@ -1685,7 +2023,7 @@ mod tests {
         ns.compact(true).await.unwrap();
 
         let target = docs[0].vector.clone();
-        ns.write_records(&[Record::Upsert(Doc::new(4242, target.clone()))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(4242u64, target.clone()))]).await.unwrap();
 
         // The committer remembers the manifest it just wrote, so even a stale-
         // tolerant read on this node sees the write rather than lagging an
@@ -1740,6 +2078,7 @@ mod tests {
             }],
             segments: vec![],
             index: None,
+            schema: Default::default(),
         };
         let mode = match version {
             Some(v) => PutMode::Update(v),
@@ -1781,7 +2120,7 @@ mod tests {
             .await
             .unwrap();
         ns.compact(true).await.unwrap();
-        ns.write_records(&[Record::Upsert(Doc::new(7777, vec![1.0; 8]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(7777u64, vec![1.0; 8]))]).await.unwrap();
 
         let before = ns.metrics.gets.load(Ordering::Relaxed);
         let md = ns.metadata().await.unwrap();
@@ -1868,8 +2207,8 @@ mod tests {
         );
 
         // Writes must not cross in either direction.
-        dst.write_records(&[Record::Upsert(Doc::new(11111, q.clone()))]).await.unwrap();
-        src.write_records(&[Record::Upsert(Doc::new(22222, q.clone()))]).await.unwrap();
+        dst.write_records(&[Record::Upsert(Doc::new(11111u64, q.clone()))]).await.unwrap();
+        src.write_records(&[Record::Upsert(Doc::new(22222u64, q.clone()))]).await.unwrap();
 
         let src_ids = ids(&src.query(&QueryRequest::new(q.clone())).await.unwrap().hits);
         let dst_ids = ids(&dst.query(&QueryRequest::new(q)).await.unwrap().hits);
@@ -1907,7 +2246,7 @@ mod tests {
         let tasks: Vec<_> = (0..N)
             .map(|i| {
                 let c = commit.clone();
-                tokio::spawn(async move { c.upsert(Doc::new(i as Id, vec![i as f32, 0.0])).await })
+                tokio::spawn(async move { c.upsert(Doc::new(i as u64, vec![i as f32, 0.0])).await })
             })
             .collect();
         for t in tasks {
@@ -1929,8 +2268,8 @@ mod tests {
         let ns = ns("t/write-all");
         let commit = GroupCommit::new(ns.clone());
         let records: Vec<Record> =
-            (0..50).map(|i| Record::Upsert(Doc::new(i, vec![i as f32]))).collect();
-        commit.write_all(records).await.unwrap();
+            (0..50u64).map(|i| Record::Upsert(Doc::new(i, vec![i as f32]))).collect();
+        commit.write_all(records, None).await.unwrap();
 
         let (batches, _) = commit.stats();
         assert_eq!(batches, 1, "a single caller batch should cost one commit");
@@ -1944,7 +2283,7 @@ mod tests {
     async fn committing_against_the_remembered_version_skips_the_manifest_read() {
         let ns = ns("t/optimistic");
         // First commit has nothing remembered: GET manifest, PUT wal, CAS.
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
         let first = ns.metrics.snapshot();
         assert_eq!(first.puts, 2);
 
@@ -1968,28 +2307,28 @@ mod tests {
         let b = Namespace::new(store.clone(), "t/stale");
 
         // Both learn the same commit point.
-        a.write_records(&[Record::Upsert(Doc::new(1, vec![1.0]))]).await.unwrap();
+        a.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
         b.load().await.unwrap();
 
         // A moves the manifest forward. B's remembered version is now stale.
-        a.write_records(&[Record::Upsert(Doc::new(2, vec![2.0]))]).await.unwrap();
+        a.write_records(&[Record::Upsert(Doc::new(2u64, vec![2.0]))]).await.unwrap();
 
         // B commits anyway: the CAS must reject the stale guess, and B must
         // recover rather than lose the write or clobber A's.
-        b.write_records(&[Record::Upsert(Doc::new(3, vec![3.0]))]).await.unwrap();
+        b.write_records(&[Record::Upsert(Doc::new(3u64, vec![3.0]))]).await.unwrap();
         assert_eq!(b.metrics.cas_conflicts.load(Ordering::Relaxed), 1, "stale guess was accepted");
 
         let live = Namespace::materialize(a.all_records().await.unwrap());
         assert_eq!(live.len(), 3, "a write was lost recovering from a stale version");
         for id in 1..=3 {
-            assert!(live.contains_key(&id), "doc {id} vanished");
+            assert!(live.contains_key(&Id::Uint(id)), "doc {id} vanished");
         }
     }
 
     #[tokio::test]
     async fn metrics_count_real_object_operations() {
         let ns = ns("t/metrics");
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
         let s = ns.metrics.snapshot();
         // One WAL object plus one manifest CAS.
         assert_eq!(s.puts, 2);
