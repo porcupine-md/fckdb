@@ -40,6 +40,9 @@ pub struct IndexMeta {
     /// Attribute name to its inverted-index object.
     #[serde(default)]
     pub attributes: std::collections::BTreeMap<String, String>,
+    /// Attribute name to its full-text index object.
+    #[serde(default)]
+    pub fts: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]

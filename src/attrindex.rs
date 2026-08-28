@@ -177,6 +177,12 @@ impl AttrIndex {
             | Op::NotGlob
             | Op::NotIGlob
             | Op::NotRegex => None,
+            // Full-text operators need the term index, not the value index: this
+            // one holds whole attribute values, not their tokens.
+            Op::ContainsAllTokens
+            | Op::NotContainsAllTokens
+            | Op::ContainsTokenSequence
+            | Op::Fuzzy => None,
         }
     }
 
@@ -503,7 +509,10 @@ mod tests {
         for f in filters {
             let Some(sel) = evaluate(&f, &ix, 5) else { continue };
             let truth: BTreeSet<u32> =
-                docs.iter().filter(|(_, a)| f.matches(a)).map(|(o, _)| *o).collect();
+                docs.iter()
+                    .filter(|(_, a)| f.matches(a, &crate::fts::FtsSchema::new()))
+                    .map(|(o, _)| *o)
+                    .collect();
             assert!(
                 truth.is_subset(&sel.ordinals),
                 "index dropped real matches for {f:?}: truth {truth:?}, selection {:?}",

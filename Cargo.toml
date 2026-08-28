@@ -11,6 +11,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 futures = "0.3.34"
 object_store = { version = "0.14.1", features = ["aws"] }
 regex = "1.13.1"
+rust-stemmers = "1.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
@@ -18,4 +19,5 @@ tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["trace", "limit"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-normalization = "0.1.25"
 uuid = { version = "1.26.0", features = ["v4"] }

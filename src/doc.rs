@@ -4,6 +4,7 @@
 //! segments, and index cluster objects are all framed `Record`s. Uniform format
 //! means one encoder, one decoder, one place for bugs.
 
+use crate::fts::{FtsConfig, FtsSchema, default_edit_distance, levenshtein_within};
 use crate::value::{Type, Value};
 use anyhow::{Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -189,6 +190,10 @@ pub struct Schema {
     pub distance_metric: DistanceMetric,
     #[serde(default)]
     pub dim: Option<usize>,
+    /// Attributes enabled for full-text search, with their tokenizer and BM25
+    /// parameters.
+    #[serde(default)]
+    pub fts: FtsSchema,
 }
 
 impl Schema {
@@ -288,6 +293,27 @@ impl Schema {
                 ),
                 _ => {
                     self.attributes.insert(key.clone(), *ty);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopt client-declared full-text configuration.
+    ///
+    /// Changing a tokenizer on an attribute that already has one is refused: the
+    /// stored postings were produced by the old tokenizer, so queries would
+    /// tokenize differently from the index and match the wrong documents. The
+    /// index carries its own copy for exactly this reason.
+    pub fn declare_fts(&mut self, declared: &FtsSchema) -> Result<()> {
+        for (key, cfg) in declared {
+            match self.fts.get(key) {
+                Some(existing) if existing != cfg => bail!(
+                    "attribute {key:?} already has a full-text configuration and it cannot \
+                     be changed in place; copy into a new namespace instead"
+                ),
+                _ => {
+                    self.fts.insert(key.clone(), cfg.clone());
                 }
             }
         }
@@ -565,6 +591,24 @@ pub enum Op {
     NotContainsAny,
     Regex,
     NotRegex,
+    /// Full-text: the attribute contains every token in the query.
+    ContainsAllTokens,
+    NotContainsAllTokens,
+    /// Full-text: the tokens appear adjacent and in order.
+    ContainsTokenSequence,
+    /// Full-text: a token within the default edit distance of the query.
+    Fuzzy,
+}
+
+impl Op {
+    /// Operators that tokenize text, and therefore depend on the attribute's
+    /// full-text configuration rather than on raw value comparison.
+    pub fn is_full_text(self) -> bool {
+        matches!(
+            self,
+            Op::ContainsAllTokens | Op::NotContainsAllTokens | Op::ContainsTokenSequence | Op::Fuzzy
+        )
+    }
 }
 
 /// A filter expression.
@@ -623,10 +667,17 @@ impl Filter {
                 // Text operators match against the string rendering of a value,
                 // so their operand stays a pattern rather than becoming the
                 // attribute's type.
-                if matches!(
-                    op,
-                    Op::Glob | Op::NotGlob | Op::IGlob | Op::NotIGlob | Op::Regex | Op::NotRegex
-                ) {
+                if op.is_full_text()
+                    || matches!(
+                        op,
+                        Op::Glob
+                            | Op::NotGlob
+                            | Op::IGlob
+                            | Op::NotIGlob
+                            | Op::Regex
+                            | Op::NotRegex
+                    )
+                {
                     return Ok(());
                 }
                 let element = element_type(declared);
@@ -650,16 +701,53 @@ impl Filter {
         Ok(())
     }
 
-    pub fn matches(&self, attrs: &Attrs) -> bool {
+    /// Evaluate against one document's attributes.
+    ///
+    /// `fts` supplies the per-attribute tokenizer for full-text operators. It
+    /// must be the namespace's real configuration: tokenizing with defaults when
+    /// the attribute was indexed with a different stemmer would make this scan
+    /// disagree with the index, so the same query would match different documents
+    /// depending on which path served it.
+    pub fn matches(&self, attrs: &Attrs, fts: &FtsSchema) -> bool {
         match self {
-            Filter::And(fs) => fs.iter().all(|f| f.matches(attrs)),
-            Filter::Or(fs) => fs.iter().any(|f| f.matches(attrs)),
-            Filter::Not(f) => !f.matches(attrs),
+            Filter::And(fs) => fs.iter().all(|f| f.matches(attrs, fts)),
+            Filter::Or(fs) => fs.iter().any(|f| f.matches(attrs, fts)),
+            Filter::Not(f) => !f.matches(attrs, fts),
             Filter::Cmp { key, op, value } => {
                 let actual = attrs.get(key).unwrap_or(&Value::Null);
+                if op.is_full_text() {
+                    let cfg = fts.get(key).cloned().unwrap_or_default();
+                    return eval_full_text(actual, *op, value, &cfg);
+                }
                 eval(actual, *op, value)
             }
         }
+    }
+}
+
+/// Evaluate a full-text operator by tokenizing the stored value.
+///
+/// This is the scan path. The index answers the same questions from postings; the
+/// two must agree, which is why both take their tokenizer from the schema.
+fn eval_full_text(actual: &Value, op: Op, expected: &Value, cfg: &FtsConfig) -> bool {
+    let (Some(text), Some(query)) = (crate::fts::attribute_text(actual), expected.as_text())
+    else {
+        return false;
+    };
+    let doc = cfg.tokenizer.tokenize(&text);
+    let terms = cfg.tokenizer.tokenize(&query);
+    if terms.is_empty() {
+        return false;
+    }
+    match op {
+        Op::ContainsAllTokens => terms.iter().all(|t| doc.contains(t)),
+        Op::NotContainsAllTokens => !terms.iter().all(|t| doc.contains(t)),
+        Op::ContainsTokenSequence => doc.windows(terms.len().max(1)).any(|w| w == terms.as_slice()),
+        Op::Fuzzy => terms.iter().all(|t| {
+            let budget = default_edit_distance(t.chars().count());
+            doc.iter().any(|d| levenshtein_within(d, t, budget))
+        }),
+        _ => false,
     }
 }
 
@@ -751,6 +839,11 @@ fn eval(actual: &Value, op: Op, expected: &Value) -> bool {
         Op::NotIGlob => !glob(actual, expected, false),
         Op::Regex => regex(actual, expected),
         Op::NotRegex => !regex(actual, expected),
+        // Handled by eval_full_text, which needs the tokenizer.
+        Op::ContainsAllTokens
+        | Op::NotContainsAllTokens
+        | Op::ContainsTokenSequence
+        | Op::Fuzzy => false,
     }
 }
 
@@ -906,7 +999,7 @@ pub enum Include {
 }
 
 impl Include {
-    fn project(&self, attrs: &Attrs) -> Attrs {
+    pub fn project(&self, attrs: &Attrs) -> Attrs {
         match self {
             Include::None => Attrs::new(),
             Include::All => attrs.clone(),
@@ -977,9 +1070,10 @@ pub fn order_by<'a>(
     top_k: usize,
     filter: Option<&Filter>,
     include: &Include,
+    fts: &FtsSchema,
 ) -> Vec<Hit> {
     let mut rows: Vec<(Option<Value>, Hit)> = docs
-        .filter(|d| filter.is_none_or(|f| f.matches(&d.attrs)))
+        .filter(|d| filter.is_none_or(|f| f.matches(&d.attrs, fts)))
         .map(|d| {
             let key = d.attrs.get(&order.attribute).filter(|v| !v.is_null()).cloned();
             (key, Hit { id: d.id.clone(), score: 0.0, attrs: include.project(&d.attrs) })
@@ -1013,9 +1107,10 @@ pub fn top_k<'a>(
     filter: Option<&Filter>,
     include: &Include,
     metric: DistanceMetric,
+    fts: &FtsSchema,
 ) -> Vec<Hit> {
     let mut scored: Vec<Hit> = docs
-        .filter(|d| filter.is_none_or(|f| f.matches(&d.attrs)))
+        .filter(|d| filter.is_none_or(|f| f.matches(&d.attrs, fts)))
         .map(|d| Hit {
             id: d.id.clone(),
             score: metric.score(vector, &d.vector),
@@ -1099,43 +1194,43 @@ mod tests {
     #[test]
     fn equality_and_membership() {
         let a = attrs();
-        assert!(Filter::eq("tenant", "acme").matches(&a));
-        assert!(!Filter::eq("tenant", "globex").matches(&a));
-        assert!(Filter::cmp("tenant", Op::NotEq, "globex").matches(&a));
-        assert!(Filter::eq("count", 12u64).matches(&a));
-        assert!(Filter::eq("public", true).matches(&a));
+        assert!(Filter::eq("tenant", "acme").matches(&a, &FtsSchema::new()));
+        assert!(!Filter::eq("tenant", "globex").matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("tenant", Op::NotEq, "globex").matches(&a, &FtsSchema::new()));
+        assert!(Filter::eq("count", 12u64).matches(&a, &FtsSchema::new()));
+        assert!(Filter::eq("public", true).matches(&a, &FtsSchema::new()));
 
         assert!(
             Filter::cmp("tenant", Op::In, Value::StringArray(vec!["acme".into(), "x".into()]))
-                .matches(&a)
+                .matches(&a, &FtsSchema::new())
         );
         assert!(
-            Filter::cmp("tenant", Op::NotIn, Value::StringArray(vec!["x".into()])).matches(&a)
+            Filter::cmp("tenant", Op::NotIn, Value::StringArray(vec!["x".into()])).matches(&a, &FtsSchema::new())
         );
         // Array attribute + Contains is membership.
-        assert!(Filter::cmp("tags", Op::Contains, "red").matches(&a));
-        assert!(!Filter::cmp("tags", Op::Contains, "green").matches(&a));
+        assert!(Filter::cmp("tags", Op::Contains, "red").matches(&a, &FtsSchema::new()));
+        assert!(!Filter::cmp("tags", Op::Contains, "green").matches(&a, &FtsSchema::new()));
         // Text + Contains is substring.
-        assert!(Filter::cmp("path", Op::Contains, "intro").matches(&a));
+        assert!(Filter::cmp("path", Op::Contains, "intro").matches(&a, &FtsSchema::new()));
     }
 
     #[test]
     fn range_comparisons_need_comparable_types() {
         let a = attrs();
-        assert!(Filter::cmp("count", Op::Gte, 12u64).matches(&a));
-        assert!(Filter::cmp("count", Op::Gt, 11u64).matches(&a));
-        assert!(!Filter::cmp("count", Op::Gt, 12u64).matches(&a));
-        assert!(Filter::cmp("count", Op::Lte, 12u64).matches(&a));
-        assert!(Filter::cmp("count", Op::Lt, 13u64).matches(&a));
+        assert!(Filter::cmp("count", Op::Gte, 12u64).matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("count", Op::Gt, 11u64).matches(&a, &FtsSchema::new()));
+        assert!(!Filter::cmp("count", Op::Gt, 12u64).matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("count", Op::Lte, 12u64).matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("count", Op::Lt, 13u64).matches(&a, &FtsSchema::new()));
 
         let march1 = Value::Datetime(crate::value::parse_datetime("2024-03-01").unwrap());
-        assert!(Filter::cmp("when", Op::Gte, march1.clone()).matches(&a));
-        assert!(!Filter::cmp("when", Op::Lt, march1).matches(&a));
+        assert!(Filter::cmp("when", Op::Gte, march1.clone()).matches(&a, &FtsSchema::new()));
+        assert!(!Filter::cmp("when", Op::Lt, march1).matches(&a, &FtsSchema::new()));
 
         // A type mismatch must not match. If `compare` returned Equal or Less for
         // incomparable values, this would admit every document.
-        assert!(!Filter::cmp("count", Op::Gte, "12").matches(&a));
-        assert!(!Filter::cmp("tenant", Op::Gt, 1u64).matches(&a));
+        assert!(!Filter::cmp("count", Op::Gte, "12").matches(&a, &FtsSchema::new()));
+        assert!(!Filter::cmp("tenant", Op::Gt, 1u64).matches(&a, &FtsSchema::new()));
     }
 
     #[test]
@@ -1143,44 +1238,44 @@ mod tests {
         let a = attrs();
         for op in [Op::Gt, Op::Gte, Op::Lt, Op::Lte] {
             assert!(
-                !Filter::cmp("absent", op, 5u64).matches(&a),
+                !Filter::cmp("absent", op, 5u64).matches(&a, &FtsSchema::new()),
                 "{op:?} matched a missing attribute"
             );
         }
-        assert!(!Filter::eq("absent", 5u64).matches(&a));
+        assert!(!Filter::eq("absent", 5u64).matches(&a, &FtsSchema::new()));
         // NotEq on a missing attribute is true: it is definitely not 5.
-        assert!(Filter::cmp("absent", Op::NotEq, 5u64).matches(&a));
+        assert!(Filter::cmp("absent", Op::NotEq, 5u64).matches(&a, &FtsSchema::new()));
     }
 
     #[test]
     fn glob_escapes_regex_metacharacters() {
         let a = attrs();
-        assert!(Filter::cmp("path", Op::Glob, "docs/*").matches(&a));
-        assert!(Filter::cmp("path", Op::Glob, "docs/intro.md").matches(&a));
-        assert!(Filter::cmp("path", Op::Glob, "docs/intro?md").matches(&a));
-        assert!(!Filter::cmp("path", Op::Glob, "docs/*.txt").matches(&a));
+        assert!(Filter::cmp("path", Op::Glob, "docs/*").matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("path", Op::Glob, "docs/intro.md").matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("path", Op::Glob, "docs/intro?md").matches(&a, &FtsSchema::new()));
+        assert!(!Filter::cmp("path", Op::Glob, "docs/*.txt").matches(&a, &FtsSchema::new()));
         // Anchored: a bare prefix must not match.
-        assert!(!Filter::cmp("path", Op::Glob, "docs").matches(&a));
+        assert!(!Filter::cmp("path", Op::Glob, "docs").matches(&a, &FtsSchema::new()));
         // The dot is literal, not "any character".
         let dotted = BTreeMap::from([("path".to_string(), Value::String("docsXintro".into()))]);
         assert!(
-            !Filter::cmp("path", Op::Glob, "docs.intro").matches(&dotted),
+            !Filter::cmp("path", Op::Glob, "docs.intro").matches(&dotted, &FtsSchema::new()),
             "glob treated '.' as a regex wildcard"
         );
         // Case sensitivity.
-        assert!(!Filter::cmp("path", Op::Glob, "DOCS/*").matches(&a));
-        assert!(Filter::cmp("path", Op::IGlob, "DOCS/*").matches(&a));
-        assert!(Filter::cmp("path", Op::NotGlob, "other/*").matches(&a));
+        assert!(!Filter::cmp("path", Op::Glob, "DOCS/*").matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("path", Op::IGlob, "DOCS/*").matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("path", Op::NotGlob, "other/*").matches(&a, &FtsSchema::new()));
     }
 
     #[test]
     fn regex_operator_and_invalid_patterns() {
         let a = attrs();
-        assert!(Filter::cmp("path", Op::Regex, "^docs/").matches(&a));
-        assert!(Filter::cmp("path", Op::Regex, r"\.md$").matches(&a));
-        assert!(Filter::cmp("path", Op::NotRegex, "^other/").matches(&a));
+        assert!(Filter::cmp("path", Op::Regex, "^docs/").matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("path", Op::Regex, r"\.md$").matches(&a, &FtsSchema::new()));
+        assert!(Filter::cmp("path", Op::NotRegex, "^other/").matches(&a, &FtsSchema::new()));
         // A malformed pattern must not match and must not panic.
-        assert!(!Filter::cmp("path", Op::Regex, "[unclosed").matches(&a));
+        assert!(!Filter::cmp("path", Op::Regex, "[unclosed").matches(&a, &FtsSchema::new()));
     }
 
     #[test]
@@ -1191,9 +1286,9 @@ mod tests {
             Filter::eq("public", true),
             Filter::Or(vec![Filter::eq("tenant", "acme"), Filter::eq("tenant", "globex")]),
         ]);
-        assert!(f.matches(&a));
-        assert!(!Filter::Not(Box::new(f.clone())).matches(&a));
-        assert!(!Filter::And(vec![f, Filter::eq("tenant", "nope")]).matches(&a));
+        assert!(f.matches(&a, &FtsSchema::new()));
+        assert!(!Filter::Not(Box::new(f.clone())).matches(&a, &FtsSchema::new()));
+        assert!(!Filter::And(vec![f, Filter::eq("tenant", "nope")]).matches(&a, &FtsSchema::new()));
     }
 
     #[test]
@@ -1327,13 +1422,13 @@ mod tests {
         let mut f: Filter = serde_json::from_str(r#"["when","Gte","2024-01-01"]"#).unwrap();
         // Before coercion the comparison is Datetime vs String: incomparable, so
         // it matches nothing at all.
-        assert!(!f.matches(&attrs), "an uncoerced typed filter should match nothing");
+        assert!(!f.matches(&attrs, &FtsSchema::new()), "an uncoerced typed filter should match nothing");
         f.coerce(&schema).unwrap();
-        assert!(f.matches(&attrs), "coercion did not make the filter work");
+        assert!(f.matches(&attrs, &FtsSchema::new()), "coercion did not make the filter work");
 
         let mut f: Filter = serde_json::from_str(r#"["when","Lt","2024-01-01"]"#).unwrap();
         f.coerce(&schema).unwrap();
-        assert!(!f.matches(&attrs));
+        assert!(!f.matches(&attrs, &FtsSchema::new()));
     }
 
     #[test]
@@ -1346,7 +1441,7 @@ mod tests {
             Doc::new(5u64, vec![1.0]).with_attr("n", Value::Null),
         ];
         let asc = OrderBy { attribute: "n".into(), descending: false };
-        let got = order_by(docs.iter(), &asc, 10, None, &Include::None);
+        let got = order_by(docs.iter(), &asc, 10, None, &Include::None, &FtsSchema::new());
         assert_eq!(
             got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(),
             vec![2, 3, 1, 4, 5]
@@ -1355,14 +1450,14 @@ mod tests {
         // Missing values stay last when descending too: putting the least
         // informative rows at the top of a page would be worse than useless.
         let desc = OrderBy { attribute: "n".into(), descending: true };
-        let got = order_by(docs.iter(), &desc, 10, None, &Include::None);
+        let got = order_by(docs.iter(), &desc, 10, None, &Include::None, &FtsSchema::new());
         assert_eq!(
             got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(),
             vec![1, 3, 2, 4, 5]
         );
 
         // top_k truncates, filters apply, and attributes project.
-        let got = order_by(docs.iter(), &asc, 2, None, &Include::All);
+        let got = order_by(docs.iter(), &asc, 2, None, &Include::All, &FtsSchema::new());
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].attrs["n"], Value::Uint(10));
         let got = order_by(
@@ -1371,6 +1466,7 @@ mod tests {
             10,
             Some(&Filter::cmp("n", Op::Gte, 20u64)),
             &Include::None,
+            &FtsSchema::new(),
         );
         assert_eq!(got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(), vec![3, 1]);
     }
@@ -1380,7 +1476,7 @@ mod tests {
         let docs: Vec<Doc> =
             [5u64, 1, 9, 3].iter().map(|i| Doc::new(*i, vec![1.0]).with_attr("n", 7u64)).collect();
         let asc = OrderBy { attribute: "n".into(), descending: false };
-        let got = order_by(docs.iter(), &asc, 4, None, &Include::None);
+        let got = order_by(docs.iter(), &asc, 4, None, &Include::None, &FtsSchema::new());
         assert_eq!(
             got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(),
             vec![1, 3, 5, 9],
@@ -1415,7 +1511,7 @@ mod tests {
     #[test]
     fn top_k_breaks_ties_deterministically() {
         let docs: Vec<Doc> = [5u64, 1, 9, 3].iter().map(|i| Doc::new(*i, vec![1.0, 0.0])).collect();
-        let got = top_k(docs.iter(), &[1.0, 0.0], 3, None, &Include::None, DistanceMetric::default());
+        let got = top_k(docs.iter(), &[1.0, 0.0], 3, None, &Include::None, DistanceMetric::default(), &FtsSchema::new());
         assert_eq!(
             got.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
             vec![Id::Uint(1), Id::Uint(3), Id::Uint(5)],
@@ -1430,7 +1526,7 @@ mod tests {
             Doc::new(2u64, vec![0.9, 0.1]).with_attr("t", "b").with_attr("n", 2u64),
             Doc::new(3u64, vec![0.0, 1.0]).with_attr("t", "a").with_attr("n", 3u64),
         ];
-        let got = top_k(docs.iter(), &[1.0, 0.0], 2, None, &Include::None, DistanceMetric::default());
+        let got = top_k(docs.iter(), &[1.0, 0.0], 2, None, &Include::None, DistanceMetric::default(), &FtsSchema::new());
         assert_eq!(got.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec![Id::Uint(1), Id::Uint(2)]);
         assert!(got[0].attrs.is_empty());
 
@@ -1441,6 +1537,7 @@ mod tests {
             Some(&Filter::eq("t", "a")),
             &Include::Only(vec!["n".into()]),
             DistanceMetric::default(),
+            &FtsSchema::new(),
         );
         assert_eq!(got.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec![Id::Uint(1), Id::Uint(3)]);
         assert_eq!(got[0].attrs["n"], Value::Uint(1));

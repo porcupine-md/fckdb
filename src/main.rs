@@ -521,6 +521,70 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
         anyhow::bail!("v2 metadata lost the declared schema: {md}");
     }
 
+    // BM25 full-text, through the compatibility surface, against the same backend.
+    let fts_ns = format!("fts{}", uuid::Uuid::new_v4().simple());
+    let (status, body) = send(
+        "POST",
+        format!("/v2/namespaces/{fts_ns}"),
+        Some("e2e-token"),
+        Some(serde_json::json!({
+            "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0], "body": "the quick brown fox jumps over the lazy dog" },
+                { "id": 2, "vector": [0.0, 1.0], "body": "a quick brown dog" },
+                { "id": 3, "vector": [0.5, 0.5], "body": "unrelated notes about databases" },
+            ],
+            "schema": { "body": { "type": "string", "full_text_search": true } }
+        })),
+    )
+    .await;
+    if status != StatusCode::OK {
+        anyhow::bail!("fts write returned {status}: {body}");
+    }
+    let (status, body) =
+        send("POST", format!("/v1/namespaces/{fts_ns}/compact"), Some("e2e-token"), None).await;
+    if status != StatusCode::OK {
+        anyhow::bail!("fts compact returned {status}: {body}");
+    }
+    let (status, body) = send(
+        "POST",
+        format!("/v2/namespaces/{fts_ns}/query"),
+        Some("e2e-token"),
+        Some(serde_json::json!({
+            "rank_by": ["body", "BM25", "foxes jumping"],
+            "top_k": 5
+        })),
+    )
+    .await;
+    if status != StatusCode::OK {
+        anyhow::bail!("bm25 query returned {status}: {body}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed["rows"].as_array().cloned().unwrap_or_default();
+    // Stemming maps "foxes"->"fox" and "jumping"->"jump", so only document 1
+    // matches; a document with neither term must be absent, not scored zero.
+    if rows.len() != 1 || rows[0]["id"] != 1 {
+        anyhow::bail!("bm25 ranking wrong: {body}");
+    }
+    let (status, body) = send(
+        "POST",
+        format!("/v2/namespaces/{fts_ns}/query"),
+        Some("e2e-token"),
+        Some(serde_json::json!({
+            "rank_by": ["vector", "ANN", [1.0, 0.0]],
+            "top_k": 5,
+            "filters": ["body", "ContainsTokenSequence", "quick brown fox"]
+        })),
+    )
+    .await;
+    if status != StatusCode::OK {
+        anyhow::bail!("phrase filter returned {status}: {body}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    if parsed["rows"].as_array().map(|r| r.len()) != Some(1) {
+        anyhow::bail!("phrase filter matched the wrong set: {body}");
+    }
+    let _ = send("DELETE", format!("/v1/namespaces/{fts_ns}"), Some("e2e-token"), None).await;
+
     let (_, metrics) = send("GET", "/metrics".into(), None, None).await;
     let scraped = metrics.lines().filter(|l| !l.starts_with('#')).count();
 
@@ -532,7 +596,7 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
     }
 
     Ok(format!(
-        "401 on no token, v1 write+query+delete OK, v2 rows/$dist/schema OK, \
+        "401 on no token, v1+v2 write/query/delete OK, BM25+phrase OK, \
          {scraped} metrics exposed"
     ))
 }

@@ -13,6 +13,7 @@
 //! failed CAS leaves garbage rather than corruption, and GC is a set difference.
 
 use crate::attrindex::{self, AttrIndex};
+use crate::fts::FtsIndex;
 use crate::cache::RingCache;
 use crate::doc::{DistanceMetric, Doc, Filter, Id, Include, Record, Schema};
 use crate::value::Type;
@@ -618,6 +619,7 @@ impl Namespace {
             // against them instead of inferring something looser. One mechanism,
             // not a second coercion pass in the adapter.
             schema.declare(&config.declared_types)?;
+            schema.declare_fts(&config.declared_fts)?;
             schema.absorb(&mut batch)?;
 
             let blob = frame_records(&batch);
@@ -720,6 +722,7 @@ impl Namespace {
             filter,
             &Include::None,
             m.schema.distance_metric,
+            &m.schema.fts,
         ))
     }
 
@@ -760,6 +763,105 @@ impl Namespace {
         let unindexed_records: usize = wal_entries.iter().map(|e| e.records as usize).sum();
         let unindexed_bytes: u64 = wal_entries.iter().map(|e| e.bytes).sum();
 
+        // Full-text ranking: score from the term index, then score the tail on
+        // the same scale so recent writes remain rankable.
+        if let Some(text) = &req.text {
+            let Some(idx) = &m.index else {
+                bail!(
+                    "full-text search needs an index; namespace has not been compacted yet"
+                );
+            };
+            let Some(object) = idx.fts.get(&text.attribute) else {
+                bail!(
+                    "attribute {:?} is not enabled for full-text search",
+                    text.attribute
+                );
+            };
+            let fts = FtsIndex::decode(&self.read_immutable(&self.data_path(object)).await?)?;
+
+            let seg_paths: Vec<Path> =
+                m.segments.iter().map(|s| self.data_path(&s.name)).collect();
+            let mut wal_paths: Vec<Path> =
+                wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
+            let seg_records = self.read_records_parallel(seg_paths).await?;
+            let tail = self.read_records_parallel(std::mem::take(&mut wal_paths)).await?;
+
+            // Current state of every document, so a tombstoned or rewritten
+            // document is never scored from what the index remembers.
+            let mut live: HashMap<Id, Doc> = HashMap::new();
+            for r in &seg_records {
+                apply(&mut live, r.clone());
+            }
+            for r in &tail {
+                apply(&mut live, r.clone());
+            }
+
+            // Documents the tail touched: their text may differ from what the
+            // index saw, so their stored postings are stale. Rescored below.
+            let touched: std::collections::HashSet<Id> =
+                tail.iter().map(|r| r.id().clone()).collect();
+
+            let mut hits: Vec<Hit> = Vec::new();
+            let matches = |doc: &Doc| {
+                filter.as_ref().is_none_or(|f| f.matches(&doc.attrs, &m.schema.fts))
+            };
+
+            // Indexed documents the tail left alone: use the stored score.
+            for (ordinal, score) in fts.score(&text.query) {
+                let Some(Record::Upsert(indexed)) = seg_records.get(ordinal as usize) else {
+                    continue;
+                };
+                if touched.contains(&indexed.id) {
+                    continue;
+                }
+                let Some(doc) = live.get(&indexed.id) else { continue };
+                if matches(doc) {
+                    hits.push(Hit {
+                        id: doc.id.clone(),
+                        score,
+                        attrs: req.include_attributes.project(&doc.attrs),
+                    });
+                }
+            }
+
+            // Everything the tail touched, scored against the index's corpus
+            // statistics so it lands on the same scale.
+            for id in &touched {
+                let Some(doc) = live.get(id) else { continue };
+                let Some(t) =
+                    doc.attrs.get(&text.attribute).and_then(crate::fts::attribute_text)
+                else {
+                    continue;
+                };
+                let score = fts.score_text(&t, &text.query);
+                if score > 0.0 && matches(doc) {
+                    hits.push(Hit {
+                        id: doc.id.clone(),
+                        score,
+                        attrs: req.include_attributes.project(&doc.attrs),
+                    });
+                }
+            }
+
+            hits.sort_unstable_by(|a, b| {
+                b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
+            });
+            hits.truncate(req.top_k);
+
+            return Ok(QueryResponse {
+                hits,
+                consistent: !from_snapshot && !truncated,
+                indexed: true,
+                prefiltered: false,
+                ordered: false,
+                unindexed_records,
+                unindexed_bytes,
+                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
+                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
+                took_ms: t.elapsed().as_millis() as u64,
+            });
+        }
+
         // Ordering by attribute has no vector to probe with, so it is always a
         // scan of the candidate set.
         if let Some(order) = &req.order_by {
@@ -773,6 +875,7 @@ impl Namespace {
                 req.top_k,
                 filter.as_ref(),
                 &req.include_attributes,
+                &m.schema.fts,
             );
             return Ok(QueryResponse {
                 hits,
@@ -825,6 +928,7 @@ impl Namespace {
                     filter.as_ref(),
                     &req.include_attributes,
                     m.schema.distance_metric,
+                    &m.schema.fts,
                 );
                 return Ok(QueryResponse {
                     hits,
@@ -856,6 +960,7 @@ impl Namespace {
                         filter.as_ref(),
                         &req.include_attributes,
                         m.schema.distance_metric,
+                        &m.schema.fts,
                     ),
                     false,
                 )
@@ -893,6 +998,7 @@ impl Namespace {
                         filter.as_ref(),
                         &req.include_attributes,
                         m.schema.distance_metric,
+                        &m.schema.fts,
                     ),
                     true,
                 )
@@ -955,7 +1061,7 @@ impl Namespace {
         let live = Self::materialize(self.all_records().await?);
         let mut matched: Vec<Id> = live
             .values()
-            .filter(|d| filter.matches(&d.attrs))
+            .filter(|d| filter.matches(&d.attrs, &m.schema.fts))
             .map(|d| d.id.clone())
             .collect();
         // Deterministic order, so a reissued request makes progress through the
@@ -1088,6 +1194,37 @@ impl Namespace {
                     r?;
                 }
 
+                // One full-text index per attribute the schema enables.
+                let mut fts_names = std::collections::BTreeMap::new();
+                let mut fts_writes = Vec::new();
+                for (attribute, config) in &m.schema.fts {
+                    let built = FtsIndex::build(
+                        docs.iter().enumerate().filter_map(|(o, d)| {
+                            d.attrs
+                                .get(attribute)
+                                .and_then(crate::fts::attribute_text)
+                                .map(|t| (o as u32, t))
+                        }).collect::<Vec<_>>().iter().map(|(o, t)| (*o, t.as_str())),
+                        docs.len(),
+                        config,
+                    );
+                    if built.is_empty() {
+                        continue;
+                    }
+                    let name = format!("{}.fts", uuid::Uuid::new_v4());
+                    let blob = built.encode();
+                    index_bytes += blob.len() as u64;
+                    fts_names.insert(attribute.clone(), name.clone());
+                    fts_writes.push((self.data_path(&name), blob));
+                }
+                for r in futures::future::join_all(
+                    fts_writes.iter().map(|(p, b)| self.put_object(p, b.clone())),
+                )
+                .await
+                {
+                    r?;
+                }
+
                 clusters_written = cluster_names.len();
                 new_index = Some(IndexMeta {
                     dim: docs[0].vector.len(),
@@ -1097,6 +1234,7 @@ impl Namespace {
                     bytes: index_bytes,
                     ids: Some(ids_name),
                     attributes: attr_names,
+                    fts: fts_names,
                 });
             }
         }
@@ -1447,11 +1585,13 @@ pub struct WriteConfig {
     pub metric: Option<DistanceMetric>,
     /// Client-declared attribute types, for the types JSON cannot express.
     pub declared_types: BTreeMap<String, Type>,
+    /// Attributes to enable for full-text search.
+    pub declared_fts: crate::fts::FtsSchema,
 }
 
 impl WriteConfig {
     pub fn is_empty(&self) -> bool {
-        self.metric.is_none() && self.declared_types.is_empty()
+        self.metric.is_none() && self.declared_types.is_empty() && self.declared_fts.is_empty()
     }
 }
 
@@ -2125,7 +2265,7 @@ mod tests {
         let scanned: Vec<Id> = {
             let mut v: Vec<Id> = live
                 .values()
-                .filter(|d| Filter::eq("tier", "gold").matches(&d.attrs))
+                .filter(|d| Filter::eq("tier", "gold").matches(&d.attrs, &crate::fts::FtsSchema::new()))
                 .map(|d| d.id.clone())
                 .collect();
             v.sort();
@@ -2229,6 +2369,159 @@ mod tests {
             !res.hits.iter().any(|h| h.id == victim),
             "prefiltered query returned a tombstoned document"
         );
+    }
+
+    // -------------------------------------------------------- phase 19: BM25
+
+    async fn text_ns(prefix: &str) -> Arc<Namespace> {
+        let ns = ns(prefix);
+        let cfg = WriteConfig {
+            declared_fts: crate::fts::FtsSchema::from([(
+                "body".to_string(),
+                crate::fts::FtsConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let docs = vec![
+            Record::Upsert(
+                Doc::new(1u64, vec![1.0, 0.0])
+                    .with_attr("body", "the quick brown fox jumps over the lazy dog")
+                    .with_attr("tier", "gold"),
+            ),
+            Record::Upsert(
+                Doc::new(2u64, vec![0.9, 0.1])
+                    .with_attr("body", "a quick brown dog")
+                    .with_attr("tier", "grey"),
+            ),
+            Record::Upsert(
+                Doc::new(3u64, vec![0.0, 1.0])
+                    .with_attr("body", "unrelated notes about databases")
+                    .with_attr("tier", "gold"),
+            ),
+        ];
+        ns.commit_records(&docs, &cfg).await.unwrap();
+        ns.compact(true).await.unwrap();
+        ns
+    }
+
+    #[tokio::test]
+    async fn bm25_ranks_and_excludes_non_matches() {
+        let ns = text_ns("t/bm25").await;
+        let (m, _) = ns.load().await.unwrap();
+        assert!(
+            m.index.as_ref().unwrap().fts.contains_key("body"),
+            "compaction did not build a full-text index"
+        );
+
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(10)).await.unwrap();
+        assert_eq!(ids(&res.hits), vec![1, 2], "BM25 returned the wrong set");
+        assert!(res.hits[0].score > res.hits[1].score, "scores not ordered");
+        // A document with neither term is absent, not scored zero.
+        assert!(!ids(&res.hits).contains(&3));
+
+        // Filters compose with text ranking.
+        let res = ns
+            .query(
+                &QueryRequest::new(vec![])
+                    .text("body", "quick")
+                    .top_k(10)
+                    .filter(Filter::eq("tier", "gold")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&res.hits), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn bm25_ranks_documents_that_are_only_in_the_tail() {
+        let ns = text_ns("t/bm25-tail").await;
+
+        // A new document, more relevant than anything indexed, exists only in the
+        // WAL. If it were unrankable it would be invisible to every text query
+        // until the next compaction.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(99u64, vec![1.0, 0.0])
+                .with_attr("body", "quick fox quick fox")
+                .with_attr("tier", "gold"),
+        )])
+        .await
+        .unwrap();
+
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(10)).await.unwrap();
+        assert!(ids(&res.hits).contains(&99), "a tail-only document was not ranked");
+        assert_eq!(res.hits[0].id, Id::Uint(99), "the most relevant document did not rank first");
+
+        // A patch that removes the terms must drop the document, not leave it
+        // ranked on what the index remembers.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(1),
+            attrs: std::collections::BTreeMap::from([(
+                "body".to_string(),
+                Value::from("nothing relevant here"),
+            )]),
+        }])
+        .await
+        .unwrap();
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(10)).await.unwrap();
+        assert!(
+            !ids(&res.hits).contains(&1),
+            "a document rewritten by the tail was still scored from stale postings"
+        );
+
+        // And a tombstone removes it entirely.
+        ns.write_records(&[Record::Delete(Id::Uint(2))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick").top_k(10)).await.unwrap();
+        assert!(!ids(&res.hits).contains(&2), "a tombstoned document was still ranked");
+    }
+
+    #[tokio::test]
+    async fn full_text_search_needs_configuration_and_an_index() {
+        let ns = ns("t/bm25-unconfigured");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0]).with_attr("body", "quick fox"),
+        )])
+        .await
+        .unwrap();
+
+        // Before compaction there is no term index at all.
+        let err = ns
+            .query(&QueryRequest::new(vec![]).text("body", "quick"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compacted"), "unhelpful error: {err}");
+
+        // After compaction, an attribute nobody enabled is still refused by name.
+        ns.compact(true).await.unwrap();
+        let err = ns
+            .query(&QueryRequest::new(vec![]).text("body", "quick"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("full-text"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_tokenizer_cannot_be_changed_under_an_existing_index() {
+        let ns = text_ns("t/bm25-tokenizer").await;
+        let different = WriteConfig {
+            declared_fts: crate::fts::FtsSchema::from([(
+                "body".to_string(),
+                crate::fts::FtsConfig {
+                    tokenizer: crate::fts::Tokenizer { stemming: false, ..Default::default() },
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        // Stored postings were produced by the old tokenizer, so a query would
+        // tokenize differently from the index and match the wrong documents.
+        let err = ns
+            .commit_records(&[Record::Upsert(Doc::new(9u64, vec![1.0, 0.0]))], &different)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("full-text"), "unhelpful error: {err}");
     }
 
     // -------------------------------------------------------- phase 12: schema

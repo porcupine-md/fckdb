@@ -51,6 +51,15 @@ pub struct QueryRequest {
     /// is ignored.
     #[serde(default)]
     pub order_by: Option<OrderBy>,
+    /// Rank by BM25 over a full-text attribute. When set, `vector` is ignored.
+    #[serde(default)]
+    pub text: Option<TextSearch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextSearch {
+    pub attribute: String,
+    pub query: String,
 }
 
 impl QueryRequest {
@@ -63,6 +72,7 @@ impl QueryRequest {
             consistency: Consistency::Strong,
             include_attributes: Include::None,
             order_by: None,
+            text: None,
         }
     }
     pub fn top_k(mut self, k: usize) -> Self {
@@ -87,6 +97,10 @@ impl QueryRequest {
     }
     pub fn order_by(mut self, attribute: &str, descending: bool) -> Self {
         self.order_by = Some(OrderBy { attribute: attribute.into(), descending });
+        self
+    }
+    pub fn text(mut self, attribute: &str, query: &str) -> Self {
+        self.text = Some(TextSearch { attribute: attribute.into(), query: query.into() });
         self
     }
 }

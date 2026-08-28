@@ -2,6 +2,7 @@ pub mod attrindex;
 pub mod cache;
 pub mod compat;
 pub mod doc;
+pub mod fts;
 pub mod index;
 pub mod ops;
 pub mod server;

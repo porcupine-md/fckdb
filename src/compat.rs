@@ -18,6 +18,7 @@
 use crate::doc::{Attrs, DistanceMetric, Doc, Filter, Id, Include};
 use crate::store::Manifest;
 use crate::value::Type;
+use crate::fts::{FtsConfig, FtsSchema};
 use crate::wire::{Columns, Consistency, FilterPatch, QueryRequest, WriteRequest};
 use anyhow::{Result, bail};
 use serde::de::{self, Deserializer};
@@ -49,7 +50,25 @@ pub struct SchemaAttr {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glob: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full_text_search: Option<serde_json::Value>,
+    pub full_text_search: Option<FullText>,
+}
+
+/// `full_text_search` is either a flag or a tokenizer configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum FullText {
+    Enabled(bool),
+    Config(Box<FtsConfig>),
+}
+
+impl FullText {
+    fn config(&self) -> Option<FtsConfig> {
+        match self {
+            FullText::Enabled(true) => Some(FtsConfig::default()),
+            FullText::Enabled(false) => None,
+            FullText::Config(c) => Some((**c).clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -90,6 +109,20 @@ impl V2Write {
         self.schema
             .as_ref()
             .map(|s| s.iter().map(|(k, v)| (k.clone(), v.ty)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Attributes the client enabled for full-text search, with their tokenizer.
+    pub fn declared_fts(&self) -> FtsSchema {
+        self.schema
+            .as_ref()
+            .map(|s| {
+                s.iter()
+                    .filter_map(|(k, v)| {
+                        v.full_text_search.as_ref()?.config().map(|c| (k.clone(), c))
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -147,6 +180,8 @@ pub enum RankBy {
     Knn { attribute: String, vector: Vec<f32> },
     /// Rank by an attribute value.
     Order { attribute: String, descending: bool },
+    /// BM25 full-text ranking over a text attribute.
+    Bm25 { attribute: String, query: String },
     /// Recognised but not implemented yet, so it can be reported as such rather
     /// than mis-parsed as something else.
     Unsupported(String),
@@ -194,6 +229,13 @@ fn parse_rank_by(raw: &serde_json::Value) -> Result<RankBy> {
         .ok_or_else(|| anyhow::anyhow!("rank_by function must be a string"))?;
 
     match func {
+        "BM25" => {
+            let query = arr[2]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("rank_by BM25 expects a query string"))?
+                .to_string();
+            Ok(RankBy::Bm25 { attribute, query })
+        }
         "ANN" | "kNN" => {
             let vector: Vec<f32> = serde_json::from_value(arr[2].clone()).map_err(|_| {
                 // Embed takes text instead of a vector; say so precisely rather
@@ -279,13 +321,17 @@ impl V2Query {
         let Some(rank_by) = self.rank_by else {
             bail!("rank_by is required");
         };
-        let (vector, exact, order_by) = match rank_by {
-            RankBy::Ann { vector, .. } => (vector, false, None),
-            RankBy::Knn { vector, .. } => (vector, true, None),
-            RankBy::Order { attribute, descending } => (
+        let (vector, exact, order_by, text) = match rank_by {
+            RankBy::Ann { vector, .. } => (vector, false, None, None),
+            RankBy::Knn { vector, .. } => (vector, true, None, None),
+            RankBy::Order { attribute, descending } => {
+                (vec![], false, Some(crate::doc::OrderBy { attribute, descending }), None)
+            }
+            RankBy::Bm25 { attribute, query } => (
                 vec![],
                 false,
-                Some(crate::doc::OrderBy { attribute, descending }),
+                None,
+                Some(crate::wire::TextSearch { attribute, query }),
             ),
             RankBy::Unsupported(f) => bail!("rank_by function {f:?} is not implemented"),
         };
@@ -320,6 +366,7 @@ impl V2Query {
                 consistency,
                 include_attributes: self.include_attributes,
                 order_by,
+                text,
             },
             exact,
         ))
@@ -364,6 +411,16 @@ pub fn to_v2_rows(hits: Vec<crate::doc::Hit>, metric: DistanceMetric) -> Vec<V2R
             attrs: h.attrs,
         })
         .collect()
+}
+
+/// Rows for a BM25 query.
+///
+/// `$dist` carries the relevance score unchanged, because for BM25 HIGHER is
+/// better — the opposite of a vector distance. Running these through the vector
+/// conversion would invert the ranking, which is the same trap as the score/dist
+/// flip, in the other direction.
+pub fn to_v2_score_rows(hits: Vec<crate::doc::Hit>) -> Vec<V2Row> {
+    hits.into_iter().map(|h| V2Row { id: h.id, dist: Some(h.score), attrs: h.attrs }).collect()
 }
 
 /// Rows for an attribute-ordered query, which carries no distance.
@@ -414,7 +471,11 @@ pub fn to_v2_metadata(name: &str, m: &Manifest) -> V2Metadata {
                         ty: *ty,
                         filterable: Some(true),
                         glob: None,
-                        full_text_search: None,
+                        full_text_search: m
+                            .schema
+                            .fts
+                            .get(k)
+                            .map(|c| FullText::Config(Box::new(c.clone()))),
                     },
                 )
             })
@@ -443,6 +504,26 @@ mod tests {
     }
 
     #[test]
+    fn rank_by_parses_bm25() {
+        let got: RankBy = serde_json::from_str(r#"["content","BM25","quick fox"]"#).unwrap();
+        assert_eq!(
+            got,
+            RankBy::Bm25 { attribute: "content".into(), query: "quick fox".into() }
+        );
+        let (req, exact) = V2Query { rank_by: Some(got), ..Default::default() }
+            .into_native(8)
+            .unwrap();
+        assert!(!exact);
+        assert!(req.vector.is_empty(), "a text query needs no vector");
+        let t = req.text.unwrap();
+        assert_eq!(t.attribute, "content");
+        assert_eq!(t.query, "quick fox");
+
+        // A non-string argument is a shape error, not a mis-parse.
+        assert!(serde_json::from_str::<RankBy>(r#"["content","BM25",[1.0]]"#).is_err());
+    }
+
+    #[test]
     fn rank_by_parses_attribute_ordering() {
         let asc: RankBy = serde_json::from_str(r#"["created_at","asc"]"#).unwrap();
         assert_eq!(asc, RankBy::Order { attribute: "created_at".into(), descending: false });
@@ -468,7 +549,7 @@ mod tests {
 
     #[test]
     fn unimplemented_rank_functions_are_named_not_swallowed() {
-        for f in ["BM25", "SparseKNN"] {
+        for f in ["SparseKNN"] {
             let got: RankBy =
                 serde_json::from_str(&format!(r#"["a","{f}",[1.0]]"#)).unwrap();
             assert_eq!(got, RankBy::Unsupported(f.into()));

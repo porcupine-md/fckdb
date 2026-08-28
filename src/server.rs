@@ -435,8 +435,8 @@ async fn query(
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
-    if req.order_by.is_none() && req.vector.is_empty() {
-        return Err(bad("query requires either a vector or order_by"));
+    if req.order_by.is_none() && req.text.is_none() && req.vector.is_empty() {
+        return Err(bad("query requires a vector, order_by, or text"));
     }
     if req.vector.iter().any(|f| !f.is_finite()) {
         return Err(bad("query vector must not contain NaN or infinity"));
@@ -595,6 +595,8 @@ fn classify(e: anyhow::Error) -> AppError {
     let msg = format!("{e:#}");
     let client = [
         "declared",
+        "not enabled for full-text",
+        "has not been compacted",
         "dimensions",
         "distance_metric",
         "cannot interpret",
@@ -639,6 +641,7 @@ async fn v2_write(
     let config = WriteConfig {
         metric: body.distance_metric,
         declared_types: body.declared_types(),
+        declared_fts: body.declared_fts(),
     };
     // Which counters to report is decided by what was asked for, before
     // translation loses that information.
@@ -675,7 +678,7 @@ async fn v2_query(
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
     let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify)?;
-    let ordering = req.order_by.is_some();
+    let ordering = req.order_by.is_some() || req.text.is_some();
     if !ordering && (req.vector.is_empty() || req.vector.iter().any(|f| !f.is_finite())) {
         return Err(bad("rank_by vector must be non-empty and finite"));
     }
@@ -695,8 +698,14 @@ async fn v2_query(
         handle.ns.query(&req).await.map_err(classify)?.hits
     };
 
-    let rows = if ordering {
+    let rows = if req.order_by.is_some() {
+        // Ordering by attribute reports no distance at all.
         crate::compat::to_v2_ordered_rows(hits)
+    } else if req.text.is_some() {
+        // BM25 reports a relevance score in $dist, where HIGHER is better —
+        // unlike a vector distance. Passing it through the vector conversion
+        // would invert the ranking.
+        crate::compat::to_v2_score_rows(hits)
     } else {
         crate::compat::to_v2_rows(hits, metric)
     };
@@ -1349,7 +1358,6 @@ mod tests {
         .await;
 
         for body in [
-            json!({ "rank_by": ["text", "BM25", "hello"] }),
             json!({ "rank_by": ["vec", "SparseKNN", [1.0]] }),
             json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]],
                     "aggregate_by": { "n": ["Count"] } }),
@@ -1484,6 +1492,168 @@ mod tests {
         let ids: Vec<u64> =
             res["rows"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn v2_bm25_full_text_search() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpb",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "vector": [1.0, 0.0],
+                      "body": "the quick brown fox jumps over the lazy dog" },
+                    { "id": 2, "vector": [0.0, 1.0], "body": "a quick brown dog" },
+                    { "id": 3, "vector": [0.5, 0.5], "body": "unrelated notes about databases" },
+                ],
+                "schema": { "body": { "type": "string", "full_text_search": true } }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        // BM25 needs the term index, which compaction builds.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpb/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["body", "BM25", "quick fox"], "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unbuilt text index should be an actionable error, not a 500: {res}"
+        );
+
+        let (status, _) =
+            call(&state, "POST", "/v1/namespaces/tpb/compact", Some(TOKEN_A), None).await;
+        assert_eq!(status, StatusCode::OK, "compaction is a native operation");
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpb/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "rank_by": ["body", "BM25", "quick fox"],
+                "top_k": 5,
+                "include_attributes": ["body"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let rows = res["rows"].as_array().unwrap();
+        // Document 1 has both terms; 2 has only "quick"; 3 has neither and must
+        // be absent rather than scored zero.
+        assert_eq!(rows.len(), 2, "BM25 returned the wrong set: {res}");
+        assert_eq!(rows[0]["id"], 1);
+        assert_eq!(rows[1]["id"], 2);
+        // For BM25, $dist is a relevance score: HIGHER is better, the opposite of
+        // a vector distance. Passing it through the distance conversion would
+        // invert the ranking.
+        let d0 = rows[0]["$dist"].as_f64().unwrap();
+        let d1 = rows[1]["$dist"].as_f64().unwrap();
+        assert!(d0 > d1, "BM25 $dist was inverted: {d0} then {d1}");
+        assert!(rows[0]["body"].as_str().unwrap().contains("fox"));
+
+        // Stemming: "foxes" finds "fox".
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpb/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["body", "BM25", "foxes jumping"], "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(res["rows"][0]["id"], 1, "stemming did not match foxes to fox");
+
+        // A term nobody has returns nothing, not a page of zeroes.
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpb/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["body", "BM25", "zebra"], "top_k": 5 })),
+        )
+        .await;
+        assert!(res["rows"].as_array().unwrap().is_empty());
+
+        // An attribute without full_text_search is refused by name.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpb/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["nope", "BM25", "quick"], "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+    }
+
+    #[tokio::test]
+    async fn v2_full_text_filters() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpft",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "vector": [1.0, 0.0], "body": "the king of spain visited" },
+                    { "id": 2, "vector": [0.9, 0.1], "body": "spain beat the king in chess" },
+                    { "id": 3, "vector": [0.8, 0.2], "body": "database internals" },
+                ],
+                "schema": { "body": { "type": "string", "full_text_search": true } }
+            })),
+        )
+        .await;
+        call(&state, "POST", "/v1/namespaces/tpft/compact", Some(TOKEN_A), None).await;
+
+        let query = |filter: Value| {
+            let state = state.clone();
+            async move {
+                let (status, res) = call(
+                    &state,
+                    "POST",
+                    "/v2/namespaces/tpft/query",
+                    Some(TOKEN_A),
+                    Some(json!({
+                        "rank_by": ["vector", "ANN", [1.0, 0.0]],
+                        "top_k": 10,
+                        "filters": filter,
+                    })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{res}");
+                let mut ids: Vec<u64> = res["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["id"].as_u64().unwrap())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        // Both mention king and spain somewhere.
+        assert_eq!(query(json!(["body", "ContainsAllTokens", "king spain"])).await, vec![1, 2]);
+        // Only one has them as a phrase — and "of" being a stopword must not
+        // break the adjacency.
+        assert_eq!(
+            query(json!(["body", "ContainsTokenSequence", "king of spain"])).await,
+            vec![1]
+        );
+        // Reversed, the phrase appears nowhere.
+        assert!(query(json!(["body", "ContainsTokenSequence", "spain king"])).await.is_empty());
+        // Fuzzy tolerates a typo on a long enough token.
+        assert_eq!(query(json!(["body", "Fuzzy", "databse"])).await, vec![3]);
+        assert!(query(json!(["body", "Fuzzy", "zzzzzzzz"])).await.is_empty());
     }
 
     #[tokio::test]

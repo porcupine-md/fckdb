@@ -208,7 +208,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 149 tests
+cargo test                       # 174 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -265,10 +265,11 @@ architecture*, not a drop-in replacement.
 | Partial update | `patch_rows`, `patch_columns` | ✅ `Record::Patch` — merge, with null removing an attribute |
 | Order by attribute | `rank_by: ["attr","desc"]` | ✅ same shape, `$dist` omitted |
 | Attribute index | inverted, per attribute | ✅ built by compaction; drives exact filtered search |
+| BM25 full-text | `rank_by: ["body","BM25","query"]`, `ContainsAllTokens`, `ContainsTokenSequence`, `Fuzzy` | ✅ all four, with stemming and phrase positions |
 | Aggregations | `aggregate_by`, group-by | none — returns **501** |
 | Multi-vector, sharding, CMEK | yes | no |
 
-The common subset now works: a client doing row or column upserts, deletes,
+BM25 is in. The common subset now works: a client doing row or column upserts, deletes,
 patches, filter-based writes, ANN or kNN queries with typed filters and
 `include_attributes` can point at `/v2` unchanged. What remains is BM25, sparse
 vectors, aggregations, multi-query and sharding — each new engine work rather
@@ -314,10 +315,14 @@ Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
 - **Order by attribute** (`rank_by: ["created_at","desc"]`), with missing values
   last in both directions and ties broken by id so pages are stable
 
+- **BM25 full-text search** (`src/fts.rs`): tokenizer with stemming, stopwords,
+  ASCII folding and token-length limits; a **positional** inverted index per
+  attribute; textbook BM25 scoring; and the `ContainsAllTokens`,
+  `ContainsTokenSequence` (phrase) and `Fuzzy` filter operators
+
 **Next, in dependency order**
 
-1. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
-   each its own project
+1. **Aggregations**, sparse vectors, multi-query, sharding — each its own project
 
 Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
 a similarity, so the conversion inverts ordering — that needs a test asserting
@@ -348,6 +353,9 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Order-by scans candidates instead of walking the sorted index | `doc::order_by` | answer from `ids` + one index object, reading no vectors |
 | `ids_matching` falls back to a full scan whenever the WAL is non-empty | `Namespace::ids_matching` | index the tail, or resolve only WAL-touched ids |
 | Negations (`NotEq`, `NotIn`, …) are not answerable from the index | `attrindex::AttrIndex::select` | store the document universe per attribute |
+| A full-text query fetches the whole term index object | `fts::FtsIndex` | term dictionary with offsets at the tail, then range-request only the query's terms |
+| Stopword lists exist for English only | `fts::EN_STOPWORDS` | a data change, not a code change — the stemmer already switches by language |
+| BM25 scores the unindexed tail one document at a time | `Namespace::query` | index the tail incrementally |
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |
 | Blocking `pread` on the async runtime | `cache::RingCache` | `spawn_blocking` or io_uring |
