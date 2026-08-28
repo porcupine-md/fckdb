@@ -183,6 +183,8 @@ pub enum RankBy {
     Order { attribute: String, descending: bool },
     /// BM25 full-text ranking over a text attribute.
     Bm25 { attribute: String, query: String },
+    /// Sparse-vector similarity over a `{}f16` attribute.
+    SparseKnn { attribute: String, vector: crate::sparse::SparseVector },
     /// Recognised but not implemented yet, so it can be reported as such rather
     /// than mis-parsed as something else.
     Unsupported(String),
@@ -230,6 +232,15 @@ fn parse_rank_by(raw: &serde_json::Value) -> Result<RankBy> {
         .ok_or_else(|| anyhow::anyhow!("rank_by function must be a string"))?;
 
     match func {
+        "SparseKNN" => {
+            let vector: crate::sparse::SparseVector = serde_json::from_value(arr[2].clone())
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "rank_by SparseKNN expects an object of dimension weights"
+                    )
+                })?;
+            Ok(RankBy::SparseKnn { attribute, vector })
+        }
         "BM25" => {
             let query = arr[2]
                 .as_str()
@@ -276,6 +287,7 @@ pub enum ConsistencyLevel {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct V2Query {
     #[serde(default)]
     pub rank_by: Option<RankBy>,
@@ -292,9 +304,13 @@ pub struct V2Query {
     /// Recognised so an unsupported value is reported rather than ignored.
     #[serde(default)]
     pub vector_encoding: Option<String>,
-    /// Multi-query. Recognised and reported as unimplemented.
+    /// Sub-queries executed together. Mutually exclusive with the ordinary
+    /// query fields.
     #[serde(default)]
-    pub queries: Option<Vec<serde_json::Value>>,
+    pub queries: Option<Vec<V2Query>>,
+    /// Fuse the sub-queries' rows into one ranked list.
+    #[serde(default)]
+    pub rerank_by: Option<RerankBy>,
     #[serde(default)]
     pub aggregate_by: Option<BTreeMap<String, Agg>>,
     #[serde(default)]
@@ -308,9 +324,43 @@ const EVENTUAL_MAX_AGE_MS: u64 = 3_600_000;
 impl V2Query {
     /// Translate into the native request. Returns the request and whether the
     /// index should be bypassed (`kNN` means exact).
+    /// Up to this many sub-queries per request, matching turbopuffer.
+    pub const MAX_SUBQUERIES: usize = 16;
+
+    /// Validate a multi-query and hand back its sub-queries.
+    ///
+    /// `consistency` and `vector_encoding` belong on the root object; a
+    /// sub-query carrying either is rejected rather than silently ignored,
+    /// because ignoring it would serve a stale answer to a caller who asked for
+    /// a fresh one.
+    pub fn split_multi(self) -> Result<Option<(Vec<V2Query>, Option<RerankBy>, usize)>> {
+        let Some(queries) = self.queries else { return Ok(None) };
+        if self.rank_by.is_some() || self.aggregate_by.is_some() || self.filters.is_some() {
+            bail!("`queries` is mutually exclusive with the ordinary query fields");
+        }
+        if queries.is_empty() {
+            bail!("`queries` must contain at least one sub-query");
+        }
+        if queries.len() > Self::MAX_SUBQUERIES {
+            bail!("at most {} sub-queries per request, got {}", Self::MAX_SUBQUERIES, queries.len());
+        }
+        for q in &queries {
+            if q.consistency.is_some() || q.vector_encoding.is_some() {
+                bail!("consistency and vector_encoding belong on the root object");
+            }
+            if q.queries.is_some() {
+                bail!("sub-queries cannot themselves be multi-queries");
+            }
+        }
+        // The fused list is capped by the root limit, defaulting like a single
+        // query would.
+        let limit = self.top_k.or(self.limit.map(|l| l.total)).unwrap_or(10);
+        Ok(Some((queries, self.rerank_by, limit)))
+    }
+
     pub fn into_native(self, nprobe: usize) -> Result<(QueryRequest, bool)> {
         if self.queries.is_some() {
-            bail!("multi-queries are not implemented");
+            bail!("`queries` must be handled as a multi-query, not converted directly");
         }
         if let Some(enc) = &self.vector_encoding
             && enc != "float"
@@ -340,6 +390,7 @@ impl V2Query {
                         include_attributes: Include::None,
                         order_by: None,
                         text: None,
+                        sparse: None,
                         aggregate_by: self.aggregate_by,
                         group_by: self.group_by,
                     },
@@ -348,6 +399,7 @@ impl V2Query {
             }
             bail!("rank_by is required");
         };
+        let mut sparse = None;
         let (vector, exact, order_by, text) = match rank_by {
             RankBy::Ann { vector, .. } => (vector, false, None, None),
             RankBy::Knn { vector, .. } => (vector, true, None, None),
@@ -360,6 +412,10 @@ impl V2Query {
                 None,
                 Some(crate::wire::TextSearch { attribute, query }),
             ),
+            RankBy::SparseKnn { attribute, vector } => {
+                sparse = Some(crate::wire::SparseSearch { attribute, vector });
+                (vec![], false, None, None)
+            }
             RankBy::Unsupported(f) => bail!("rank_by function {f:?} is not implemented"),
         };
 
@@ -394,6 +450,7 @@ impl V2Query {
                 include_attributes: self.include_attributes,
                 order_by,
                 text,
+                sparse,
                 aggregate_by: self.aggregate_by,
                 group_by: self.group_by,
             },
@@ -412,6 +469,12 @@ pub struct V2Row {
     pub dist: Option<f32>,
     #[serde(flatten)]
     pub attrs: Attrs,
+}
+
+/// A multi-query response: one result object per sub-query, in order.
+#[derive(Debug, Clone, Serialize)]
+pub struct V2MultiResponse {
+    pub results: Vec<V2QueryResponse>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -465,6 +528,83 @@ pub fn to_v2_rows(hits: Vec<crate::doc::Hit>, metric: DistanceMetric) -> Vec<V2R
                 DistanceMetric::DotProduct => -h.score,
             }),
             attrs: h.attrs,
+        })
+        .collect()
+}
+
+/// How a multi-query's result lists are combined.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RerankBy {
+    /// Reciprocal rank fusion.
+    Rrf { k: f32 },
+}
+
+/// The conventional RRF constant. Larger flattens the contribution of top ranks.
+const RRF_K: f32 = 60.0;
+
+impl<'de> Deserialize<'de> for RerankBy {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<RerankBy, D::Error> {
+        let raw = serde_json::Value::deserialize(d)?;
+        let arr = raw
+            .as_array()
+            .ok_or_else(|| de::Error::custom(format!("rerank_by must be an array, got {raw}")))?;
+        match arr.first().and_then(|v| v.as_str()) {
+            Some("RRF") => {
+                let k = arr
+                    .get(1)
+                    .and_then(|c| c.get("k"))
+                    .and_then(|k| k.as_f64())
+                    .map(|k| k as f32)
+                    .unwrap_or(RRF_K);
+                if k <= 0.0 {
+                    return Err(de::Error::custom("RRF k must be positive"));
+                }
+                Ok(RerankBy::Rrf { k })
+            }
+            Some(other) => {
+                Err(de::Error::custom(format!("rerank function {other:?} is not implemented")))
+            }
+            None => Err(de::Error::custom("rerank_by must name a function")),
+        }
+    }
+}
+
+/// Reciprocal rank fusion.
+///
+/// Each list contributes `1 / (k + rank)` per document. Only RANKS are used, not
+/// scores — which is the entire point: a BM25 relevance score and a cosine
+/// distance live on incomparable scales, and any attempt to blend the numbers
+/// directly would let whichever happens to be larger dominate the result.
+pub fn rrf(lists: Vec<Vec<V2Row>>, k: f32, limit: usize) -> Vec<V2Row> {
+    let mut fused: BTreeMap<Id, (f32, V2Row)> = BTreeMap::new();
+    for list in lists {
+        for (rank, row) in list.into_iter().enumerate() {
+            let contribution = 1.0 / (k + rank as f32 + 1.0);
+            match fused.get_mut(&row.id) {
+                Some((score, existing)) => {
+                    *score += contribution;
+                    // Keep whichever copy actually carries attributes, so a
+                    // sub-query that requested none does not blank them out.
+                    if existing.attrs.is_empty() && !row.attrs.is_empty() {
+                        existing.attrs = row.attrs;
+                    }
+                }
+                None => {
+                    fused.insert(row.id.clone(), (contribution, row));
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<(f32, V2Row)> = fused.into_values().collect();
+    out.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    out.truncate(limit);
+    out.into_iter()
+        .map(|(score, mut row)| {
+            // The fused score replaces the per-list one, which no longer means
+            // anything once two scales have been mixed.
+            row.dist = Some(score);
+            row
         })
         .collect()
 }
@@ -606,6 +746,120 @@ mod tests {
         assert_eq!(json["aggregation_groups"][0]["n"], 42);
     }
 
+    fn row(id: u64, dist: f32) -> V2Row {
+        V2Row { id: Id::Uint(id), dist: Some(dist), attrs: Attrs::new() }
+    }
+
+    #[test]
+    fn rrf_fuses_by_rank_not_by_score() {
+        // Two lists on wildly different scales. If scores were blended, list B
+        // would dominate entirely; RRF only looks at position.
+        let a = vec![row(1, 0.01), row(2, 0.02), row(3, 0.03)];
+        let b = vec![row(3, 900.0), row(1, 500.0)];
+        let fused = rrf(vec![a, b], 60.0, 5);
+
+        let ids: Vec<u64> = fused.iter().map(|r| r.id.as_uint().unwrap()).collect();
+        // 1 is rank 0 and rank 1; 3 is rank 2 and rank 0. Both beat 2, which
+        // appears in one list only.
+        assert_eq!(ids[..2].iter().collect::<std::collections::BTreeSet<_>>().len(), 2);
+        assert!(ids[..2].contains(&1) && ids[..2].contains(&3), "got {ids:?}");
+        assert_eq!(ids[2], 2);
+
+        // Scores are RRF contributions, not either input scale.
+        let scores: Vec<f32> = fused.iter().map(|r| r.dist.unwrap()).collect();
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "not ordered: {scores:?}");
+        assert!(scores[0] < 1.0, "a raw score leaked through: {scores:?}");
+        let expected = 1.0 / 61.0 + 1.0 / 62.0;
+        assert!((scores[0] - expected).abs() < 1e-6, "got {}", scores[0]);
+    }
+
+    #[test]
+    fn rrf_keeps_attributes_from_whichever_list_has_them() {
+        let mut with = row(1, 1.0);
+        with.attrs.insert("title".into(), Value::from("kept"));
+        let without = row(1, 2.0);
+        // Whichever order the lists arrive in, the attributes survive: a
+        // sub-query that requested none must not blank out one that did.
+        for lists in [vec![vec![without.clone()], vec![with.clone()]], vec![vec![with], vec![without]]] {
+            let fused = rrf(lists, 60.0, 5);
+            assert_eq!(fused.len(), 1);
+            assert_eq!(fused[0].attrs["title"], Value::from("kept"));
+        }
+    }
+
+    #[test]
+    fn rrf_respects_the_limit_and_handles_degenerate_input() {
+        let a = vec![row(1, 1.0), row(2, 1.0), row(3, 1.0)];
+        assert_eq!(rrf(vec![a.clone()], 60.0, 2).len(), 2);
+        assert!(rrf(vec![], 60.0, 5).is_empty());
+        assert!(rrf(vec![vec![]], 60.0, 5).is_empty());
+        // A single list comes back in its original order.
+        let ids: Vec<u64> =
+            rrf(vec![a], 60.0, 5).iter().map(|r| r.id.as_uint().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn rerank_by_parses_and_rejects() {
+        assert_eq!(
+            serde_json::from_str::<RerankBy>(r#"["RRF"]"#).unwrap(),
+            RerankBy::Rrf { k: RRF_K }
+        );
+        assert_eq!(
+            serde_json::from_str::<RerankBy>(r#"["RRF",{"k":10}]"#).unwrap(),
+            RerankBy::Rrf { k: 10.0 }
+        );
+        for bad in [r#""RRF""#, r#"[]"#, r#"["Magic"]"#, r#"["RRF",{"k":0}]"#, r#"["RRF",{"k":-1}]"#] {
+            assert!(serde_json::from_str::<RerankBy>(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn multi_query_validation() {
+        let split = |json: &str| serde_json::from_str::<V2Query>(json).unwrap().split_multi();
+        // Not a multi-query at all.
+        assert!(split(r#"{"rank_by":["v","ANN",[1.0]]}"#).unwrap().is_none());
+
+        let (subs, rerank, limit) = split(
+            r#"{"top_k":7,"rerank_by":["RRF"],"queries":[{"rank_by":["v","ANN",[1.0]]}]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(rerank, Some(RerankBy::Rrf { k: RRF_K }));
+        assert_eq!(limit, 7, "the fused list is capped by the root limit");
+
+        assert!(split(r#"{"queries":[]}"#).is_err());
+        assert!(
+            split(r#"{"queries":[{"rank_by":["v","ANN",[1.0]]}],"filters":["a","Eq",1]}"#).is_err()
+        );
+        assert!(
+            split(r#"{"queries":[{"rank_by":["v","ANN",[1.0]],"vector_encoding":"float"}]}"#)
+                .is_err(),
+            "vector_encoding belongs on the root object"
+        );
+    }
+
+    #[test]
+    fn rank_by_parses_sparse_knn() {
+        let got: RankBy =
+            serde_json::from_str(r#"["terms","SparseKNN",{"cat":1.0,"dog":0.5}]"#).unwrap();
+        match got {
+            RankBy::SparseKnn { ref attribute, ref vector } => {
+                assert_eq!(attribute, "terms");
+                assert_eq!(vector.len(), 2);
+                assert_eq!(vector["cat"], 1.0);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let (req, _) = V2Query { rank_by: Some(got), ..Default::default() }.into_native(8).unwrap();
+        assert!(req.vector.is_empty(), "a sparse query needs no dense vector");
+        assert_eq!(req.sparse.unwrap().attribute, "terms");
+
+        // A dense array is the wrong shape for SparseKNN.
+        assert!(serde_json::from_str::<RankBy>(r#"["terms","SparseKNN",[1.0,2.0]]"#).is_err());
+    }
+
     #[test]
     fn rank_by_parses_bm25() {
         let got: RankBy = serde_json::from_str(r#"["content","BM25","quick fox"]"#).unwrap();
@@ -654,7 +908,7 @@ mod tests {
 
     #[test]
     fn unimplemented_rank_functions_are_named_not_swallowed() {
-        for f in ["SparseKNN"] {
+        for f in ["Frobnicate"] {
             let got: RankBy =
                 serde_json::from_str(&format!(r#"["a","{f}",[1.0]]"#)).unwrap();
             assert_eq!(got, RankBy::Unsupported(f.into()));

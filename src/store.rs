@@ -14,6 +14,7 @@
 
 use crate::attrindex::{self, AttrIndex};
 use crate::fts::FtsIndex;
+use crate::sparse::SparseIndex;
 use crate::cache::RingCache;
 use crate::doc::{DistanceMetric, Doc, Filter, Id, Include, Record, Schema};
 use crate::value::Type;
@@ -782,8 +783,10 @@ impl Namespace {
         };
 
         // A request that only aggregates has nothing to rank.
-        let ranking_requested =
-            !req.vector.is_empty() || req.text.is_some() || req.order_by.is_some();
+        let ranking_requested = !req.vector.is_empty()
+            || req.text.is_some()
+            || req.sparse.is_some()
+            || req.order_by.is_some();
         if req.aggregate_by.is_some() && !ranking_requested {
             return Ok(QueryResponse {
                 hits: vec![],
@@ -793,6 +796,92 @@ impl Namespace {
                 ordered: false,
                 aggregations,
                 aggregation_groups,
+                unindexed_records,
+                unindexed_bytes,
+                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
+                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
+                took_ms: t.elapsed().as_millis() as u64,
+            });
+        }
+
+        // Sparse-vector ranking: score from the inverted list, then the tail on
+        // the same measure so recent writes stay rankable.
+        if let Some(sp) = &req.sparse {
+            let Some(idx) = &m.index else {
+                bail!("sparse search needs an index; namespace has not been compacted yet");
+            };
+            let Some(object) = idx.sparse.get(&sp.attribute) else {
+                bail!("attribute {:?} is not a sparse vector", sp.attribute);
+            };
+            let index =
+                SparseIndex::decode(&self.read_immutable(&self.data_path(object)).await?)?;
+
+            let seg_paths: Vec<Path> =
+                m.segments.iter().map(|s| self.data_path(&s.name)).collect();
+            let wal_paths: Vec<Path> =
+                wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
+            let seg_records = self.read_records_parallel(seg_paths).await?;
+            let tail = self.read_records_parallel(wal_paths).await?;
+
+            let mut live: HashMap<Id, Doc> = HashMap::new();
+            for r in &seg_records {
+                apply(&mut live, r.clone());
+            }
+            for r in &tail {
+                apply(&mut live, r.clone());
+            }
+            let touched: std::collections::HashSet<Id> =
+                tail.iter().map(|r| r.id().clone()).collect();
+
+            let matches = |doc: &Doc| {
+                filter.as_ref().is_none_or(|f| f.matches(&doc.attrs, &m.schema.fts))
+            };
+            let mut hits: Vec<Hit> = Vec::new();
+
+            for (ordinal, score) in index.score(&sp.vector) {
+                let Some(Record::Upsert(indexed)) = seg_records.get(ordinal as usize) else {
+                    continue;
+                };
+                if touched.contains(&indexed.id) {
+                    continue;
+                }
+                let Some(doc) = live.get(&indexed.id) else { continue };
+                if matches(doc) {
+                    hits.push(Hit {
+                        id: doc.id.clone(),
+                        score,
+                        attrs: req.include_attributes.project(&doc.attrs),
+                    });
+                }
+            }
+            for id in &touched {
+                let Some(doc) = live.get(id) else { continue };
+                let Some(crate::value::Value::Sparse(v)) = doc.attrs.get(&sp.attribute) else {
+                    continue;
+                };
+                let score = crate::sparse::dot(v, &sp.vector);
+                if score != 0.0 && matches(doc) {
+                    hits.push(Hit {
+                        id: doc.id.clone(),
+                        score,
+                        attrs: req.include_attributes.project(&doc.attrs),
+                    });
+                }
+            }
+
+            hits.sort_unstable_by(|a, b| {
+                b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
+            });
+            hits.truncate(req.top_k);
+
+            return Ok(QueryResponse {
+                hits,
+                consistent: !from_snapshot && !truncated,
+                indexed: true,
+                prefiltered: false,
+                ordered: false,
+                aggregations: aggregations.clone(),
+                aggregation_groups: aggregation_groups.clone(),
                 unindexed_records,
                 unindexed_bytes,
                 object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
@@ -1271,6 +1360,42 @@ impl Namespace {
                     r?;
                 }
 
+                // One inverted list per sparse-vector attribute.
+                let mut sparse_names = std::collections::BTreeMap::new();
+                let mut sparse_writes = Vec::new();
+                for (attribute, ty) in &m.schema.attributes {
+                    if *ty != Type::SparseF16 {
+                        continue;
+                    }
+                    let vectors: Vec<(u32, crate::sparse::SparseVector)> = docs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(o, d)| match d.attrs.get(attribute) {
+                            Some(crate::value::Value::Sparse(v)) => Some((o as u32, v.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    let built = SparseIndex::build(
+                        vectors.iter().map(|(o, v)| (*o, v)),
+                        docs.len(),
+                    );
+                    if built.is_empty() {
+                        continue;
+                    }
+                    let name = format!("{}.spx", uuid::Uuid::new_v4());
+                    let blob = built.encode();
+                    index_bytes += blob.len() as u64;
+                    sparse_names.insert(attribute.clone(), name.clone());
+                    sparse_writes.push((self.data_path(&name), blob));
+                }
+                for r in futures::future::join_all(
+                    sparse_writes.iter().map(|(p, b)| self.put_object(p, b.clone())),
+                )
+                .await
+                {
+                    r?;
+                }
+
                 clusters_written = cluster_names.len();
                 new_index = Some(IndexMeta {
                     dim: docs[0].vector.len(),
@@ -1281,6 +1406,7 @@ impl Namespace {
                     ids: Some(ids_name),
                     attributes: attr_names,
                     fts: fts_names,
+                    sparse: sparse_names,
                 });
             }
         }

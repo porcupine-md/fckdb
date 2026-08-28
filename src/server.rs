@@ -20,7 +20,9 @@
 use crate::cache::RingCache;
 use crate::doc::Record;
 use crate::ops::{self, Pricing};
-use crate::compat::{V2Metadata, V2Query, V2QueryResponse, V2Write, V2WriteResponse};
+use crate::compat::{
+    V2Metadata, V2MultiResponse, V2Query, V2QueryResponse, V2Write, V2WriteResponse,
+};
 use crate::store::{
     GroupCommit, MAX_DELETE_BY_FILTER_ROWS, MAX_PATCH_BY_FILTER_ROWS,
     MAX_UNINDEXED_SCAN_BYTES, Namespace, WriteConfig,
@@ -28,7 +30,8 @@ use crate::store::{
 use crate::wire::{QueryRequest, WriteRequest, WriteResponse};
 use crate::doc::Doc;
 use anyhow::Result;
-use axum::extract::{DefaultBodyLimit, Path as AxPath, Request, State};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, FromRequest, Path as AxPath, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -238,6 +241,28 @@ fn bad(msg: impl Into<String>) -> AppError {
 
 type ApiResult<T> = std::result::Result<T, AppError>;
 
+/// `Json`, but a malformed body is a 400 with a JSON error body.
+///
+/// Axum's own rejection is a 422 with a plain-text body, which is a second error
+/// shape for clients to handle and a status they are unlikely to be checking for.
+/// One shape for every failure is worth fifteen lines.
+pub struct AppJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for AppJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> std::result::Result<Self, Self::Rejection> {
+        let Json(value) = Json::<T>::from_request(req, state)
+            .await
+            .map_err(|e| AppError(StatusCode::BAD_REQUEST, e.body_text()))?;
+        Ok(AppJson(value))
+    }
+}
+
 // ---------------------------------------------------------------- middleware
 
 async fn authenticate(
@@ -261,7 +286,7 @@ async fn write(
     State(state): State<AppState>,
     Extension(Org(org)): Extension<Org>,
     AxPath(name): AxPath<String>,
-    Json(body): Json<WriteRequest>,
+    AppJson(body): AppJson<WriteRequest>,
 ) -> ApiResult<Json<WriteResponse>> {
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
@@ -430,17 +455,18 @@ async fn query(
     State(state): State<AppState>,
     Extension(Org(org)): Extension<Org>,
     AxPath(name): AxPath<String>,
-    Json(req): Json<QueryRequest>,
+    AppJson(req): AppJson<QueryRequest>,
 ) -> ApiResult<Response> {
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
     if req.order_by.is_none()
         && req.text.is_none()
+        && req.sparse.is_none()
         && req.aggregate_by.is_none()
         && req.vector.is_empty()
     {
-        return Err(bad("query requires a vector, order_by, text, or aggregate_by"));
+        return Err(bad("query requires a vector, order_by, text, sparse, or aggregate_by"));
     }
     if req.vector.iter().any(|f| !f.is_finite()) {
         return Err(bad("query vector must not contain NaN or infinity"));
@@ -620,6 +646,7 @@ fn classify(e: anyhow::Error) -> AppError {
         "declared",
         "needs a numeric",
         "not enabled for full-text",
+        "is not a sparse vector",
         "has not been compacted",
         "dimensions",
         "distance_metric",
@@ -647,7 +674,7 @@ async fn v2_write(
     State(state): State<AppState>,
     Extension(Org(org)): Extension<Org>,
     AxPath(name): AxPath<String>,
-    Json(body): Json<V2Write>,
+    AppJson(body): AppJson<V2Write>,
 ) -> ApiResult<Response> {
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
@@ -696,32 +723,84 @@ async fn v2_query(
     State(state): State<AppState>,
     Extension(Org(org)): Extension<Org>,
     AxPath(name): AxPath<String>,
-    Json(body): Json<V2Query>,
+    AppJson(body): AppJson<V2Query>,
 ) -> ApiResult<Response> {
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
-    let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify_request)?;
-    let aggregating = req.aggregate_by.is_some();
-    let grouped = !req.group_by.is_empty();
-    let ordering = req.order_by.is_some() || req.text.is_some() || aggregating;
-    if !ordering && (req.vector.is_empty() || req.vector.iter().any(|f| !f.is_finite())) {
-        return Err(bad("rank_by vector must be non-empty and finite"));
+
+    // A multi-query runs each sub-query against the same namespace, then either
+    // reports them separately or fuses them into one list.
+    let consistency = body.consistency;
+    if let Some((subqueries, rerank, limit)) =
+        body.clone().split_multi().map_err(classify_request)?
+    {
+        let handle = state.resident(&org, &name);
+        let (manifest, _) = handle.ns.load().await?;
+        let metric = manifest.schema.distance_metric;
+
+        let mut results = Vec::with_capacity(subqueries.len());
+        for mut sub in subqueries {
+            // Consistency is a property of the request, not of each sub-query.
+            sub.consistency = consistency;
+            let one = run_v2_query(&handle, sub, metric).await?;
+            results.push(one);
+        }
+
+        return match rerank {
+            None => Ok(Json(V2MultiResponse { results }).into_response()),
+            Some(crate::compat::RerankBy::Rrf { k }) => {
+                let lists: Vec<Vec<crate::compat::V2Row>> =
+                    results.into_iter().filter_map(|r| r.rows).collect();
+                if lists.is_empty() {
+                    return Err(bad("rerank_by needs sub-queries that return rows"));
+                }
+                let rows = crate::compat::rrf(lists, k, limit);
+                Ok(Json(V2QueryResponse { rows: Some(rows), ..Default::default() })
+                    .into_response())
+            }
+        };
     }
 
     let handle = state.resident(&org, &name);
     let (manifest, _) = handle.ns.load().await?;
     let metric = manifest.schema.distance_metric;
+    let response = run_v2_query(&handle, body, metric).await?;
+    Ok(Json(response).into_response())
+}
+
+/// Execute one compatibility query and shape its response.
+///
+/// Shared by the single and multi-query paths so a sub-query behaves exactly
+/// like the same query sent on its own.
+async fn run_v2_query(
+    handle: &Resident,
+    body: V2Query,
+    metric: crate::doc::DistanceMetric,
+) -> ApiResult<V2QueryResponse> {
+    let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify_request)?;
+    let aggregating = req.aggregate_by.is_some();
+    let grouped = !req.group_by.is_empty();
+    let ranking = !req.vector.is_empty()
+        || req.text.is_some()
+        || req.sparse.is_some()
+        || req.order_by.is_some();
+
+    if !ranking && !aggregating {
+        return Err(bad("rank_by vector must be non-empty and finite"));
+    }
+    if !req.vector.is_empty() && req.vector.iter().any(|f| !f.is_finite()) {
+        return Err(bad("rank_by vector must be non-empty and finite"));
+    }
 
     // A pure aggregation ranks nothing and reports no rows.
-    if aggregating && req.vector.is_empty() && req.text.is_none() && req.order_by.is_none() {
+    if aggregating && !ranking {
         let res = handle.ns.query(&req).await.map_err(classify)?;
-        return Ok(Json(crate::compat::to_v2_aggregations(
+        return Ok(crate::compat::to_v2_aggregations(
             res.aggregations,
             res.aggregation_groups,
             grouped,
-        ))
-        .into_response());
+        ));
     }
 
     let (hits, aggregated) = if exact {
@@ -741,14 +820,15 @@ async fn v2_query(
     let rows = if req.order_by.is_some() {
         // Ordering by attribute reports no distance at all.
         crate::compat::to_v2_ordered_rows(hits)
-    } else if req.text.is_some() {
-        // BM25 reports a relevance score in $dist, where HIGHER is better —
-        // unlike a vector distance. Passing it through the vector conversion
-        // would invert the ranking.
+    } else if req.text.is_some() || req.sparse.is_some() {
+        // BM25 and sparse similarity both report a score in $dist where HIGHER
+        // is better — unlike a vector distance. Passing either through the
+        // vector conversion would invert the ranking.
         crate::compat::to_v2_score_rows(hits)
     } else {
         crate::compat::to_v2_rows(hits, metric)
     };
+
     // Ranking and aggregating in one request yields both, which is how a faceted
     // result page is fetched in a single round trip.
     let mut response = V2QueryResponse { rows: Some(rows), ..Default::default() };
@@ -757,7 +837,7 @@ async fn v2_query(
         response.aggregations = shaped.aggregations;
         response.aggregation_groups = shaped.aggregation_groups;
     }
-    Ok(Json(response).into_response())
+    Ok(response)
 }
 
 async fn v2_metadata(
@@ -1406,8 +1486,6 @@ mod tests {
         .await;
 
         for body in [
-            json!({ "rank_by": ["vec", "SparseKNN", [1.0]] }),
-            json!({ "queries": [{ "rank_by": ["vector", "ANN", [1.0, 0.0]] }] }),
             json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]], "vector_encoding": "base64" }),
         ] {
             let (status, res) =
@@ -1858,6 +1936,217 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+    }
+
+    #[tokio::test]
+    async fn v2_sparse_vector_search() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpsp",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0], "terms": { "cat": 1.0, "pet": 0.5 } },
+                { "id": 2, "vector": [0.0, 1.0], "terms": { "cat": 0.2, "dog": 1.0 } },
+                { "id": 3, "vector": [0.5, 0.5], "terms": { "car": 2.0 } },
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        // The attribute's type is inferred from the object shape.
+        let (_, md) = call(&state, "GET", "/v1/namespaces/tpsp/metadata", Some(TOKEN_A), None).await;
+        assert_eq!(md["schema"]["terms"]["type"], "{}f16");
+
+        let (status, _) =
+            call(&state, "POST", "/v1/namespaces/tpsp/compact", Some(TOKEN_A), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpsp/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "rank_by": ["terms", "SparseKNN", { "cat": 1.0, "pet": 1.0 }],
+                "top_k": 5
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let rows = res["rows"].as_array().unwrap();
+        // doc1 = 1.0 + 0.5 = 1.5, doc2 = 0.2. doc3 shares no dimension and is
+        // absent rather than scored zero.
+        assert_eq!(rows.len(), 2, "{res}");
+        assert_eq!(rows[0]["id"], 1);
+        assert_eq!(rows[1]["id"], 2);
+        // Sparse similarity is a score: higher is better, like BM25.
+        assert!(rows[0]["$dist"].as_f64().unwrap() > rows[1]["$dist"].as_f64().unwrap());
+        assert!((rows[0]["$dist"].as_f64().unwrap() - 1.5).abs() < 1e-5);
+
+        // A dimension nobody has returns nothing.
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpsp/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["terms", "SparseKNN", { "zebra": 1.0 }], "top_k": 5 })),
+        )
+        .await;
+        assert!(res["rows"].as_array().unwrap().is_empty());
+
+        // An attribute that is not sparse is refused by name.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpsp/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["nope", "SparseKNN", { "cat": 1.0 }], "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+    }
+
+    #[tokio::test]
+    async fn v2_multi_query_and_rrf_hybrid_search() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tphy",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "vector": [1.0, 0.0], "body": "quick brown fox", "n": 1 },
+                    { "id": 2, "vector": [0.0, 1.0], "body": "lazy dog sleeping", "n": 2 },
+                    { "id": 3, "vector": [0.7, 0.7], "body": "quick lazy afternoon", "n": 3 },
+                ],
+                "schema": { "body": { "type": "string", "full_text_search": true } }
+            })),
+        )
+        .await;
+        call(&state, "POST", "/v1/namespaces/tphy/compact", Some(TOKEN_A), None).await;
+
+        // Without rerank_by, each sub-query reports separately and in order.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tphy/query",
+            Some(TOKEN_A),
+            Some(json!({ "queries": [
+                { "rank_by": ["vector", "ANN", [0.0, 1.0]], "top_k": 3 },
+                { "rank_by": ["body", "BM25", "quick"], "top_k": 3 },
+                { "aggregate_by": { "n": ["Count"] } },
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let results = res["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        // Vector query: nearest to [0,1] is doc 2.
+        assert_eq!(results[0]["rows"][0]["id"], 2);
+        // BM25 query: "quick" is in docs 1 and 3.
+        let bm25: Vec<u64> = results[1]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(bm25.len(), 2);
+        // An aggregating sub-query reports aggregations, not rows.
+        assert_eq!(results[2]["aggregations"]["n"], 3);
+        assert!(results[2].get("rows").is_none());
+
+        // With rerank_by RRF, the lists fuse into one. This is hybrid search: a
+        // BM25 relevance score and a cosine distance are on incomparable scales,
+        // so only the RANKS are combined.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tphy/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "top_k": 3,
+                "rerank_by": ["RRF"],
+                "queries": [
+                    { "rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 3 },
+                    { "rank_by": ["body", "BM25", "quick"], "top_k": 3 },
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert!(res.get("results").is_none(), "a fused query also reported per-list results");
+        let rows = res["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        // Document 1 is first in both lists, so it must fuse to the top.
+        assert_eq!(rows[0]["id"], 1);
+        // Fused scores descend, and are RRF contributions rather than either
+        // original scale.
+        let scores: Vec<f64> = rows.iter().map(|r| r["$dist"].as_f64().unwrap()).collect();
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "fused scores not ordered: {scores:?}");
+        assert!(scores[0] < 1.0, "fused score looks like a raw BM25 score: {scores:?}");
+    }
+
+    #[tokio::test]
+    async fn v2_multi_query_validation() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpmv",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] })),
+        )
+        .await;
+
+        let cases: Vec<(&str, Value)> = vec![
+            ("empty queries", json!({ "queries": [] })),
+            (
+                "mixed with ordinary fields",
+                json!({ "queries": [{ "rank_by": ["vector", "ANN", [1.0, 0.0]] }],
+                        "rank_by": ["vector", "ANN", [1.0, 0.0]] }),
+            ),
+            (
+                "consistency inside a sub-query",
+                json!({ "queries": [{ "rank_by": ["vector", "ANN", [1.0, 0.0]],
+                                      "consistency": { "level": "eventual" } }] }),
+            ),
+            (
+                "nested multi-query",
+                json!({ "queries": [{ "queries": [
+                    { "rank_by": ["vector", "ANN", [1.0, 0.0]] }] }] }),
+            ),
+            (
+                "unknown rerank function",
+                json!({ "rerank_by": ["Magic"],
+                        "queries": [{ "rank_by": ["vector", "ANN", [1.0, 0.0]] }] }),
+            ),
+            (
+                "rrf over aggregations only",
+                json!({ "rerank_by": ["RRF"], "queries": [{ "aggregate_by": { "n": ["Count"] } }] }),
+            ),
+        ];
+        for (label, body) in cases {
+            let (status, res) =
+                call(&state, "POST", "/v2/namespaces/tpmv/query", Some(TOKEN_A), Some(body)).await;
+            assert!(status.is_client_error(), "{label} accepted with {status}: {res}");
+        }
+
+        // Seventeen sub-queries is one too many.
+        let too_many: Vec<Value> = (0..17)
+            .map(|_| json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]] }))
+            .collect();
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpmv/query",
+            Some(TOKEN_A),
+            Some(json!({ "queries": too_many })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

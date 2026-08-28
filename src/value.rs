@@ -19,6 +19,7 @@ use serde::de::{self, Deserializer};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 /// Wire tags. Append only — changing one silently reinterprets stored bytes.
 const T_NULL: u8 = 0;
@@ -32,6 +33,7 @@ const T_UUID: u8 = 7;
 const T_STRING_ARRAY: u8 = 8;
 const T_UINT_ARRAY: u8 = 9;
 const T_INT_ARRAY: u8 = 10;
+const T_SPARSE: u8 = 11;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -49,6 +51,12 @@ pub enum Value {
     StringArray(Vec<String>),
     UintArray(Vec<u64>),
     IntArray(Vec<i64>),
+    /// A sparse vector: named dimensions to weights.
+    ///
+    /// turbopuffer spells the type `{}f16`. Weights are stored as f32 here, which
+    /// is a lossless superset of f16 at twice the size — worth revisiting if
+    /// sparse namespaces get large.
+    Sparse(BTreeMap<String, f32>),
 }
 
 /// A declared attribute type, as it appears in a namespace schema.
@@ -70,6 +78,8 @@ pub enum Type {
     UintArray,
     #[serde(rename = "[]int")]
     IntArray,
+    #[serde(rename = "{}f16")]
+    SparseF16,
 }
 
 impl Type {
@@ -85,6 +95,7 @@ impl Type {
             Type::StringArray => "[]string",
             Type::UintArray => "[]uint",
             Type::IntArray => "[]int",
+            Type::SparseF16 => "{}f16",
         }
     }
 }
@@ -105,6 +116,7 @@ impl Value {
             Value::StringArray(_) => Type::StringArray,
             Value::UintArray(_) => Type::UintArray,
             Value::IntArray(_) => Type::IntArray,
+            Value::Sparse(_) => Type::SparseF16,
         })
     }
 
@@ -170,6 +182,10 @@ impl Value {
             (StringArray(a), StringArray(b)) => Some(a.cmp(b)),
             (UintArray(a), UintArray(b)) => Some(a.cmp(b)),
             (IntArray(a), IntArray(b)) => Some(a.cmp(b)),
+            // Sparse vectors have no meaningful order; they are ranked, not
+            // compared. Returning an ordering would let a range filter on one
+            // silently succeed.
+            (Sparse(_), Sparse(_)) => None,
             // Numeric comparison across integer widths goes through i128 so no
             // value is lost; only a float operand falls back to f64.
             (F64(_), _) | (_, F64(_)) => {
@@ -265,6 +281,14 @@ impl Value {
                     b.put_i64_le(*v);
                 }
             }
+            Value::Sparse(m) => {
+                b.put_u8(T_SPARSE);
+                b.put_u32_le(m.len() as u32);
+                for (dim, weight) in m {
+                    put_str(b, dim);
+                    b.put_f32_le(*weight);
+                }
+            }
         }
     }
 
@@ -307,6 +331,16 @@ impl Value {
                     out.push(i64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap()));
                 }
                 Value::IntArray(out)
+            }
+            T_SPARSE => {
+                let n = u32::from_le_bytes(take(buf, pos, 4)?.try_into().unwrap()) as usize;
+                let mut out = BTreeMap::new();
+                for _ in 0..n {
+                    let dim = get_str(buf, pos)?;
+                    let weight = f32::from_le_bytes(take(buf, pos, 4)?.try_into().unwrap());
+                    out.insert(dim, weight);
+                }
+                Value::Sparse(out)
             }
             other => bail!("unknown value tag {other} at offset {}", *pos - 1),
         })
@@ -417,6 +451,14 @@ impl Serialize for Value {
                 }
                 seq.end()
             }
+            Value::Sparse(m) => {
+                use serde::ser::SerializeMap;
+                let mut map = s.serialize_map(Some(m.len()))?;
+                for (dim, weight) in m {
+                    map.serialize_entry(dim, weight)?;
+                }
+                map.end()
+            }
         }
     }
 }
@@ -466,7 +508,22 @@ pub fn from_json(raw: serde_json::Value) -> Result<Value> {
                 bail!("arrays must be all strings or all unsigned integers")
             }
         }
-        J::Object(_) => bail!("nested objects are not supported as attribute values"),
+        // The one object-shaped type is a sparse vector, so an object is read as
+        // one. Anything non-numeric inside is a nested object, which is not a
+        // supported attribute value.
+        J::Object(fields) => {
+            let mut out = BTreeMap::new();
+            for (dim, weight) in fields {
+                let Some(w) = weight.as_f64() else {
+                    bail!(
+                        "attribute values may be a sparse vector of numbers, but {dim:?} holds \
+                         {weight}"
+                    );
+                };
+                out.insert(dim, w as f32);
+            }
+            Value::Sparse(out)
+        }
     })
 }
 
@@ -539,6 +596,11 @@ mod tests {
             Value::UintArray(vec![0, u64::MAX]),
             Value::IntArray(vec![]),
             Value::IntArray(vec![i64::MIN, 0, i64::MAX]),
+            Value::Sparse(BTreeMap::new()),
+            Value::Sparse(BTreeMap::from([
+                ("dim0".to_string(), 0.5f32),
+                ("dim1".to_string(), -1.25f32),
+            ])),
         ]
     }
 
@@ -609,7 +671,37 @@ mod tests {
     fn mixed_arrays_are_rejected() {
         assert!(serde_json::from_str::<Value>(r#"[1,"a"]"#).is_err());
         assert!(serde_json::from_str::<Value>(r#"[{"a":1}]"#).is_err());
-        assert!(serde_json::from_str::<Value>(r#"{"a":1}"#).is_err());
+    }
+
+    #[test]
+    fn objects_read_as_sparse_vectors() {
+        let v: Value = serde_json::from_str(r#"{"dim0":0.5,"dim1":2}"#).unwrap();
+        assert_eq!(
+            v,
+            Value::Sparse(BTreeMap::from([
+                ("dim0".to_string(), 0.5f32),
+                ("dim1".to_string(), 2.0f32),
+            ]))
+        );
+        assert_eq!(v.type_of(), Some(Type::SparseF16));
+        // Round-trips as an object.
+        let back: Value = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(back, v);
+        assert_eq!(serde_json::from_str::<Value>("{}").unwrap(), Value::Sparse(BTreeMap::new()));
+        // A nested object is not a weight.
+        assert!(serde_json::from_str::<Value>(r#"{"a":{"b":1}}"#).is_err());
+        assert!(serde_json::from_str::<Value>(r#"{"a":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn sparse_vectors_have_no_order() {
+        // Ranked, never compared. An ordering here would let a Gte filter on a
+        // sparse attribute silently succeed.
+        let a = Value::Sparse(BTreeMap::from([("d".to_string(), 1.0f32)]));
+        let b = Value::Sparse(BTreeMap::from([("d".to_string(), 2.0f32)]));
+        assert_eq!(a.compare(&b), None);
+        assert!(!a.equals(&b));
+        assert!(a.as_text().is_none());
     }
 
     #[test]
@@ -715,6 +807,7 @@ mod tests {
         assert_eq!(Type::F64.name(), "float");
         assert_eq!(serde_json::to_string(&Type::F64).unwrap(), r#""float""#);
         assert_eq!(serde_json::to_string(&Type::IntArray).unwrap(), r#""[]int""#);
+        assert_eq!(serde_json::to_string(&Type::SparseF16).unwrap(), r#""{}f16""#);
         assert_eq!(Type::UintArray.name(), "[]uint");
         assert_eq!(serde_json::to_string(&Type::StringArray).unwrap(), r#""[]string""#);
         assert_eq!(serde_json::to_string(&Type::Datetime).unwrap(), r#""datetime""#);

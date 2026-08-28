@@ -43,6 +43,9 @@ pub struct IndexMeta {
     /// Attribute name to its full-text index object.
     #[serde(default)]
     pub fts: std::collections::BTreeMap<String, String>,
+    /// Attribute name to its sparse-vector index object.
+    #[serde(default)]
+    pub sparse: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -208,7 +208,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 193 tests
+cargo test                       # 211 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -266,8 +266,10 @@ architecture*, not a drop-in replacement.
 | Order by attribute | `rank_by: ["attr","desc"]` | ✅ same shape, `$dist` omitted |
 | Attribute index | inverted, per attribute | ✅ built by compaction; drives exact filtered search |
 | BM25 full-text | `rank_by: ["body","BM25","query"]`, `ContainsAllTokens`, `ContainsTokenSequence`, `Fuzzy` | ✅ all four, with stemming and phrase positions |
+| Sparse vectors | `{}f16` attributes, `SparseKNN` | ✅ inverted list per dimension |
+| Multi-query, hybrid | `queries` (≤16), `rerank_by: ["RRF"]` | ✅ both, separate results or fused |
 | Aggregations | `aggregate_by`, `group_by`, `ForEachUnique` | ✅ Count/Sum/Min/Max/Avg, grouped or not, composing with ranking |
-| Multi-vector, sharding, CMEK | yes | no |
+| Sharding, CMEK, `compute_attributes`, `Embed` | yes | no — the unsupported ones return **501** |
 
 BM25 is in. The common subset now works: a client doing row or column upserts, deletes,
 patches, filter-based writes, ANN or kNN queries with typed filters and
@@ -325,9 +327,17 @@ Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
   attributes into one group per element. Ranking and aggregating compose, so a
   faceted result page is one round trip
 
+- **Sparse vectors** (`src/sparse.rs`): the `{}f16` attribute type, an inverted
+  list per dimension, and `SparseKNN` ranking by dot product over shared
+  dimensions
+- **Multi-query and RRF**: up to 16 sub-queries per request, reported separately
+  or fused by reciprocal rank fusion — which is what makes hybrid search work,
+  since a BM25 relevance score and a cosine distance live on incomparable scales
+  and only their *ranks* can be combined
+
 **Next, in dependency order**
 
-1. Sparse vectors, multi-query / RRF, sharding, native embedding
+1. Sharding, native embedding
 
 Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
 a similarity, so the conversion inverts ordering — that needs a test asserting
@@ -362,6 +372,8 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Stopword lists exist for English only | `fts::EN_STOPWORDS` | a data change, not a code change — the stemmer already switches by language |
 | BM25 scores the unindexed tail one document at a time | `Namespace::query` | index the tail incrementally |
 | Aggregations scan every matching document | `Namespace::query` | answer Count from the attribute index's posting lengths, Min/Max from its sorted ends |
+| Sparse weights are stored f32, not f16 | `value::Value::Sparse` | half-precision, when sparse namespaces get large enough for the size to matter |
+| Sub-queries in a multi-query run sequentially | `server::v2_query` | they are independent; run them concurrently |
 | HTTP status is chosen by matching engine error text | `server::classify` | a typed error enum carrying its own kind |
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |

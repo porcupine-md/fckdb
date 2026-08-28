@@ -7,6 +7,7 @@ pub mod fts;
 pub mod index;
 pub mod ops;
 pub mod server;
+pub mod sparse;
 pub mod store;
 pub mod value;
 pub mod wire;

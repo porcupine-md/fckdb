@@ -585,6 +585,33 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
     if parsed["rows"].as_array().map(|r| r.len()) != Some(1) {
         anyhow::bail!("phrase filter matched the wrong set: {body}");
     }
+    // Hybrid search: BM25 and vector fused by reciprocal rank fusion.
+    let (status, body) = send(
+        "POST",
+        format!("/v2/namespaces/{fts_ns}/query"),
+        Some("e2e-token"),
+        Some(serde_json::json!({
+            "top_k": 3,
+            "rerank_by": ["RRF"],
+            "queries": [
+                { "rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 3 },
+                { "rank_by": ["body", "BM25", "quick fox"], "top_k": 3 },
+            ]
+        })),
+    )
+    .await;
+    if status != StatusCode::OK {
+        anyhow::bail!("hybrid query returned {status}: {body}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed["rows"].as_array().cloned().unwrap_or_default();
+    // Document 1 tops both lists, so it must fuse to the top; and the score must
+    // be an RRF contribution rather than either input scale.
+    let top_score = rows.first().and_then(|r| r["$dist"].as_f64()).unwrap_or(f64::NAN);
+    if rows.is_empty() || rows[0]["id"] != 1 || !(top_score > 0.0 && top_score < 1.0) {
+        anyhow::bail!("RRF fusion wrong: {body}");
+    }
+
     let _ = send("DELETE", format!("/v1/namespaces/{fts_ns}"), Some("e2e-token"), None).await;
 
     // Aggregations and grouping, through /v2 against the same backend.
@@ -632,6 +659,6 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
 
     Ok(format!(
         "401 on no token, v1+v2 write/query/delete OK, BM25+phrase OK, \
-         group_by OK, {scraped} metrics exposed"
+         group_by+RRF OK, {scraped} metrics exposed"
     ))
 }

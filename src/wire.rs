@@ -55,6 +55,9 @@ pub struct QueryRequest {
     /// Rank by BM25 over a full-text attribute. When set, `vector` is ignored.
     #[serde(default)]
     pub text: Option<TextSearch>,
+    /// Rank by sparse-vector similarity. When set, `vector` is ignored.
+    #[serde(default)]
+    pub sparse: Option<SparseSearch>,
     /// Compute aggregates over the documents matching `filter`. When set, no
     /// rows are returned unless a ranking is also requested.
     #[serde(default)]
@@ -70,6 +73,12 @@ pub struct TextSearch {
     pub query: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparseSearch {
+    pub attribute: String,
+    pub vector: crate::sparse::SparseVector,
+}
+
 impl QueryRequest {
     pub fn new(vector: Vec<f32>) -> Self {
         Self {
@@ -81,6 +90,7 @@ impl QueryRequest {
             include_attributes: Include::None,
             order_by: None,
             text: None,
+            sparse: None,
             aggregate_by: None,
             group_by: vec![],
         }
@@ -111,6 +121,10 @@ impl QueryRequest {
     }
     pub fn text(mut self, attribute: &str, query: &str) -> Self {
         self.text = Some(TextSearch { attribute: attribute.into(), query: query.into() });
+        self
+    }
+    pub fn sparse(mut self, attribute: &str, vector: crate::sparse::SparseVector) -> Self {
+        self.sparse = Some(SparseSearch { attribute: attribute.into(), vector });
         self
     }
     pub fn aggregate(mut self, spec: BTreeMap<String, Agg>) -> Self {
