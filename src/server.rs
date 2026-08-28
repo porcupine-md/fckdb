@@ -231,8 +231,13 @@ impl IntoResponse for AppError {
         struct Body {
             error: String,
         }
-        if self.0.is_server_error() {
-            tracing::error!(status = %self.0, "{}", self.1);
+        // 501 is a refusal, not an incident: the caller asked for something this
+        // build does not do. Logging it at ERROR alongside real faults trains
+        // operators to ignore the level that matters.
+        match self.0 {
+            StatusCode::NOT_IMPLEMENTED => tracing::debug!(status = %self.0, "{}", self.1),
+            s if s.is_server_error() => tracing::error!(status = %s, "{}", self.1),
+            _ => {}
         }
         let mut res = (self.0, Json(Body { error: self.1 })).into_response();
         if self.0 == StatusCode::TOO_MANY_REQUESTS {
