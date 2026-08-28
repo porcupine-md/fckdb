@@ -273,6 +273,27 @@ impl Schema {
         Ok(())
     }
 
+    /// Adopt client-declared attribute types.
+    ///
+    /// Re-declaring the same type is a no-op, which matters because turbopuffer's
+    /// clients may send the schema on every write. Changing an existing type is
+    /// refused: every value already stored was encoded under the old one.
+    pub fn declare(&mut self, declared: &BTreeMap<String, Type>) -> Result<()> {
+        for (key, ty) in declared {
+            match self.attributes.get(key) {
+                Some(existing) if existing != ty => bail!(
+                    "attribute {key:?} is already {} and cannot be changed to {}",
+                    existing.name(),
+                    ty.name()
+                ),
+                _ => {
+                    self.attributes.insert(key.clone(), *ty);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Adopt a caller-supplied distance metric, or reject a change to one that
     /// is already set. Cluster assignment depends on it, so changing it would
     /// invalidate the index without rebuilding it.
@@ -539,6 +560,9 @@ pub enum Op {
     /// Substring for text, membership for array attributes.
     Contains,
     NotContains,
+    /// Array intersection: does the attribute share any element with the list?
+    ContainsAny,
+    NotContainsAny,
     Regex,
     NotRegex,
 }
@@ -578,6 +602,54 @@ impl Filter {
         }
     }
 
+    /// Coerce literal values to the declared type of the attribute they compare
+    /// against.
+    ///
+    /// Without this, a JSON client filtering a `datetime` attribute sends a
+    /// string, the comparison is between a Datetime and a String, and
+    /// `compare` correctly reports them as incomparable — so the filter silently
+    /// matches NOTHING. Not an error, not everything: nothing. That is the worst
+    /// possible failure mode for a filter, so this runs on every query.
+    pub fn coerce(&mut self, schema: &BTreeMap<String, Type>) -> Result<()> {
+        match self {
+            Filter::And(fs) | Filter::Or(fs) => {
+                for f in fs {
+                    f.coerce(schema)?;
+                }
+            }
+            Filter::Not(f) => f.coerce(schema)?,
+            Filter::Cmp { key, op, value } => {
+                let Some(&declared) = schema.get(key) else { return Ok(()) };
+                // Text operators match against the string rendering of a value,
+                // so their operand stays a pattern rather than becoming the
+                // attribute's type.
+                if matches!(
+                    op,
+                    Op::Glob | Op::NotGlob | Op::IGlob | Op::NotIGlob | Op::Regex | Op::NotRegex
+                ) {
+                    return Ok(());
+                }
+                let element = element_type(declared);
+                let target = match op {
+                    // These take a list of candidate ELEMENTS.
+                    Op::In | Op::NotIn | Op::ContainsAny | Op::NotContainsAny => element,
+                    // Membership in an array attribute compares one element.
+                    Op::Contains | Op::NotContains => element,
+                    _ => declared,
+                };
+                let taken = std::mem::replace(value, Value::Null);
+                if taken.is_null() {
+                    // `Eq(key, null)` means "missing"; leave it alone.
+                    *value = Value::Null;
+                    return Ok(());
+                }
+                *value = coerce_operand(taken, target)
+                    .map_err(|e| anyhow::anyhow!("filter on {key:?}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn matches(&self, attrs: &Attrs) -> bool {
         match self {
             Filter::And(fs) => fs.iter().all(|f| f.matches(attrs)),
@@ -588,6 +660,70 @@ impl Filter {
                 eval(actual, *op, value)
             }
         }
+    }
+}
+
+/// The type of one element of an array type; other types are their own element.
+fn element_type(ty: Type) -> Type {
+    match ty {
+        Type::StringArray => Type::String,
+        Type::UintArray => Type::Uint,
+        Type::IntArray => Type::Int,
+        other => other,
+    }
+}
+
+/// Coerce a filter operand, element-wise when it is a list.
+fn coerce_operand(value: Value, target: Type) -> Result<Value> {
+    match value {
+        // A list operand coerces each element, so `In` against a datetime
+        // attribute accepts an array of ISO strings.
+        Value::StringArray(items) => {
+            let coerced: Result<Vec<Value>> = items
+                .into_iter()
+                .map(|s| Value::String(s).coerce(target))
+                .collect();
+            Ok(pack(coerced?, target))
+        }
+        Value::UintArray(items) => {
+            let coerced: Result<Vec<Value>> =
+                items.into_iter().map(|u| Value::Uint(u).coerce(target)).collect();
+            Ok(pack(coerced?, target))
+        }
+        scalar => scalar.coerce(target),
+    }
+}
+
+/// Re-pack coerced elements into the array form the target type implies, so
+/// `elements()` still yields them for membership tests.
+fn pack(values: Vec<Value>, target: Type) -> Value {
+    match target {
+        Type::String => Value::StringArray(
+            values
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.as_text().unwrap_or_default(),
+                })
+                .collect(),
+        ),
+        Type::Uint => Value::UintArray(
+            values.iter().filter_map(|v| match v {
+                Value::Uint(u) => Some(*u),
+                _ => None,
+            }).collect(),
+        ),
+        Type::Int => Value::IntArray(
+            values.iter().filter_map(|v| match v {
+                Value::Int(i) => Some(*i),
+                _ => None,
+            }).collect(),
+        ),
+        // Datetime, uuid and friends have no array form here; keep them as a
+        // string array of their renderings so membership still compares.
+        _ => Value::StringArray(
+            values.iter().filter_map(|v| v.as_text()).collect(),
+        ),
     }
 }
 
@@ -607,6 +743,8 @@ fn eval(actual: &Value, op: Op, expected: &Value) -> bool {
         Op::NotIn => !expected.elements().iter().any(|e| actual.equals(e)),
         Op::Contains => contains(actual, expected),
         Op::NotContains => !contains(actual, expected),
+        Op::ContainsAny => contains_any(actual, expected),
+        Op::NotContainsAny => !contains_any(actual, expected),
         Op::Glob => glob(actual, expected, true),
         Op::NotGlob => !glob(actual, expected, true),
         Op::IGlob => glob(actual, expected, false),
@@ -627,6 +765,11 @@ fn contains(actual: &Value, expected: &Value) -> bool {
             _ => false,
         },
     }
+}
+
+fn contains_any(actual: &Value, expected: &Value) -> bool {
+    let mine = actual.elements();
+    expected.elements().iter().any(|want| mine.iter().any(|have| have.equals(want)))
 }
 
 fn glob(actual: &Value, pattern: &Value, case_sensitive: bool) -> bool {
@@ -1056,6 +1199,90 @@ mod tests {
         f.keys(&mut keys);
         keys.sort();
         assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn filter_literals_coerce_to_declared_types() {
+        use crate::value::Type;
+        let schema = BTreeMap::from([
+            ("when".to_string(), Type::Datetime),
+            ("who".to_string(), Type::Uuid),
+            ("tags".to_string(), Type::StringArray),
+            ("rank".to_string(), Type::Uint),
+        ]);
+
+        // A JSON string against a datetime attribute becomes a Datetime, which is
+        // the difference between matching correctly and matching nothing.
+        let mut f: Filter = serde_json::from_str(r#"["when","Gte","2024-03-01T00:00:00Z"]"#).unwrap();
+        f.coerce(&schema).unwrap();
+        match &f {
+            Filter::Cmp { value, .. } => assert!(matches!(value, Value::Datetime(_))),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let mut f: Filter =
+            serde_json::from_str(r#"["who","Eq","550e8400-e29b-41d4-a716-446655440000"]"#).unwrap();
+        f.coerce(&schema).unwrap();
+        match &f {
+            Filter::Cmp { value, .. } => assert!(matches!(value, Value::Uuid(_))),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Nested through connectives.
+        let mut f: Filter =
+            serde_json::from_str(r#"["And",[["when","Lt","2025-01-01"],["rank","Gte",5]]]"#).unwrap();
+        f.coerce(&schema).unwrap();
+        match &f {
+            Filter::And(parts) => match &parts[0] {
+                Filter::Cmp { value, .. } => assert!(matches!(value, Value::Datetime(_))),
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // A membership operand against an array attribute coerces element-wise.
+        let mut f: Filter = serde_json::from_str(r#"["tags","Contains","red"]"#).unwrap();
+        f.coerce(&schema).unwrap();
+        match &f {
+            Filter::Cmp { value, .. } => assert_eq!(value, &Value::from("red")),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Text operators keep their pattern rather than becoming the attribute's type.
+        let mut f: Filter = serde_json::from_str(r#"["who","Glob","550e*"]"#).unwrap();
+        f.coerce(&schema).unwrap();
+        match &f {
+            Filter::Cmp { value, .. } => assert_eq!(value, &Value::from("550e*")),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Unknown attributes are left alone, and a bad literal names the field.
+        let mut f: Filter = serde_json::from_str(r#"["unknown","Eq","x"]"#).unwrap();
+        f.coerce(&schema).unwrap();
+        let mut f: Filter = serde_json::from_str(r#"["when","Gte","not a date"]"#).unwrap();
+        let err = f.coerce(&schema).unwrap_err().to_string();
+        assert!(err.contains("when"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn coerced_filters_actually_match() {
+        use crate::value::Type;
+        let schema = BTreeMap::from([("when".to_string(), Type::Datetime)]);
+        let attrs = BTreeMap::from([(
+            "when".to_string(),
+            Value::Datetime(crate::value::parse_datetime("2024-06-01").unwrap()),
+        )]);
+
+        let mut f: Filter = serde_json::from_str(r#"["when","Gte","2024-01-01"]"#).unwrap();
+        // Before coercion the comparison is Datetime vs String: incomparable, so
+        // it matches nothing at all.
+        assert!(!f.matches(&attrs), "an uncoerced typed filter should match nothing");
+        f.coerce(&schema).unwrap();
+        assert!(f.matches(&attrs), "coercion did not make the filter work");
+
+        let mut f: Filter = serde_json::from_str(r#"["when","Lt","2024-01-01"]"#).unwrap();
+        f.coerce(&schema).unwrap();
+        assert!(!f.matches(&attrs));
     }
 
     #[test]

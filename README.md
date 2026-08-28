@@ -162,6 +162,8 @@ backpressure with an error the caller can act on.
 
 ## HTTP API
 
+Two surfaces over one engine. `/v1` is native; `/v2` is turbopuffer-compatible.
+
 ```
 GET    /healthz
 GET    /metrics                                  Prometheus, no auth
@@ -174,6 +176,10 @@ POST   /v1/namespaces/{ns}/compact
 POST   /v1/namespaces/{ns}/warm                  pull the index into cache
 POST   /v1/namespaces/{ns}/gc
 POST   /v1/namespaces/{ns}/branch/{dest}         point-in-time copy
+
+POST   /v2/namespaces/{ns}                       turbopuffer-compatible write
+POST   /v2/namespaces/{ns}/query                 turbopuffer-compatible query
+GET    /v1/namespaces/{ns}/metadata              turbopuffer-compatible metadata
 ```
 
 Bearer token per tenant, compared in constant time against every configured
@@ -196,7 +202,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 104 tests
+cargo test                       # 131 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -246,19 +252,20 @@ architecture*, not a drop-in replacement.
 | Query rank | `rank_by: ["vector","ANN",[…]]`; also kNN, BM25, SparseKNN, order-by-attr, `Embed` | `vector: […]`, cosine ANN only |
 | Result limit | `limit` | `top_k` |
 | Filters | `("And", (("ts","Gte",…),("public","Eq",true)))`; Gt/Lt/In/Glob/Regex | ✅ **same tuple grammar**: Eq/NotEq/Gt/Gte/Lt/Lte/In/NotIn/Glob/IGlob/Contains/Regex + And/Or/Not |
-| Score | `$dist` — a **distance**, lower is better | `score` — a **similarity**, higher is better |
+| Score | `$dist` — a **distance**, lower is better | ✅ `$dist` on `/v2` (native `/v1` keeps `score`, a similarity) |
 | Attributes | typed + schema, `include_attributes` | ✅ **typed** (bool, uint, int, f64, string, datetime, uuid, []string, []uint), inferred schema, `include_attributes` |
 | Document ids | uint / string / uuid | ✅ all three |
 | `distance_metric` | cosine, euclidean, … | ✅ cosine, euclidean-squared, dot product |
 | Partial update | `patch_rows`, `patch_columns` | ✅ `Record::Patch` — merge, with null removing an attribute |
-| Aggregations | `aggregate_by`, group-by | none |
+| Aggregations | `aggregate_by`, group-by | none — returns **501** |
 | Multi-vector, sharding, CMEK | yes | no |
 
-Reaching the *common subset* (row upserts, deletes, ANN rank_by, simple filters,
-`limit`, `include_attributes`, the `$dist` sign flip) is a translation layer plus
-two real engine gaps: returning attributes at all, and typed attribute values for
-range filters. Everything past that — BM25, sparse vectors, aggregations,
-patches, filter-based writes — is new engine work, not adapter work.
+The common subset now works: a client doing row or column upserts, deletes,
+patches, filter-based writes, ANN or kNN queries with typed filters and
+`include_attributes` can point at `/v2` unchanged. What remains is BM25, sparse
+vectors, aggregations, multi-query and sharding — each new engine work rather
+than adapter work, and each returning **501 Not Implemented** today rather than a
+plausible wrong answer.
 
 ### Parity progress
 
@@ -283,14 +290,19 @@ Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
   and querying with another puts a document's neighbours in a cluster the query
   never probes
 
+- **Column-oriented and filter-based writes**: `upsert_columns`,
+  `patch_columns`, `delete_by_filter`, `patch_by_filter`, with the documented
+  caps (5M / 50k) and `rows_remaining`
+- **The `/v2` compatibility surface** (`src/compat.rs`): `upsert_rows`,
+  `rank_by` ANN/kNN, `filters`, `limit.total`/`top_k`, object-shaped
+  `consistency`, flattened result rows with `$dist`, `rows_affected` counters,
+  client-declared `schema`, and `GET /v1/namespaces/{ns}/metadata`
+
 **Next, in dependency order**
 
-1. `upsert_columns` / `patch_columns`, `patch_by_filter` / `delete_by_filter`
-2. The `/v2` compatibility router: endpoint paths, `rank_by`, `limit`, `$dist`
-   sign flip, `rows_affected`
-3. Inverted attribute index (filters are still evaluated per candidate)
-4. Order by attribute, `kNN` exact search (already the brute-force path)
-5. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
+1. Inverted attribute index (filters are still evaluated per candidate)
+2. Order by attribute
+3. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
    each its own project
 
 Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
@@ -320,6 +332,8 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Full-rewrite compaction, needs live set in RAM | `Namespace::compact` | leveled/tiered compaction |
 | Write throughput = `MAX_BATCH_LEN` ÷ commit latency | `store` | raise the cap; ~257 docs/s observed |
 | Filters evaluated per candidate during the scan | `doc::Filter` | inverted attribute index |
+| `ids_matching` full-scans the live set for filter-based writes | `Namespace::ids_matching` | attribute index |
+| Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |
 | Blocking `pread` on the async runtime | `cache::RingCache` | `spawn_blocking` or io_uring |
 | Static tokens, no rotation or scopes | `server::Auth` | real key management |

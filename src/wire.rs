@@ -4,8 +4,10 @@
 //! server cannot drift, and the e2e driver exercises the same shapes real
 //! clients send.
 
-use crate::doc::{DistanceMetric, Doc, Filter, Id, IdType, Include};
-use crate::value::Type;
+use crate::doc::{Attrs, DistanceMetric, Doc, Filter, Id, IdType, Include};
+use anyhow::{Result, bail};
+use std::collections::BTreeMap;
+use crate::value::{Type, Value};
 pub use crate::doc::Hit;
 use serde::{Deserialize, Serialize};
 
@@ -106,6 +108,17 @@ pub struct WriteRequest {
     pub patch: Vec<PatchRow>,
     #[serde(default)]
     pub delete: Vec<Id>,
+    /// Column-oriented form of `upsert`. Each key is a column, each value the
+    /// per-document values in the same order.
+    #[serde(default)]
+    pub upsert_columns: Option<Columns>,
+    #[serde(default)]
+    pub patch_columns: Option<Columns>,
+    /// Delete or patch every document matching a filter, up to a cap.
+    #[serde(default)]
+    pub delete_by_filter: Option<Filter>,
+    #[serde(default)]
+    pub patch_by_filter: Option<FilterPatch>,
     /// Settable on a namespace's first write only; a later change is rejected
     /// because the index's cluster assignment depends on it.
     #[serde(default)]
@@ -116,13 +129,102 @@ pub struct WriteRequest {
 pub struct PatchRow {
     pub id: Id,
     #[serde(flatten)]
-    pub attrs: std::collections::BTreeMap<String, crate::value::Value>,
+    pub attrs: Attrs,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterPatch {
+    pub filters: Filter,
+    pub patch: Attrs,
+}
+
+impl WriteRequest {
+    pub fn is_empty(&self) -> bool {
+        self.upsert.is_empty()
+            && self.patch.is_empty()
+            && self.delete.is_empty()
+            && self.upsert_columns.is_none()
+            && self.patch_columns.is_none()
+            && self.delete_by_filter.is_none()
+            && self.patch_by_filter.is_none()
+    }
+}
+
+/// Column-oriented documents: `{"id":[1,2], "vector":[[…],[…]], "name":["a","b"]}`
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct Columns(pub BTreeMap<String, Vec<serde_json::Value>>);
+
+/// One document pulled out of a column layout.
+pub struct Row {
+    pub id: Id,
+    pub vector: Option<Vec<f32>>,
+    pub attrs: Attrs,
+}
+
+impl Columns {
+    /// Transpose columns into rows.
+    ///
+    /// Every column must be the same length, because the Nth entry of each is by
+    /// definition the same document. A ragged batch is a client bug that would
+    /// otherwise silently attach one document's attribute to another.
+    pub fn transpose(&self) -> Result<Vec<Row>> {
+        let Some(ids) = self.0.get("id") else {
+            bail!("column writes require an `id` column");
+        };
+        let n = ids.len();
+        for (name, col) in &self.0 {
+            if col.len() != n {
+                bail!(
+                    "column {name:?} has {} values but `id` has {n}; every column must be \
+                     the same length",
+                    col.len()
+                );
+            }
+        }
+
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let id: Id = serde_json::from_value(ids[i].clone())
+                .map_err(|e| anyhow::anyhow!("row {i}: {e}"))?;
+
+            let vector = match self.0.get("vector").map(|c| &c[i]) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(raw) => Some(
+                    serde_json::from_value::<Vec<f32>>(raw.clone())
+                        .map_err(|e| anyhow::anyhow!("row {i} vector: {e}"))?,
+                ),
+            };
+
+            let mut attrs = Attrs::new();
+            for (name, col) in &self.0 {
+                if name == "id" || name == "vector" {
+                    continue;
+                }
+                // A null in a column means this document has no value for it,
+                // which is different from the attribute not existing at all.
+                let value = crate::value::from_json(col[i].clone())
+                    .map_err(|e| anyhow::anyhow!("row {i}, column {name:?}: {e}"))?;
+                if !matches!(value, Value::Null) {
+                    attrs.insert(name.clone(), value);
+                }
+            }
+            rows.push(Row { id, vector, attrs });
+        }
+        Ok(rows)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WriteResponse {
     pub seq: u64,
     pub records: usize,
+    pub rows_upserted: usize,
+    pub rows_patched: usize,
+    pub rows_deleted: usize,
+    /// True when a filter-based write hit its cap and more documents still
+    /// match. Reissue the same request to continue.
+    pub rows_remaining: bool,
     pub took_ms: u64,
 }
 

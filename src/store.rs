@@ -14,6 +14,8 @@
 
 use crate::cache::RingCache;
 use crate::doc::{DistanceMetric, Doc, Filter, Id, Include, Record, Schema};
+use crate::value::Type;
+use std::collections::BTreeMap;
 use crate::index::{self, IndexMeta, IvfParams};
 use crate::wire::{
     CompactResponse, Consistency, GcResponse, Hit, NamespaceMetadata, QueryRequest, QueryResponse,
@@ -49,6 +51,15 @@ pub const MAX_BATCH_BYTES: usize = 8 << 20;
 /// silently violating the consistency it promised is the one option that is
 /// always wrong.
 pub const MAX_UNINDEXED_SCAN_BYTES: u64 = 128 << 20;
+
+/// Caps on filter-based writes, matching turbopuffer's documented limits.
+///
+/// These exist so indexing and consistent reads can keep up: an unbounded
+/// `delete_by_filter` on a large namespace would produce a WAL entry bigger than
+/// the query scan cap, making the namespace unqueryable until compaction caught
+/// up. Callers reissue the request until `rows_remaining` is false.
+pub const MAX_DELETE_BY_FILTER_ROWS: usize = 5_000_000;
+pub const MAX_PATCH_BY_FILTER_ROWS: usize = 50_000;
 
 // ---------------------------------------------------------------- framing
 
@@ -114,6 +125,14 @@ pub struct Manifest {
     pub index: Option<IndexMeta>,
     #[serde(default)]
     pub schema: Schema,
+    /// Nanoseconds since the epoch. Reported by the compatibility metadata
+    /// endpoint, which returns ISO 8601.
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub last_write_at: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
 }
 
 impl Manifest {
@@ -121,6 +140,15 @@ impl Manifest {
     /// yet" from "configured and immutable" for namespace-level settings.
     pub fn has_data(&self) -> bool {
         !self.wal.is_empty() || !self.segments.is_empty()
+    }
+
+    fn stamp(&mut self, wrote_data: bool) {
+        let now = chrono::Utc::now().timestamp_nanos_opt();
+        self.created_at = self.created_at.or(now);
+        self.updated_at = now;
+        if wrote_data {
+            self.last_write_at = now;
+        }
     }
 }
 
@@ -442,6 +470,7 @@ impl Namespace {
                 bytes: entry_bytes,
                 records: entry_records,
             });
+            manifest.stamp(true);
 
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -491,7 +520,7 @@ impl Namespace {
     }
 
     pub async fn write_records(&self, records: &[Record]) -> Result<(u64, usize)> {
-        self.commit_records(records, None).await
+        self.commit_records(records, &WriteConfig::default()).await
     }
 
     /// Commit records with schema inference and enforcement.
@@ -502,7 +531,7 @@ impl Namespace {
     pub async fn commit_records(
         &self,
         records: &[Record],
-        metric: Option<DistanceMetric>,
+        config: &WriteConfig,
     ) -> Result<(u64, usize)> {
         let mut optimistic = true;
 
@@ -514,9 +543,13 @@ impl Namespace {
 
             let mut batch = records.to_vec();
             let mut schema = manifest.schema.clone();
-            if let Some(m) = metric {
+            if let Some(m) = config.metric {
                 schema.set_metric(m, manifest.has_data())?;
             }
+            // Declared types go in before inference runs, so `absorb` coerces
+            // against them instead of inferring something looser. One mechanism,
+            // not a second coercion pass in the adapter.
+            schema.declare(&config.declared_types)?;
             schema.absorb(&mut batch)?;
 
             let blob = frame_records(&batch);
@@ -531,6 +564,7 @@ impl Namespace {
                 records: batch.len() as u32,
             });
             manifest.schema = schema;
+            manifest.stamp(true);
 
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -601,6 +635,15 @@ impl Namespace {
         filter: Option<&Filter>,
     ) -> Result<Vec<Hit>> {
         let (m, _) = self.load().await?;
+        let mut owned;
+        let filter = match filter {
+            Some(f) => {
+                owned = f.clone();
+                owned.coerce(&m.schema.attributes)?;
+                Some(&owned)
+            }
+            None => None,
+        };
         let live = Self::materialize(self.all_records().await?);
         Ok(crate::doc::top_k(
             live.values(),
@@ -625,6 +668,14 @@ impl Namespace {
         let hits_before = self.cache.as_ref().map_or(0, |c| c.stats().0);
 
         let (m, from_snapshot) = self.load_with(req.consistency).await?;
+
+        // Filter literals arrive as JSON, which cannot express datetime or uuid.
+        // Coercing them against the schema is what makes a typed filter match
+        // anything at all.
+        let mut filter = req.filter.clone();
+        if let Some(f) = filter.as_mut() {
+            f.coerce(&m.schema.attributes)?;
+        }
 
         // Decide how much of the unindexed tail to read.
         let unindexed_total = m.unindexed_bytes();
@@ -653,7 +704,7 @@ impl Namespace {
                         live.values(),
                         &req.vector,
                         req.top_k,
-                        req.filter.as_ref(),
+                        filter.as_ref(),
                         &req.include_attributes,
                         m.schema.distance_metric,
                     ),
@@ -690,7 +741,7 @@ impl Namespace {
                         candidates.values(),
                         &req.vector,
                         req.top_k,
-                        req.filter.as_ref(),
+                        filter.as_ref(),
                         &req.include_attributes,
                         m.schema.distance_metric,
                     ),
@@ -711,6 +762,28 @@ impl Namespace {
             cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
             took_ms: t.elapsed().as_millis() as u64,
         })
+    }
+
+    /// Document ids matching `filter`, capped, plus whether more remain.
+    ///
+    /// ponytail: full scan of the live set. Selection is resolved against a
+    /// snapshot taken now, so a document written concurrently may be missed — the
+    /// same bound any capped filter-write has, and why callers reissue until
+    /// `rows_remaining` is false. The attribute index (phase 17) is what makes
+    /// this cheap rather than what makes it correct.
+    pub async fn ids_matching(&self, filter: &Filter, cap: usize) -> Result<(Vec<Id>, bool)> {
+        let live = Self::materialize(self.all_records().await?);
+        let mut matched: Vec<Id> = live
+            .values()
+            .filter(|d| filter.matches(&d.attrs))
+            .map(|d| d.id.clone())
+            .collect();
+        // Deterministic order, so a reissued request makes progress through the
+        // set rather than re-picking an arbitrary subset.
+        matched.sort();
+        let remaining = matched.len() > cap;
+        matched.truncate(cap);
+        Ok((matched, remaining))
     }
 
     // ------------------------------------------------------------ compaction
@@ -820,6 +893,7 @@ impl Namespace {
             current.wal.retain(|e| !consumed.contains(&e.name));
             current.segments = new_segments.clone();
             current.index = new_index.clone();
+            current.stamp(false);
 
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -1137,13 +1211,28 @@ fn apply(live: &mut HashMap<Id, Doc>, r: Record) {
 
 // ---------------------------------------------------------------- group commit
 
-/// One queued write: the record, an optional namespace-level metric request, and
+/// Namespace-level settings a write may carry.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteConfig {
+    /// Settable only on a namespace's first write.
+    pub metric: Option<DistanceMetric>,
+    /// Client-declared attribute types, for the types JSON cannot express.
+    pub declared_types: BTreeMap<String, Type>,
+}
+
+impl WriteConfig {
+    pub fn is_empty(&self) -> bool {
+        self.metric.is_none() && self.declared_types.is_empty()
+    }
+}
+
+/// One queued write: the record, any namespace-level settings, and
 /// where to report the commit.
 ///
 /// Records rather than encoded bytes, because schema inference has to see the
 /// values before they are framed — and it has to see the whole coalesced batch,
 /// so two documents in one commit cannot disagree about a type.
-type Req = (Record, Option<DistanceMetric>, oneshot::Sender<Result<u64, String>>);
+type Req = (Record, WriteConfig, oneshot::Sender<Result<u64, String>>);
 
 /// Funnels every write for one namespace through a single committer.
 ///
@@ -1188,9 +1277,14 @@ impl GroupCommit {
                 // first request in the batch carries it and the rest agree by
                 // construction, since a conflicting value is rejected by the
                 // schema rather than silently applied.
-                let metric = waiters.iter().find_map(|(_, m, _)| *m);
+                let config = waiters
+                    .iter()
+                    .map(|(_, c, _)| c)
+                    .find(|c| !c.is_empty())
+                    .cloned()
+                    .unwrap_or_default();
                 b.fetch_add(1, Ordering::Relaxed);
-                let result = ns.commit_records(&records, metric).await;
+                let result = ns.commit_records(&records, &config).await;
                 if let Ok((_, n)) = &result {
                     a.fetch_add(*n, Ordering::Relaxed);
                 }
@@ -1205,20 +1299,20 @@ impl GroupCommit {
         Self { tx, batches, attempts }
     }
 
-    pub async fn submit(&self, record: Record, metric: Option<DistanceMetric>) -> Result<u64> {
+    pub async fn submit(&self, record: Record, config: WriteConfig) -> Result<u64> {
         let (done, wait) = oneshot::channel();
         self.tx
-            .send((record, metric, done))
+            .send((record, config, done))
             .map_err(|_| anyhow::anyhow!("committer stopped"))?;
         wait.await.context("committer dropped the request")?.map_err(|e| anyhow::anyhow!(e))
     }
 
     pub async fn upsert(&self, doc: Doc) -> Result<u64> {
-        self.submit(Record::Upsert(doc), None).await
+        self.submit(Record::Upsert(doc), WriteConfig::default()).await
     }
 
     pub async fn delete(&self, id: Id) -> Result<u64> {
-        self.submit(Record::Delete(id), None).await
+        self.submit(Record::Delete(id), WriteConfig::default()).await
     }
 
     /// Submit many records and wait for all of them, so a caller's whole batch
@@ -1226,14 +1320,14 @@ impl GroupCommit {
     pub async fn write_all(
         &self,
         records: Vec<Record>,
-        metric: Option<DistanceMetric>,
+        config: WriteConfig,
     ) -> Result<u64> {
         let waits: Vec<_> = records
             .into_iter()
             .map(|r| {
                 let (done, wait) = oneshot::channel();
                 self.tx
-                    .send((r, metric, done))
+                    .send((r, config.clone(), done))
                     .map_err(|_| anyhow::anyhow!("committer stopped"))?;
                 Ok::<_, anyhow::Error>(wait)
             })
@@ -1889,12 +1983,12 @@ mod tests {
         let q = vec![1.0f32, 0.0];
 
         let cos = Namespace::new(store.clone(), "t/metric-cos");
-        cos.commit_records(&docs, Some(DistanceMetric::CosineDistance)).await.unwrap();
+        cos.commit_records(&docs, &WriteConfig { metric: Some(DistanceMetric::CosineDistance), ..Default::default() }).await.unwrap();
         cos.compact(true).await.unwrap();
         let by_angle = cos.query(&QueryRequest::new(q.clone()).top_k(2)).await.unwrap();
 
         let euc = Namespace::new(store.clone(), "t/metric-euc");
-        euc.commit_records(&docs, Some(DistanceMetric::EuclideanSquared)).await.unwrap();
+        euc.commit_records(&docs, &WriteConfig { metric: Some(DistanceMetric::EuclideanSquared), ..Default::default() }).await.unwrap();
         euc.compact(true).await.unwrap();
         let by_distance = euc.query(&QueryRequest::new(q.clone()).top_k(2)).await.unwrap();
 
@@ -1911,7 +2005,7 @@ mod tests {
         let err = euc
             .commit_records(
                 &[Record::Upsert(Doc::new(3u64, vec![1.0, 0.0]))],
-                Some(DistanceMetric::CosineDistance),
+                &WriteConfig { metric: Some(DistanceMetric::CosineDistance), ..Default::default() },
             )
             .await
             .unwrap_err()
@@ -2079,6 +2173,9 @@ mod tests {
             segments: vec![],
             index: None,
             schema: Default::default(),
+            created_at: None,
+            last_write_at: None,
+            updated_at: None,
         };
         let mode = match version {
             Some(v) => PutMode::Update(v),
@@ -2269,7 +2366,7 @@ mod tests {
         let commit = GroupCommit::new(ns.clone());
         let records: Vec<Record> =
             (0..50u64).map(|i| Record::Upsert(Doc::new(i, vec![i as f32]))).collect();
-        commit.write_all(records, None).await.unwrap();
+        commit.write_all(records, WriteConfig::default()).await.unwrap();
 
         let (batches, _) = commit.stats();
         assert_eq!(batches, 1, "a single caller batch should cost one commit");

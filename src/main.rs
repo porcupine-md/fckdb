@@ -464,6 +464,63 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
         anyhow::bail!("query returned the wrong hit: {body}");
     }
 
+    // The turbopuffer-compatible surface, against the same backend.
+    let (status, body) = send(
+        "POST",
+        format!("/v2/namespaces/{ns}"),
+        Some("e2e-token"),
+        Some(serde_json::json!({
+            "upsert_rows": [
+                { "id": 10, "vector": [1.0, 0.0], "lang": "id", "when": "2024-03-05T00:00:00Z" },
+                { "id": 11, "vector": [0.0, 1.0], "lang": "en", "when": "2023-01-01T00:00:00Z" },
+            ],
+            "schema": { "when": { "type": "datetime" } }
+        })),
+    )
+    .await;
+    if status != StatusCode::OK {
+        anyhow::bail!("v2 write returned {status}: {body}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    if parsed["rows_upserted"] != 2 {
+        anyhow::bail!("v2 write reported the wrong count: {body}");
+    }
+
+    let (status, body) = send(
+        "POST",
+        format!("/v2/namespaces/{ns}/query"),
+        Some("e2e-token"),
+        Some(serde_json::json!({
+            "rank_by": ["vector", "ANN", [1.0, 0.0]],
+            "limit": { "total": 5 },
+            "filters": ["when", "Gte", "2024-01-01T00:00:00Z"],
+            "include_attributes": ["lang"],
+            "consistency": { "level": "strong" }
+        })),
+    )
+    .await;
+    if status != StatusCode::OK {
+        anyhow::bail!("v2 query returned {status}: {body}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = parsed["rows"].as_array().cloned().unwrap_or_default();
+    // The declared datetime made the range filter select exactly one row, and
+    // $dist must be a distance: an exact cosine match is ~0.
+    let dist = rows.first().and_then(|r| r["$dist"].as_f64()).unwrap_or(f64::NAN);
+    if rows.len() != 1 || rows[0]["id"] != 10 || rows[0]["lang"] != "id" || dist.abs() > 1e-4 {
+        anyhow::bail!("v2 query returned the wrong shape: {body}");
+    }
+
+    let (status, md) =
+        send("GET", format!("/v1/namespaces/{ns}/metadata"), Some("e2e-token"), None).await;
+    if status != StatusCode::OK {
+        anyhow::bail!("v2 metadata returned {status}: {md}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&md)?;
+    if parsed["schema"]["when"]["type"] != "datetime" {
+        anyhow::bail!("v2 metadata lost the declared schema: {md}");
+    }
+
     let (_, metrics) = send("GET", "/metrics".into(), None, None).await;
     let scraped = metrics.lines().filter(|l| !l.starts_with('#')).count();
 
@@ -474,5 +531,8 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
         anyhow::bail!("namespace delete returned {status}");
     }
 
-    Ok(format!("401 on no token, write+query+delete OK, {scraped} metrics exposed"))
+    Ok(format!(
+        "401 on no token, v1 write+query+delete OK, v2 rows/$dist/schema OK, \
+         {scraped} metrics exposed"
+    ))
 }

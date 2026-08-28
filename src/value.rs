@@ -31,6 +31,7 @@ const T_DATETIME: u8 = 6;
 const T_UUID: u8 = 7;
 const T_STRING_ARRAY: u8 = 8;
 const T_UINT_ARRAY: u8 = 9;
+const T_INT_ARRAY: u8 = 10;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -47,6 +48,7 @@ pub enum Value {
     Uuid(uuid::Uuid),
     StringArray(Vec<String>),
     UintArray(Vec<u64>),
+    IntArray(Vec<i64>),
 }
 
 /// A declared attribute type, as it appears in a namespace schema.
@@ -56,6 +58,8 @@ pub enum Type {
     Bool,
     Uint,
     Int,
+    /// Spelled `float` on the wire, matching turbopuffer's schema vocabulary.
+    #[serde(rename = "float")]
     F64,
     String,
     Datetime,
@@ -64,6 +68,8 @@ pub enum Type {
     StringArray,
     #[serde(rename = "[]uint")]
     UintArray,
+    #[serde(rename = "[]int")]
+    IntArray,
 }
 
 impl Type {
@@ -72,12 +78,13 @@ impl Type {
             Type::Bool => "bool",
             Type::Uint => "uint",
             Type::Int => "int",
-            Type::F64 => "f64",
+            Type::F64 => "float",
             Type::String => "string",
             Type::Datetime => "datetime",
             Type::Uuid => "uuid",
             Type::StringArray => "[]string",
             Type::UintArray => "[]uint",
+            Type::IntArray => "[]int",
         }
     }
 }
@@ -97,6 +104,7 @@ impl Value {
             Value::Uuid(_) => Type::Uuid,
             Value::StringArray(_) => Type::StringArray,
             Value::UintArray(_) => Type::UintArray,
+            Value::IntArray(_) => Type::IntArray,
         })
     }
 
@@ -130,6 +138,10 @@ impl Value {
             }
             // An empty JSON array is ambiguous; accept it as either array type.
             (Value::StringArray(a), Type::UintArray) if a.is_empty() => Value::UintArray(vec![]),
+            (Value::StringArray(a), Type::IntArray) if a.is_empty() => Value::IntArray(vec![]),
+            (Value::UintArray(a), Type::IntArray) => Value::IntArray(
+                a.iter().map(|u| i64::try_from(*u)).collect::<std::result::Result<_, _>>()?,
+            ),
             (v, ty) => bail!(
                 "cannot interpret {} as {}",
                 v.type_of().map_or("null", |t| t.name()),
@@ -157,6 +169,7 @@ impl Value {
             (Datetime(a), Datetime(b)) => Some(a.cmp(b)),
             (StringArray(a), StringArray(b)) => Some(a.cmp(b)),
             (UintArray(a), UintArray(b)) => Some(a.cmp(b)),
+            (IntArray(a), IntArray(b)) => Some(a.cmp(b)),
             // Numeric comparison across integer widths goes through i128 so no
             // value is lost; only a float operand falls back to f64.
             (F64(_), _) | (_, F64(_)) => {
@@ -183,6 +196,7 @@ impl Value {
         match self {
             Value::StringArray(a) => a.iter().cloned().map(Value::String).collect(),
             Value::UintArray(a) => a.iter().copied().map(Value::Uint).collect(),
+            Value::IntArray(a) => a.iter().copied().map(Value::Int).collect(),
             other => vec![other.clone()],
         }
     }
@@ -244,6 +258,13 @@ impl Value {
                     b.put_u64_le(*v);
                 }
             }
+            Value::IntArray(a) => {
+                b.put_u8(T_INT_ARRAY);
+                b.put_u32_le(a.len() as u32);
+                for v in a {
+                    b.put_i64_le(*v);
+                }
+            }
         }
     }
 
@@ -278,6 +299,14 @@ impl Value {
                     out.push(u64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap()));
                 }
                 Value::UintArray(out)
+            }
+            T_INT_ARRAY => {
+                let n = u32::from_le_bytes(take(buf, pos, 4)?.try_into().unwrap()) as usize;
+                let mut out = Vec::with_capacity(n.min(1024));
+                for _ in 0..n {
+                    out.push(i64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap()));
+                }
+                Value::IntArray(out)
             }
             other => bail!("unknown value tag {other} at offset {}", *pos - 1),
         })
@@ -381,6 +410,13 @@ impl Serialize for Value {
                 }
                 seq.end()
             }
+            Value::IntArray(a) => {
+                let mut seq = s.serialize_seq(Some(a.len()))?;
+                for v in a {
+                    seq.serialize_element(v)?;
+                }
+                seq.end()
+            }
         }
     }
 }
@@ -418,6 +454,8 @@ pub fn from_json(raw: serde_json::Value) -> Result<Value> {
         J::Array(items) => {
             if items.iter().all(|v| v.is_u64()) {
                 Value::UintArray(items.iter().map(|v| v.as_u64().unwrap()).collect())
+            } else if items.iter().all(|v| v.is_i64()) {
+                Value::IntArray(items.iter().map(|v| v.as_i64().unwrap()).collect())
             } else if items.iter().all(|v| v.is_string()) {
                 Value::StringArray(
                     items.iter().map(|v| v.as_str().unwrap().to_string()).collect(),
@@ -499,6 +537,8 @@ mod tests {
             Value::StringArray(vec!["a".into(), "".into(), "ü".into()]),
             Value::UintArray(vec![]),
             Value::UintArray(vec![0, u64::MAX]),
+            Value::IntArray(vec![]),
+            Value::IntArray(vec![i64::MIN, 0, i64::MAX]),
         ]
     }
 
@@ -540,6 +580,7 @@ mod tests {
             (r#""foo""#, Value::String("foo".into())),
             (r#"["a","b"]"#, Value::StringArray(vec!["a".into(), "b".into()])),
             ("[1,2]", Value::UintArray(vec![1, 2])),
+            ("[-1,2]", Value::IntArray(vec![-1, 2])),
         ];
         for (json, expected) in cases {
             let got: Value = serde_json::from_str(json).unwrap();
@@ -671,6 +712,9 @@ mod tests {
     #[test]
     fn type_names_match_the_documented_schema_spelling() {
         assert_eq!(Type::StringArray.name(), "[]string");
+        assert_eq!(Type::F64.name(), "float");
+        assert_eq!(serde_json::to_string(&Type::F64).unwrap(), r#""float""#);
+        assert_eq!(serde_json::to_string(&Type::IntArray).unwrap(), r#""[]int""#);
         assert_eq!(Type::UintArray.name(), "[]uint");
         assert_eq!(serde_json::to_string(&Type::StringArray).unwrap(), r#""[]string""#);
         assert_eq!(serde_json::to_string(&Type::Datetime).unwrap(), r#""datetime""#);

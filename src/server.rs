@@ -20,8 +20,13 @@
 use crate::cache::RingCache;
 use crate::doc::Record;
 use crate::ops::{self, Pricing};
-use crate::store::{GroupCommit, MAX_UNINDEXED_SCAN_BYTES, Namespace};
+use crate::compat::{V2Metadata, V2Query, V2QueryResponse, V2Write, V2WriteResponse};
+use crate::store::{
+    GroupCommit, MAX_DELETE_BY_FILTER_ROWS, MAX_PATCH_BY_FILTER_ROWS,
+    MAX_UNINDEXED_SCAN_BYTES, Namespace, WriteConfig,
+};
 use crate::wire::{QueryRequest, WriteRequest, WriteResponse};
+use crate::doc::Doc;
 use anyhow::Result;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -261,14 +266,13 @@ async fn write(
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
-    if body.upsert.is_empty() && body.delete.is_empty() && body.patch.is_empty() {
-        return Err(bad("write requires at least one upsert, patch, or delete"));
+    if body.is_empty() {
+        return Err(bad(
+            "write requires at least one of: upsert, patch, delete, upsert_columns, \
+             patch_columns, delete_by_filter, patch_by_filter",
+        ));
     }
-    // Cheap boundary check. Cross-document and cross-request consistency is the
-    // schema's job, since only it can see what the namespace already holds.
-    if let Some(empty) = body.upsert.iter().find(|d| d.vector.is_empty()) {
-        return Err(bad(format!("document {} has no vector", empty.id)));
-    }
+
 
     let handle = state.resident(&org, &name);
 
@@ -276,37 +280,16 @@ async fn write(
     // this costs one small GET and never a LIST or a data fetch.
     let (manifest, _) = handle.ns.load().await?;
     if manifest.unindexed_bytes() >= WRITE_BACKPRESSURE_BYTES {
-        handle
-            .ns
-            .metrics
-            .backpressure_rejects
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let ns = handle.ns.clone();
-        tokio::spawn(async move {
-            if let Err(e) = ns.compact(true).await {
-                tracing::error!("backpressure compaction failed: {e:#}");
-            }
-        });
-        return Err(AppError(
-            StatusCode::TOO_MANY_REQUESTS,
-            format!(
-                "unindexed tail is {} bytes, at or over the {WRITE_BACKPRESSURE_BYTES} byte \
-                 write limit; compaction has been triggered, retry shortly",
-                manifest.unindexed_bytes()
-            ),
-        ));
+        return Err(backpressure(&handle, manifest.unindexed_bytes()));
     }
 
     let t = Instant::now();
-    let mut records: Vec<Record> = body.upsert.into_iter().map(Record::Upsert).collect();
-    records.extend(
-        body.patch.into_iter().map(|p| Record::Patch { id: p.id, attrs: p.attrs }),
-    );
-    records.extend(body.delete.into_iter().map(Record::Delete));
-    let count = records.len();
+    let config = WriteConfig { metric: body.distance_metric, ..Default::default() };
+    let plan = assemble(&handle.ns, body).await?;
+    let count = plan.records.len();
     let seq = handle
         .commit
-        .write_all(records, body.distance_metric)
+        .write_all(plan.records, config)
         .await
         // A schema conflict is the caller's mistake, not a server fault: they
         // sent a type that disagrees with what the namespace already holds.
@@ -323,7 +306,124 @@ async fn write(
             }
         })?;
 
-    Ok(Json(WriteResponse { seq, records: count, took_ms: t.elapsed().as_millis() as u64 }))
+    Ok(Json(WriteResponse {
+        seq,
+        records: count,
+        rows_upserted: plan.upserted,
+        rows_patched: plan.patched,
+        rows_deleted: plan.deleted,
+        rows_remaining: plan.remaining,
+        took_ms: t.elapsed().as_millis() as u64,
+    }))
+}
+
+/// Refuse a write and kick compaction, so the caller gets an actionable error
+/// rather than a write that silently stops being visible.
+fn backpressure(handle: &Resident, unindexed: u64) -> AppError {
+    handle.ns.metrics.backpressure_rejects.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ns = handle.ns.clone();
+    tokio::spawn(async move {
+        if let Err(e) = ns.compact(true).await {
+            tracing::error!("backpressure compaction failed: {e:#}");
+        }
+    });
+    AppError(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!(
+            "unindexed tail is {unindexed} bytes, at or over the {WRITE_BACKPRESSURE_BYTES} \
+             byte write limit; compaction has been triggered, retry shortly"
+        ),
+    )
+}
+
+/// Default clusters probed when a compatibility query does not say.
+const DEFAULT_NPROBE: usize = 8;
+
+/// What a write request expands to.
+struct Plan {
+    records: Vec<Record>,
+    upserted: usize,
+    patched: usize,
+    deleted: usize,
+    remaining: bool,
+}
+
+/// Expand every write form into records.
+///
+/// Order matters and follows turbopuffer's: `delete_by_filter` first, then
+/// `patch_by_filter`, then the explicit row and column operations. A patch that
+/// arrives in the same request as the filter-delete that would have removed its
+/// target must lose, or the outcome depends on map iteration order.
+async fn assemble(ns: &Namespace, body: WriteRequest) -> ApiResult<Plan> {
+    let mut records = Vec::new();
+    let (mut upserted, mut patched, mut deleted) = (0usize, 0usize, 0usize);
+    let mut remaining = false;
+
+    if let Some(filter) = &body.delete_by_filter {
+        let (ids, more) = ns
+            .ids_matching(filter, MAX_DELETE_BY_FILTER_ROWS)
+            .await
+            .map_err(AppError::from)?;
+        remaining |= more;
+        deleted += ids.len();
+        records.extend(ids.into_iter().map(Record::Delete));
+    }
+
+    if let Some(fp) = &body.patch_by_filter {
+        if fp.patch.is_empty() {
+            return Err(bad("patch_by_filter requires a non-empty patch"));
+        }
+        let (ids, more) =
+            ns.ids_matching(&fp.filters, MAX_PATCH_BY_FILTER_ROWS).await.map_err(AppError::from)?;
+        remaining |= more;
+        patched += ids.len();
+        records.extend(
+            ids.into_iter().map(|id| Record::Patch { id, attrs: fp.patch.clone() }),
+        );
+    }
+
+    if let Some(cols) = &body.upsert_columns {
+        for row in cols.transpose().map_err(|e| bad(format!("upsert_columns: {e}")))? {
+            let Some(vector) = row.vector else {
+                return Err(bad(format!("upsert_columns: document {} has no vector", row.id)));
+            };
+            upserted += 1;
+            records.push(Record::Upsert(Doc { id: row.id, vector, attrs: row.attrs }));
+        }
+    }
+
+    if let Some(cols) = &body.patch_columns {
+        if cols.0.contains_key("vector") {
+            // Same restriction turbopuffer documents: a patch cannot touch a
+            // vector, because the index would have to be updated in place.
+            return Err(bad("vectors cannot be patched; upsert the whole document"));
+        }
+        for row in cols.transpose().map_err(|e| bad(format!("patch_columns: {e}")))? {
+            patched += 1;
+            records.push(Record::Patch { id: row.id, attrs: row.attrs });
+        }
+    }
+
+    for doc in body.upsert {
+        if doc.vector.is_empty() {
+            return Err(bad(format!("document {} has no vector", doc.id)));
+        }
+        upserted += 1;
+        records.push(Record::Upsert(doc));
+    }
+    for p in body.patch {
+        patched += 1;
+        records.push(Record::Patch { id: p.id, attrs: p.attrs });
+    }
+    for id in body.delete {
+        deleted += 1;
+        records.push(Record::Delete(id));
+    }
+
+    if records.is_empty() {
+        return Err(bad("write matched no documents and contained no rows"));
+    }
+    Ok(Plan { records, upserted, patched, deleted, remaining })
 }
 
 async fn query(
@@ -487,6 +587,132 @@ async fn list_namespaces(
     Ok(Json(Body { namespaces: names }).into_response())
 }
 
+// ---------------------------------------------------------------- /v2 compat
+
+/// Map an engine error to the right status. Shared by both surfaces so a client
+/// mistake never reads as a server fault on one and not the other.
+fn classify(e: anyhow::Error) -> AppError {
+    let msg = format!("{e:#}");
+    let client = [
+        "declared",
+        "dimensions",
+        "distance_metric",
+        "cannot interpret",
+        "cannot be changed",
+        "is not a",
+        "no vector",
+        "not implemented",
+        "disagree",
+        "must be",
+        "requires",
+    ];
+    if msg.contains("scan cap") {
+        AppError(StatusCode::SERVICE_UNAVAILABLE, msg)
+    } else if msg.contains("not implemented") {
+        AppError(StatusCode::NOT_IMPLEMENTED, msg)
+    } else if client.iter().any(|c| msg.contains(c)) {
+        AppError(StatusCode::BAD_REQUEST, msg)
+    } else {
+        AppError(StatusCode::INTERNAL_SERVER_ERROR, msg)
+    }
+}
+
+async fn v2_write(
+    State(state): State<AppState>,
+    Extension(Org(org)): Extension<Org>,
+    AxPath(name): AxPath<String>,
+    Json(body): Json<V2Write>,
+) -> ApiResult<Response> {
+    if !valid_namespace(&name) {
+        return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
+    }
+    if body.is_empty() {
+        return Err(bad("write requires at least one row, column, or filter operation"));
+    }
+
+    let handle = state.resident(&org, &name);
+    let (manifest, _) = handle.ns.load().await?;
+    if manifest.unindexed_bytes() >= WRITE_BACKPRESSURE_BYTES {
+        return Err(backpressure(&handle, manifest.unindexed_bytes()));
+    }
+
+    let config = WriteConfig {
+        metric: body.distance_metric,
+        declared_types: body.declared_types(),
+    };
+    // Which counters to report is decided by what was asked for, before
+    // translation loses that information.
+    let asked_upsert = !body.upsert_rows.is_empty() || body.upsert_columns.is_some();
+    let asked_patch = !body.patch_rows.is_empty()
+        || body.patch_columns.is_some()
+        || body.patch_by_filter.is_some();
+    let asked_delete = !body.deletes.is_empty() || body.delete_by_filter.is_some();
+    let asked_filter = body.delete_by_filter.is_some() || body.patch_by_filter.is_some();
+
+    let native = body.into_native().map_err(classify)?;
+    let plan = assemble(&handle.ns, native).await?;
+    let affected = plan.upserted + plan.patched + plan.deleted;
+
+    handle.commit.write_all(plan.records, config).await.map_err(classify)?;
+
+    Ok(Json(V2WriteResponse {
+        rows_affected: affected,
+        rows_upserted: asked_upsert.then_some(plan.upserted),
+        rows_patched: asked_patch.then_some(plan.patched),
+        rows_deleted: asked_delete.then_some(plan.deleted),
+        rows_remaining: asked_filter.then_some(plan.remaining),
+    })
+    .into_response())
+}
+
+async fn v2_query(
+    State(state): State<AppState>,
+    Extension(Org(org)): Extension<Org>,
+    AxPath(name): AxPath<String>,
+    Json(body): Json<V2Query>,
+) -> ApiResult<Response> {
+    if !valid_namespace(&name) {
+        return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
+    }
+    let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify)?;
+    if req.vector.is_empty() || req.vector.iter().any(|f| !f.is_finite()) {
+        return Err(bad("rank_by vector must be non-empty and finite"));
+    }
+
+    let handle = state.resident(&org, &name);
+    let (manifest, _) = handle.ns.load().await?;
+    let metric = manifest.schema.distance_metric;
+
+    let hits = if exact {
+        // kNN means exact, so bypass the index entirely rather than probing more.
+        handle
+            .ns
+            .query_brute(&req.vector, req.top_k, req.filter.as_ref())
+            .await
+            .map_err(classify)?
+    } else {
+        handle.ns.query(&req).await.map_err(classify)?.hits
+    };
+
+    Ok(Json(V2QueryResponse { rows: crate::compat::to_v2_rows(hits, metric) }).into_response())
+}
+
+async fn v2_metadata(
+    State(state): State<AppState>,
+    Extension(Org(org)): Extension<Org>,
+    AxPath(name): AxPath<String>,
+) -> ApiResult<Json<V2Metadata>> {
+    if !valid_namespace(&name) {
+        return Err(bad("invalid namespace"));
+    }
+    let handle = state.resident(&org, &name);
+    let (m, version) = handle.ns.load().await?;
+    if version.is_none() {
+        return Err(AppError(StatusCode::NOT_FOUND, format!("namespace {name} does not exist")));
+    }
+    Ok(Json(crate::compat::to_v2_metadata(&name, &m)))
+}
+
 async fn healthz() -> &'static str {
     "ok\n"
 }
@@ -566,6 +792,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/namespaces/{ns}/warm", post(warm))
         .route("/v1/namespaces/{ns}/gc", post(gc))
         .route("/v1/namespaces/{ns}/branch/{dest}", post(branch))
+        // turbopuffer-compatible surface.
+        .route("/v1/namespaces/{ns}/metadata", get(v2_metadata))
+        .route("/v2/namespaces/{ns}", post(v2_write))
+        .route("/v2/namespaces/{ns}/query", post(v2_query))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
 
     Router::new()
@@ -996,6 +1226,274 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "metric was changed in place");
     }
 
+    // ---------------------------------------------------------- /v2 surface
+
+    #[tokio::test]
+    async fn v2_write_and_query_round_trip() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tp",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "vector": [1.0, 0.0], "name": "one", "rank": 10 },
+                    { "id": 2, "vector": [0.0, 1.0], "name": "two", "rank": 20 },
+                ],
+                "distance_metric": "cosine_distance"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_affected"], 2);
+        assert_eq!(res["rows_upserted"], 2);
+        // Counters for operations that were not requested are absent, not zero.
+        assert!(res.get("rows_deleted").is_none(), "reported a delete count for no deletes");
+        assert!(res.get("rows_remaining").is_none());
+
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tp/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "rank_by": ["vector", "ANN", [1.0, 0.0]],
+                "top_k": 2,
+                "include_attributes": ["name"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let rows = res["rows"].as_array().unwrap();
+        assert_eq!(rows[0]["id"], 1);
+        // Attributes flattened next to id and $dist.
+        assert_eq!(rows[0]["name"], "one");
+        assert!(rows[0].get("attrs").is_none(), "attributes were nested");
+        assert!(rows[0].get("rank").is_none(), "returned an unrequested attribute");
+
+        // $dist is a distance: the best match has the SMALLEST value, and an
+        // exact match is ~0 under cosine.
+        let d0 = rows[0]["$dist"].as_f64().unwrap();
+        let d1 = rows[1]["$dist"].as_f64().unwrap();
+        assert!(d0 < d1, "$dist did not order ascending: {d0} then {d1}");
+        assert!(d0.abs() < 1e-5, "an exact cosine match should have $dist ~0, got {d0}");
+    }
+
+    #[tokio::test]
+    async fn v2_filters_limit_and_consistency() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpf",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0], "lang": "id", "rank": 10 },
+                { "id": 2, "vector": [0.9, 0.1], "lang": "en", "rank": 20 },
+                { "id": 3, "vector": [0.8, 0.2], "lang": "id", "rank": 30 },
+            ]})),
+        )
+        .await;
+
+        // `filters` (plural), `limit.total`, and object-shaped consistency.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpf/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "rank_by": ["vector", "ANN", [1.0, 0.0]],
+                "limit": { "total": 5 },
+                "filters": ["And", [["lang", "Eq", "id"], ["rank", "Gte", 20]]],
+                "consistency": { "level": "eventual" },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let rows = res["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], 3);
+
+        // kNN must produce the same ranking as ANN on a namespace this small.
+        let (status, knn) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpf/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "kNN", [1.0, 0.0]], "top_k": 3 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{knn}");
+        let knn_ids: Vec<u64> =
+            knn["rows"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
+        assert_eq!(knn_ids, vec![1, 2, 3], "kNN ranking disagreed with the vectors");
+    }
+
+    #[tokio::test]
+    async fn v2_reports_unimplemented_features_as_501() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpu",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] })),
+        )
+        .await;
+
+        for body in [
+            json!({ "rank_by": ["text", "BM25", "hello"] }),
+            json!({ "rank_by": ["vec", "SparseKNN", [1.0]] }),
+            json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]],
+                    "aggregate_by": { "n": ["Count"] } }),
+            json!({ "queries": [{ "rank_by": ["vector", "ANN", [1.0, 0.0]] }] }),
+            json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]], "vector_encoding": "base64" }),
+        ] {
+            let (status, res) =
+                call(&state, "POST", "/v2/namespaces/tpu/query", Some(TOKEN_A), Some(body.clone()))
+                    .await;
+            // Not implemented is honest; silently ignoring the field and
+            // returning plain vector results would be a wrong answer.
+            assert_eq!(
+                status,
+                StatusCode::NOT_IMPLEMENTED,
+                "{body} returned {status}: {res}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_schema_declaration_types_the_untypeable() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tps",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "vector": [1.0, 0.0],
+                      "when": "2024-03-05T00:00:00Z",
+                      "who": "550e8400-e29b-41d4-a716-446655440000" },
+                    { "id": 2, "vector": [0.9, 0.1],
+                      "when": "2023-01-01T00:00:00Z",
+                      "who": "550e8400-e29b-41d4-a716-446655440001" },
+                ],
+                "schema": {
+                    "when": { "type": "datetime" },
+                    "who": { "type": "uuid", "filterable": true },
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        // The declared datetime makes a range filter work; without it these would
+        // be strings and Gte would compare lexicographically.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tps/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "rank_by": ["vector", "ANN", [1.0, 0.0]],
+                "top_k": 10,
+                "filters": ["when", "Gte", "2024-01-01T00:00:00Z"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let rows = res["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "datetime range filter selected wrongly: {res}");
+        assert_eq!(rows[0]["id"], 1);
+
+        // The metadata endpoint reports the declared schema in their shape.
+        let (status, md) =
+            call(&state, "GET", "/v1/namespaces/tps/metadata", Some(TOKEN_A), None).await;
+        assert_eq!(status, StatusCode::OK, "{md}");
+        assert_eq!(md["id"], "tps");
+        assert_eq!(md["schema"]["when"]["type"], "datetime");
+        assert_eq!(md["schema"]["who"]["type"], "uuid");
+        assert_eq!(md["approx_row_count"], 2);
+        assert_eq!(md["distance_metric"], "cosine_distance");
+        assert_eq!(md["index"]["unindexed_bytes"].as_u64().unwrap() > 0, true);
+        assert!(md["last_write_at"].as_str().is_some());
+        assert_eq!(md["encryption"]["mode"], "default");
+
+        // Changing a declared type is refused.
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tps",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [{ "id": 3, "vector": [1.0, 0.0] }],
+                "schema": { "when": { "type": "string" } }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a declared type was changed in place");
+    }
+
+    #[tokio::test]
+    async fn v2_column_and_filter_writes() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpc",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_columns": {
+                "id": [1, 2, 3, 4],
+                "vector": [[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3]],
+                "tier": ["gold", "silver", "gold", "silver"],
+            }})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_upserted"], 4);
+
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpc",
+            Some(TOKEN_A),
+            Some(json!({ "delete_by_filter": ["tier", "Eq", "silver"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_deleted"], 2);
+        assert_eq!(res["rows_affected"], 2);
+        assert_eq!(res["rows_remaining"], false);
+
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpc/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 10 })),
+        )
+        .await;
+        let ids: Vec<u64> =
+            res["rows"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn v2_requires_auth_and_validates_namespaces() {
+        let state = test_state();
+        let body = json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] });
+        let (status, _) = call(&state, "POST", "/v2/namespaces/x", None, Some(body.clone())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) =
+            call(&state, "POST", "/v2/namespaces/a.b", Some(TOKEN_A), Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) =
+            call(&state, "GET", "/v1/namespaces/ghost/metadata", Some(TOKEN_A), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn malformed_filters_are_rejected_not_ignored() {
         let state = test_state();
@@ -1031,6 +1529,179 @@ mod tests {
                 "filter {filter} was accepted with {status}: {res}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn column_writes_transpose_into_documents() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/cols/write",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_columns": {
+                "id": [1, 2, 3],
+                "vector": [[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]],
+                "name": ["a", "b", null],
+                "rank": [10, 20, 30],
+            }})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_upserted"], 3);
+
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/cols/query",
+            Some(TOKEN_A),
+            Some(json!({ "vector": [1.0, 0.0], "top_k": 3, "include_attributes": true })),
+        )
+        .await;
+        assert_eq!(res["hits"][0]["id"], 1);
+        assert_eq!(res["hits"][0]["attrs"]["name"], "a");
+        assert_eq!(res["hits"][0]["attrs"]["rank"], 10);
+        // A null column entry means this document has no value, not a null value.
+        let third = res["hits"].as_array().unwrap().iter().find(|h| h["id"] == 3).unwrap();
+        assert!(third["attrs"].get("name").is_none(), "null column became an attribute");
+        assert_eq!(third["attrs"]["rank"], 30);
+
+        // patch_columns merges without touching vectors.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/cols/write",
+            Some(TOKEN_A),
+            Some(json!({ "patch_columns": { "id": [1], "rank": [99] } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_patched"], 1);
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/cols/query",
+            Some(TOKEN_A),
+            Some(json!({ "vector": [1.0, 0.0], "top_k": 1, "include_attributes": true })),
+        )
+        .await;
+        assert_eq!(res["hits"][0]["attrs"]["rank"], 99);
+    }
+
+    #[tokio::test]
+    async fn ragged_and_invalid_column_writes_are_rejected() {
+        let state = test_state();
+        let cases: Vec<(&str, Value)> = vec![
+            ("missing id column", json!({ "upsert_columns": { "vector": [[1.0]] } })),
+            (
+                "ragged columns",
+                json!({ "upsert_columns": {
+                    "id": [1, 2],
+                    "vector": [[1.0, 0.0], [0.0, 1.0]],
+                    "name": ["only-one"],
+                }}),
+            ),
+            (
+                "missing vector",
+                json!({ "upsert_columns": { "id": [1], "name": ["a"] } }),
+            ),
+            (
+                "vector in patch_columns",
+                json!({ "patch_columns": { "id": [1], "vector": [[1.0, 0.0]] } }),
+            ),
+        ];
+        for (label, body) in cases {
+            let (status, res) =
+                call(&state, "POST", "/v1/namespaces/badcols/write", Some(TOKEN_A), Some(body))
+                    .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label} was accepted: {res}");
+        }
+    }
+
+    #[tokio::test]
+    async fn filter_based_writes_delete_and_patch_in_bulk() {
+        let state = test_state();
+        let ids: Vec<u64> = (1..=20).collect();
+        let body = json!({ "upsert_columns": {
+            "id": ids,
+            "vector": ids.iter().map(|i| vec![1.0, *i as f64 * 0.01]).collect::<Vec<_>>(),
+            "tier": ids.iter().map(|i| if i % 2 == 0 { "gold" } else { "silver" }).collect::<Vec<_>>(),
+            "rank": ids.clone(),
+        }});
+        let (status, res) =
+            call(&state, "POST", "/v1/namespaces/bulk/write", Some(TOKEN_A), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        // Patch every gold document.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/bulk/write",
+            Some(TOKEN_A),
+            Some(json!({ "patch_by_filter": {
+                "filters": ["tier", "Eq", "gold"],
+                "patch": { "tier": "platinum" },
+            }})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_patched"], 10);
+        assert_eq!(res["rows_remaining"], false);
+
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/bulk/query",
+            Some(TOKEN_A),
+            Some(json!({ "vector": [1.0, 0.0], "top_k": 100,
+                         "filter": ["tier", "Eq", "platinum"] })),
+        )
+        .await;
+        assert_eq!(res["hits"].as_array().unwrap().len(), 10, "patch_by_filter missed rows");
+
+        // Delete every silver document.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/bulk/write",
+            Some(TOKEN_A),
+            Some(json!({ "delete_by_filter": ["tier", "Eq", "silver"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_deleted"], 10);
+
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/bulk/query",
+            Some(TOKEN_A),
+            Some(json!({ "vector": [1.0, 0.0], "top_k": 100 })),
+        )
+        .await;
+        assert_eq!(res["hits"].as_array().unwrap().len(), 10, "delete_by_filter left rows behind");
+
+        // An empty patch is refused rather than committing nothing.
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/bulk/write",
+            Some(TOKEN_A),
+            Some(json!({ "patch_by_filter": { "filters": ["tier", "Eq", "gold"], "patch": {} } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A filter matching nothing is an error, not a silent no-op write.
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/v1/namespaces/bulk/write",
+            Some(TOKEN_A),
+            Some(json!({ "delete_by_filter": ["tier", "Eq", "nonexistent"] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1174,6 +1845,9 @@ mod tests {
             segments: vec![],
             index: None,
             schema: Default::default(),
+            created_at: None,
+            last_write_at: None,
+            updated_at: None,
         };
         handle
             .ns
