@@ -190,10 +190,23 @@ pub struct Schema {
     pub distance_metric: DistanceMetric,
     #[serde(default)]
     pub dim: Option<usize>,
+    /// Fixed at the namespace's inaugural write. `None` means one shard.
+    #[serde(default)]
+    pub num_shards: Option<usize>,
     /// Attributes enabled for full-text search, with their tokenizer and BM25
     /// parameters.
     #[serde(default)]
     pub fts: FtsSchema,
+    /// Attributes whose text is embedded into the document's vector on write.
+    #[serde(default)]
+    pub embed: BTreeMap<String, EmbedSpec>,
+}
+
+/// How an attribute's text becomes a vector.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EmbedSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Schema {
@@ -318,6 +331,52 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    /// Adopt client-declared auto-embedding.
+    ///
+    /// Changing the model on an attribute that already has one is refused: the
+    /// stored vectors came from the old model, and vectors from two different
+    /// models are not comparable — mixing them silently degrades every result.
+    pub fn declare_embed(&mut self, declared: &BTreeMap<String, EmbedSpec>) -> Result<()> {
+        for (key, spec) in declared {
+            match self.embed.get(key) {
+                Some(existing) if existing != spec => bail!(
+                    "attribute {key:?} already embeds with a different model; vectors from two \
+                     models are not comparable, so copy into a new namespace instead"
+                ),
+                _ => {
+                    self.embed.insert(key.clone(), spec.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fix the shard count, or reject a change to one already set.
+    ///
+    /// Each shard indexes only its own documents, so changing the count would
+    /// relocate documents away from the index that describes them. turbopuffer
+    /// refuses this too; the escape hatch is copying into a new namespace.
+    pub fn set_shards(&mut self, requested: usize, has_data: bool) -> Result<()> {
+        if requested == 0 || requested > 256 {
+            bail!("num_shards must be between 1 and 256, got {requested}");
+        }
+        match self.num_shards {
+            None if !has_data => self.num_shards = Some(requested),
+            None => bail!("num_shards cannot be set on a namespace that already holds data"),
+            Some(current) if current != requested => bail!(
+                "num_shards is {current} and cannot be changed to {requested} in place; \
+                 copy into a new namespace instead"
+            ),
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Shard count, defaulting to one.
+    pub fn shards(&self) -> usize {
+        self.num_shards.unwrap_or(1)
     }
 
     /// Adopt a caller-supplied distance metric, or reject a change to one that

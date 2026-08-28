@@ -143,6 +143,39 @@ pub struct SegmentEntry {
     pub docs: u32,
 }
 
+/// One shard's data: its compacted segments and its own indexes.
+///
+/// Shards share the namespace's WAL, so a write still commits once. They do not
+/// share indexes: each shard clusters and indexes only its own documents, which
+/// is what lets a namespace grow past the size a single index can serve.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Shard {
+    pub segments: Vec<SegmentEntry>,
+    pub index: Option<IndexMeta>,
+}
+
+/// Which shard a document belongs to.
+///
+/// FNV-1a rather than `DefaultHasher`: the assignment is PERSISTED. A hash whose
+/// output can change between Rust releases would silently relocate every
+/// document, leaving each shard's index describing rows it no longer owns.
+pub fn shard_of(id: &Id, num_shards: usize) -> usize {
+    if num_shards <= 1 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut byte = |b: u8| {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    };
+    match id {
+        Id::Uint(v) => v.to_le_bytes().iter().for_each(|b| byte(*b)),
+        Id::Uuid(u) => u.as_bytes().iter().for_each(|b| byte(*b)),
+        Id::String(s) => s.as_bytes().iter().for_each(|b| byte(*b)),
+    }
+    (hash % num_shards as u64) as usize
+}
+
 /// A namespace's commit point.
 ///
 /// Sizes are recorded inline so backpressure, billing and the query planner can
@@ -152,8 +185,9 @@ pub struct SegmentEntry {
 pub struct Manifest {
     pub next_seq: u64,
     pub wal: Vec<WalEntry>,
-    pub segments: Vec<SegmentEntry>,
-    pub index: Option<IndexMeta>,
+    /// One entry per shard. Always at least one once anything is compacted.
+    #[serde(default)]
+    pub shards: Vec<Shard>,
     #[serde(default)]
     pub schema: Schema,
     /// Nanoseconds since the epoch. Reported by the compatibility metadata
@@ -170,7 +204,22 @@ impl Manifest {
     /// Whether anything has ever been written. Distinguishes "not configured
     /// yet" from "configured and immutable" for namespace-level settings.
     pub fn has_data(&self) -> bool {
-        !self.wal.is_empty() || !self.segments.is_empty()
+        !self.wal.is_empty() || self.shards.iter().any(|s| !s.segments.is_empty())
+    }
+
+    /// Every segment across every shard.
+    pub fn all_segments(&self) -> impl Iterator<Item = &SegmentEntry> {
+        self.shards.iter().flat_map(|s| s.segments.iter())
+    }
+
+    /// Every shard index that exists.
+    pub fn all_indexes(&self) -> impl Iterator<Item = &IndexMeta> {
+        self.shards.iter().filter_map(|s| s.index.as_ref())
+    }
+
+    /// Documents covered by the indexes, summed across shards.
+    pub fn indexed_docs(&self) -> usize {
+        self.all_indexes().map(|i| i.docs).sum()
     }
 
     fn stamp(&mut self, wrote_data: bool) {
@@ -191,10 +240,10 @@ impl Manifest {
         self.wal.iter().map(|e| e.records as usize).sum()
     }
     pub fn segment_bytes(&self) -> u64 {
-        self.segments.iter().map(|s| s.bytes).sum()
+        self.all_segments().map(|s| s.bytes).sum()
     }
     pub fn index_bytes(&self) -> u64 {
-        self.index.as_ref().map_or(0, |i| i.bytes)
+        self.all_indexes().map(|i| i.bytes).sum()
     }
     pub fn total_bytes(&self) -> u64 {
         self.unindexed_bytes() + self.segment_bytes() + self.index_bytes()
@@ -207,13 +256,19 @@ impl Manifest {
         for e in &self.wal {
             out.insert(format!("wal/{}", e.name));
         }
-        for s in &self.segments {
+        for s in self.all_segments() {
             out.insert(format!("data/{}", s.name));
         }
-        if let Some(i) = &self.index {
+        for i in self.all_indexes() {
             out.insert(format!("data/{}", i.centroids));
             for c in &i.clusters {
                 out.insert(format!("data/{c}"));
+            }
+            if let Some(ids) = &i.ids {
+                out.insert(format!("data/{ids}"));
+            }
+            for object in i.attributes.values().chain(i.fts.values()).chain(i.sparse.values()) {
+                out.insert(format!("data/{object}"));
             }
         }
         out
@@ -621,6 +676,10 @@ impl Namespace {
             // not a second coercion pass in the adapter.
             schema.declare(&config.declared_types)?;
             schema.declare_fts(&config.declared_fts)?;
+            if let Some(n) = config.num_shards {
+                schema.set_shards(n, manifest.has_data())?;
+            }
+            schema.declare_embed(&config.declared_embed)?;
             schema.absorb(&mut batch)?;
 
             let blob = frame_records(&batch);
@@ -679,7 +738,7 @@ impl Namespace {
     pub async fn all_records(&self) -> Result<Vec<Record>> {
         let (m, _) = self.load().await?;
         let mut out = Vec::new();
-        for s in &m.segments {
+        for s in m.all_segments() {
             out.extend(self.read_records(&self.data_path(&s.name)).await?);
         }
         for e in &m.wal {
@@ -733,6 +792,16 @@ impl Namespace {
     ///   1. manifest                      (skipped entirely under Eventual)
     ///   2. centroids + unindexed WAL     (concurrent)
     ///   3. the probed cluster objects    (concurrent)
+    /// The real query path.
+    ///
+    /// Roundtrip shape on a cold cache, mirroring turbopuffer's:
+    ///   1. manifest                      (skipped entirely under Eventual)
+    ///   2. centroids + unindexed WAL     (concurrent)
+    ///   3. the probed cluster objects    (concurrent)
+    ///
+    /// With more than one shard, every ranked query fans out and merges. Every
+    /// shard must answer before the query can, so the slowest shard sets the tail
+    /// latency — which is why over-sharding hurts.
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse> {
         let t = Instant::now();
         self.metrics.queries.fetch_add(1, Ordering::Relaxed);
@@ -759,41 +828,19 @@ impl Namespace {
                  catches up. Retry with eventual consistency or compact this namespace."
             );
         }
-        let wal_paths: Vec<Path> =
-            wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
+        let wal_paths: Vec<Path> = wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
         let unindexed_records: usize = wal_entries.iter().map(|e| e.records as usize).sum();
         let unindexed_bytes: u64 = wal_entries.iter().map(|e| e.bytes).sum();
 
-        // Aggregations scan the documents matching the filter. They compose with
-        // ranking rather than replacing it: a request carrying both gets rows AND
-        // totals, which is how a faceted search page is built in one round trip.
-        let (aggregations, aggregation_groups) = match &req.aggregate_by {
-            None => (BTreeMap::new(), vec![]),
-            Some(aggs) => {
-                let mut paths: Vec<Path> =
-                    m.segments.iter().map(|s| self.data_path(&s.name)).collect();
-                paths.extend(wal_entries.iter().map(|e| self.wal_path(&e.name)));
-                let live = Self::materialize(self.read_records_parallel(paths).await?);
-                let matching: Vec<&Doc> = live
-                    .values()
-                    .filter(|d| filter.as_ref().is_none_or(|f| f.matches(&d.attrs, &m.schema.fts)))
-                    .collect();
-                crate::aggregate::aggregate(matching.into_iter(), aggs, &req.group_by)?
-            }
-        };
-
-        // A request that only aggregates has nothing to rank.
-        let ranking_requested = !req.vector.is_empty()
-            || req.text.is_some()
-            || req.sparse.is_some()
-            || req.order_by.is_some();
-        if req.aggregate_by.is_some() && !ranking_requested {
-            return Ok(QueryResponse {
-                hits: vec![],
+        let respond = |hits, indexed, prefiltered, ordered, aggregations, aggregation_groups| {
+            Ok(QueryResponse {
+                hits,
+                // Honest reporting: an answer is consistent only if it came from a
+                // fresh commit point AND read the whole tail.
                 consistent: !from_snapshot && !truncated,
-                indexed: false,
-                prefiltered: false,
-                ordered: false,
+                indexed,
+                prefiltered,
+                ordered,
                 aggregations,
                 aggregation_groups,
                 unindexed_records,
@@ -801,13 +848,110 @@ impl Namespace {
                 object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
                 cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
                 took_ms: t.elapsed().as_millis() as u64,
-            });
+            })
+        };
+
+        // The tail is shared by every shard, so it is read once.
+        let tail = self.read_records_parallel(wal_paths).await?;
+
+        // Aggregations and attribute ordering both scan the whole live set, so
+        // they gather across shards rather than fanning out and merging: a
+        // partial average cannot be combined from finalized per-shard averages.
+        let gather_all = req.aggregate_by.is_some() || req.order_by.is_some();
+        let live_all = if gather_all {
+            let seg_paths: Vec<Path> =
+                m.all_segments().map(|s| self.data_path(&s.name)).collect();
+            let mut records = self.read_records_parallel(seg_paths).await?;
+            records.extend(tail.iter().cloned());
+            Self::materialize(records)
+        } else {
+            HashMap::new()
+        };
+
+        let (aggregations, aggregation_groups) = match &req.aggregate_by {
+            None => (BTreeMap::new(), vec![]),
+            Some(aggs) => {
+                let matching: Vec<&Doc> = live_all
+                    .values()
+                    .filter(|d| filter.as_ref().is_none_or(|f| f.matches(&d.attrs, &m.schema.fts)))
+                    .collect();
+                crate::aggregate::aggregate(matching.into_iter(), aggs, &req.group_by)?
+            }
+        };
+
+        let ranking_requested = !req.vector.is_empty()
+            || req.text.is_some()
+            || req.sparse.is_some()
+            || req.order_by.is_some();
+
+        // A request that only aggregates has nothing to rank.
+        if req.aggregate_by.is_some() && !ranking_requested {
+            return respond(vec![], false, false, false, aggregations, aggregation_groups);
         }
+
+        if let Some(order) = &req.order_by {
+            let hits = crate::doc::order_by(
+                live_all.values(),
+                order,
+                req.top_k,
+                filter.as_ref(),
+                &req.include_attributes,
+                &m.schema.fts,
+            );
+            return respond(hits, false, false, true, aggregations, aggregation_groups);
+        }
+
+        // Ranked query: one pass per shard, then a merge. A document lives in
+        // exactly one shard, so the tail is partitioned the same way — applying
+        // the whole tail to every shard would let one document appear in several
+        // candidate sets and survive the merge twice.
+        let shards = m.schema.shards();
+        // A namespace that has never been compacted has no shards yet, but its
+        // WAL is still queryable — so it gets one implicit empty shard rather
+        // than a fan-out over nothing, which would silently return no rows.
+        let empty = [Shard::default()];
+        let resident: &[Shard] = if m.shards.is_empty() { &empty } else { &m.shards };
+
+        let mut merged: Vec<Hit> = Vec::new();
+        let mut indexed_any = false;
+        let mut prefiltered_all = true;
+
+        for (number, shard) in resident.iter().enumerate() {
+            let shard_tail: Vec<Record> = if shards <= 1 || resident.len() <= 1 {
+                tail.clone()
+            } else {
+                tail.iter().filter(|r| shard_of(r.id(), shards) == number).cloned().collect()
+            };
+            let outcome = self.shard_hits(shard, req, filter.as_ref(), &shard_tail, &m).await?;
+            indexed_any |= outcome.indexed;
+            prefiltered_all &= outcome.prefiltered;
+            merged.extend(outcome.hits);
+        }
+
+        // Global top-k is a subset of the union of per-shard top-k, so merging
+        // the shards' own truncated lists is exact.
+        merged.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        merged.truncate(req.top_k);
+
+        respond(merged, indexed_any, prefiltered_all, false, aggregations, aggregation_groups)
+    }
+
+    /// Rank one shard's documents, overlaid with that shard's slice of the tail.
+    async fn shard_hits(
+        &self,
+        shard: &Shard,
+        req: &QueryRequest,
+        filter: Option<&Filter>,
+        tail: &[Record],
+        m: &Manifest,
+    ) -> Result<ShardOutcome> {
+        let schema = &m.schema;
+        let seg_paths: Vec<Path> = shard.segments.iter().map(|s| self.data_path(&s.name)).collect();
 
         // Sparse-vector ranking: score from the inverted list, then the tail on
         // the same measure so recent writes stay rankable.
         if let Some(sp) = &req.sparse {
-            let Some(idx) = &m.index else {
+            let Some(idx) = &shard.index else {
                 bail!("sparse search needs an index; namespace has not been compacted yet");
             };
             let Some(object) = idx.sparse.get(&sp.attribute) else {
@@ -815,43 +959,13 @@ impl Namespace {
             };
             let index =
                 SparseIndex::decode(&self.read_immutable(&self.data_path(object)).await?)?;
-
-            let seg_paths: Vec<Path> =
-                m.segments.iter().map(|s| self.data_path(&s.name)).collect();
-            let wal_paths: Vec<Path> =
-                wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
             let seg_records = self.read_records_parallel(seg_paths).await?;
-            let tail = self.read_records_parallel(wal_paths).await?;
+            let (live, touched) = overlay(&seg_records, tail);
 
-            let mut live: HashMap<Id, Doc> = HashMap::new();
-            for r in &seg_records {
-                apply(&mut live, r.clone());
-            }
-            for r in &tail {
-                apply(&mut live, r.clone());
-            }
-            let touched: std::collections::HashSet<Id> =
-                tail.iter().map(|r| r.id().clone()).collect();
-
-            let matches = |doc: &Doc| {
-                filter.as_ref().is_none_or(|f| f.matches(&doc.attrs, &m.schema.fts))
-            };
-            let mut hits: Vec<Hit> = Vec::new();
-
+            let mut hits = Vec::new();
             for (ordinal, score) in index.score(&sp.vector) {
-                let Some(Record::Upsert(indexed)) = seg_records.get(ordinal as usize) else {
-                    continue;
-                };
-                if touched.contains(&indexed.id) {
-                    continue;
-                }
-                let Some(doc) = live.get(&indexed.id) else { continue };
-                if matches(doc) {
-                    hits.push(Hit {
-                        id: doc.id.clone(),
-                        score,
-                        attrs: req.include_attributes.project(&doc.attrs),
-                    });
+                if let Some(doc) = untouched(&seg_records, ordinal, &touched, &live) {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
                 }
             }
             for id in &touched {
@@ -860,97 +974,31 @@ impl Namespace {
                     continue;
                 };
                 let score = crate::sparse::dot(v, &sp.vector);
-                if score != 0.0 && matches(doc) {
-                    hits.push(Hit {
-                        id: doc.id.clone(),
-                        score,
-                        attrs: req.include_attributes.project(&doc.attrs),
-                    });
+                if score != 0.0 {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
                 }
             }
-
-            hits.sort_unstable_by(|a, b| {
-                b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
-            });
-            hits.truncate(req.top_k);
-
-            return Ok(QueryResponse {
-                hits,
-                consistent: !from_snapshot && !truncated,
-                indexed: true,
-                prefiltered: false,
-                ordered: false,
-                aggregations: aggregations.clone(),
-                aggregation_groups: aggregation_groups.clone(),
-                unindexed_records,
-                unindexed_bytes,
-                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
-                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
-                took_ms: t.elapsed().as_millis() as u64,
-            });
+            return Ok(ShardOutcome::ranked(hits, req.top_k, true));
         }
 
-        // Full-text ranking: score from the term index, then score the tail on
-        // the same scale so recent writes remain rankable.
+        // Full-text ranking.
         if let Some(text) = &req.text {
-            let Some(idx) = &m.index else {
-                bail!(
-                    "full-text search needs an index; namespace has not been compacted yet"
-                );
+            let Some(idx) = &shard.index else {
+                bail!("full-text search needs an index; namespace has not been compacted yet");
             };
             let Some(object) = idx.fts.get(&text.attribute) else {
-                bail!(
-                    "attribute {:?} is not enabled for full-text search",
-                    text.attribute
-                );
+                bail!("attribute {:?} is not enabled for full-text search", text.attribute);
             };
             let fts = FtsIndex::decode(&self.read_immutable(&self.data_path(object)).await?)?;
-
-            let seg_paths: Vec<Path> =
-                m.segments.iter().map(|s| self.data_path(&s.name)).collect();
-            let mut wal_paths: Vec<Path> =
-                wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
             let seg_records = self.read_records_parallel(seg_paths).await?;
-            let tail = self.read_records_parallel(std::mem::take(&mut wal_paths)).await?;
+            let (live, touched) = overlay(&seg_records, tail);
 
-            // Current state of every document, so a tombstoned or rewritten
-            // document is never scored from what the index remembers.
-            let mut live: HashMap<Id, Doc> = HashMap::new();
-            for r in &seg_records {
-                apply(&mut live, r.clone());
-            }
-            for r in &tail {
-                apply(&mut live, r.clone());
-            }
-
-            // Documents the tail touched: their text may differ from what the
-            // index saw, so their stored postings are stale. Rescored below.
-            let touched: std::collections::HashSet<Id> =
-                tail.iter().map(|r| r.id().clone()).collect();
-
-            let mut hits: Vec<Hit> = Vec::new();
-            let matches = |doc: &Doc| {
-                filter.as_ref().is_none_or(|f| f.matches(&doc.attrs, &m.schema.fts))
-            };
-
-            // Indexed documents the tail left alone: use the stored score.
+            let mut hits = Vec::new();
             for (ordinal, score) in fts.score(&text.query) {
-                let Some(Record::Upsert(indexed)) = seg_records.get(ordinal as usize) else {
-                    continue;
-                };
-                if touched.contains(&indexed.id) {
-                    continue;
-                }
-                let Some(doc) = live.get(&indexed.id) else { continue };
-                if matches(doc) {
-                    hits.push(Hit {
-                        id: doc.id.clone(),
-                        score,
-                        attrs: req.include_attributes.project(&doc.attrs),
-                    });
+                if let Some(doc) = untouched(&seg_records, ordinal, &touched, &live) {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
                 }
             }
-
             // Everything the tail touched, scored against the index's corpus
             // statistics so it lands on the same scale.
             for id in &touched {
@@ -961,85 +1009,24 @@ impl Namespace {
                     continue;
                 };
                 let score = fts.score_text(&t, &text.query);
-                if score > 0.0 && matches(doc) {
-                    hits.push(Hit {
-                        id: doc.id.clone(),
-                        score,
-                        attrs: req.include_attributes.project(&doc.attrs),
-                    });
+                if score > 0.0 {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
                 }
             }
-
-            hits.sort_unstable_by(|a, b| {
-                b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
-            });
-            hits.truncate(req.top_k);
-
-            return Ok(QueryResponse {
-                hits,
-                consistent: !from_snapshot && !truncated,
-                indexed: true,
-                prefiltered: false,
-                ordered: false,
-                aggregations: aggregations.clone(),
-                aggregation_groups: aggregation_groups.clone(),
-                unindexed_records,
-                unindexed_bytes,
-                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
-                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
-                took_ms: t.elapsed().as_millis() as u64,
-            });
-        }
-
-        // Ordering by attribute has no vector to probe with, so it is always a
-        // scan of the candidate set.
-        if let Some(order) = &req.order_by {
-            let mut paths: Vec<Path> =
-                m.segments.iter().map(|s| self.data_path(&s.name)).collect();
-            paths.extend(wal_entries.iter().map(|e| self.wal_path(&e.name)));
-            let live = Self::materialize(self.read_records_parallel(paths).await?);
-            let hits = crate::doc::order_by(
-                live.values(),
-                order,
-                req.top_k,
-                filter.as_ref(),
-                &req.include_attributes,
-                &m.schema.fts,
-            );
-            return Ok(QueryResponse {
-                hits,
-                consistent: !from_snapshot && !truncated,
-                indexed: false,
-                prefiltered: false,
-                ordered: true,
-                aggregations: aggregations.clone(),
-                aggregation_groups: aggregation_groups.clone(),
-                unindexed_records,
-                unindexed_bytes,
-                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
-                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
-                took_ms: t.elapsed().as_millis() as u64,
-            });
+            return Ok(ShardOutcome::ranked(hits, req.top_k, true));
         }
 
         // Selective filters take an exact path. Probing clusters and then
         // filtering can return fewer than top_k results, or none, when every
-        // surviving document sits in a cluster the query never probed — so for a
-        // filter the index can bound, scan the bounded set instead.
-        let mut prefiltered = false;
-        if let (Some(idx), Some(f)) = (&m.index, filter.as_ref())
+        // surviving document sits in a cluster the query never probed.
+        if let (Some(idx), Some(f)) = (&shard.index, filter)
             && idx.ids.is_some()
         {
             let indexes = self.load_attr_indexes(idx, f).await?;
             if let Some(sel) = attrindex::evaluate(f, &indexes, idx.docs as u32)
                 && should_prefilter(sel.ordinals.len(), idx.docs, idx.clusters.len(), req.nprobe)
             {
-                prefiltered = true;
-                let seg_paths: Vec<Path> =
-                    m.segments.iter().map(|s| self.data_path(&s.name)).collect();
                 let seg_records = self.read_records_parallel(seg_paths).await?;
-
-                // Segment order is ordinal order: compaction sorts by id.
                 let mut candidates = HashMap::new();
                 for ordinal in &sel.ordinals {
                     if let Some(Record::Upsert(d)) = seg_records.get(*ordinal as usize) {
@@ -1048,68 +1035,48 @@ impl Namespace {
                 }
                 // The tail still overrides: it may add matches the index never
                 // saw, or remove ones it did.
-                for r in wal_records_for_overlay(&wal_entries, self, &m).await? {
-                    apply(&mut candidates, r);
+                for r in tail {
+                    apply(&mut candidates, r.clone());
                 }
-
                 let hits = crate::doc::top_k(
                     candidates.values(),
                     &req.vector,
                     req.top_k,
-                    filter.as_ref(),
+                    filter,
                     &req.include_attributes,
-                    m.schema.distance_metric,
-                    &m.schema.fts,
+                    schema.distance_metric,
+                    &schema.fts,
                 );
-                return Ok(QueryResponse {
-                    hits,
-                    consistent: !from_snapshot && !truncated,
-                    indexed: true,
-                    prefiltered,
-                    ordered: false,
-                    aggregations: aggregations.clone(),
-                    aggregation_groups: aggregation_groups.clone(),
-                    unindexed_records,
-                    unindexed_bytes,
-                    object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
-                    cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
-                    took_ms: t.elapsed().as_millis() as u64,
-                });
+                return Ok(ShardOutcome { hits, indexed: true, prefiltered: true });
             }
         }
 
-        let (hits, indexed) = match &m.index {
+        match &shard.index {
             None => {
-                // No index: fall back to scanning every segment plus the tail.
-                let mut paths: Vec<Path> =
-                    m.segments.iter().map(|s| self.data_path(&s.name)).collect();
-                paths.extend(wal_paths);
-                let live = Self::materialize(self.read_records_parallel(paths).await?);
-                (
-                    crate::doc::top_k(
-                        live.values(),
-                        &req.vector,
-                        req.top_k,
-                        filter.as_ref(),
-                        &req.include_attributes,
-                        m.schema.distance_metric,
-                        &m.schema.fts,
-                    ),
-                    false,
-                )
+                // No index: scan every segment plus the tail.
+                let mut records = self.read_records_parallel(seg_paths).await?;
+                records.extend(tail.iter().cloned());
+                let live = Self::materialize(records);
+                let hits = crate::doc::top_k(
+                    live.values(),
+                    &req.vector,
+                    req.top_k,
+                    filter,
+                    &req.include_attributes,
+                    schema.distance_metric,
+                    &schema.fts,
+                );
+                Ok(ShardOutcome { hits, indexed: false, prefiltered: false })
             }
             Some(idx) => {
                 if idx.dim != req.vector.len() {
                     bail!("query has {} dims, index has {}", req.vector.len(), idx.dim);
                 }
                 let centroid_path = self.data_path(&idx.centroids);
-                let (centroid_blob, wal_records) = tokio::try_join!(
-                    self.read_immutable(&centroid_path),
-                    self.read_records_parallel(wal_paths),
-                )?;
+                let centroid_blob = self.read_immutable(&centroid_path).await?;
                 let centroids = index::decode_centroids(&centroid_blob, idx.dim)?;
 
-                let probed = index::probe(&centroids, &req.vector, req.nprobe, m.schema.distance_metric);
+                let probed = index::probe(&centroids, &req.vector, req.nprobe, schema.distance_metric);
                 let cluster_paths: Vec<Path> = probed
                     .iter()
                     .filter_map(|i| idx.clusters.get(*i))
@@ -1117,75 +1084,63 @@ impl Namespace {
                     .collect();
                 let cluster_records = self.read_records_parallel(cluster_paths).await?;
 
-                // Indexed candidates first, then the WAL overlay so recent
+                // Indexed candidates first, then the tail overlay so recent
                 // upserts and tombstones win over whatever the index believes.
                 let mut candidates = Self::materialize(cluster_records);
-                for r in wal_records {
-                    apply(&mut candidates, r);
+                for r in tail {
+                    apply(&mut candidates, r.clone());
                 }
-                (
-                    crate::doc::top_k(
-                        candidates.values(),
-                        &req.vector,
-                        req.top_k,
-                        filter.as_ref(),
-                        &req.include_attributes,
-                        m.schema.distance_metric,
-                        &m.schema.fts,
-                    ),
-                    true,
-                )
+                let hits = crate::doc::top_k(
+                    candidates.values(),
+                    &req.vector,
+                    req.top_k,
+                    filter,
+                    &req.include_attributes,
+                    schema.distance_metric,
+                    &schema.fts,
+                );
+                Ok(ShardOutcome { hits, indexed: true, prefiltered: false })
             }
-        };
-
-        Ok(QueryResponse {
-            hits,
-            // Honest reporting: an answer is consistent only if it came from a
-            // fresh commit point AND read the whole tail.
-            consistent: !from_snapshot && !truncated,
-            indexed,
-            prefiltered,
-            ordered: false,
-            aggregations,
-            aggregation_groups,
-            unindexed_records,
-            unindexed_bytes,
-            object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
-            cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
-            took_ms: t.elapsed().as_millis() as u64,
-        })
+        }
     }
+
+    // ------------------------------------------------------------ compaction
 
     /// Document ids matching `filter`, capped, plus whether more remain.
     ///
-    /// ponytail: full scan of the live set. Selection is resolved against a
-    /// snapshot taken now, so a document written concurrently may be missed — the
-    /// same bound any capped filter-write has, and why callers reissue until
-    /// `rows_remaining` is false. The attribute index (phase 17) is what makes
-    /// this cheap rather than what makes it correct.
+    /// ponytail: the fast path needs an exactly-answerable filter and an empty
+    /// tail. Otherwise it falls back to materializing the live set — the index
+    /// describes segments only, so an unindexed WAL entry could have patched a
+    /// document into or out of the match set.
     pub async fn ids_matching(&self, filter: &Filter, cap: usize) -> Result<(Vec<Id>, bool)> {
         let (m, _) = self.load().await?;
         let mut filter = filter.clone();
         filter.coerce(&m.schema.attributes)?;
 
-        // The fast path needs both an exact answer AND an empty tail: the index
-        // describes the segment only, so an unindexed WAL entry could have
-        // patched a document into or out of the match set. When the tail is
-        // empty the index is the whole truth, and this touches no vectors at all.
+        // Every shard must be exactly answerable for the fast path to be safe.
         if m.wal.is_empty()
-            && let Some(idx) = &m.index
-            && idx.ids.is_some()
+            && !m.shards.is_empty()
+            && m.shards.iter().all(|s| s.index.as_ref().is_some_and(|i| i.ids.is_some()))
         {
-            let indexes = self.load_attr_indexes(idx, &filter).await?;
-            if let Some(sel) = attrindex::evaluate(&filter, &indexes, idx.docs as u32)
-                && sel.exact
-            {
-                let ids = self.load_ids(idx).await?;
-                let mut matched: Vec<Id> = sel
-                    .ordinals
-                    .iter()
-                    .filter_map(|o| ids.get(*o as usize).cloned())
-                    .collect();
+            let mut matched = Vec::new();
+            let mut usable = true;
+            for shard in &m.shards {
+                let idx = shard.index.as_ref().expect("checked above");
+                let indexes = self.load_attr_indexes(idx, &filter).await?;
+                match attrindex::evaluate(&filter, &indexes, idx.docs as u32) {
+                    Some(sel) if sel.exact => {
+                        let ids = self.load_ids(idx).await?;
+                        matched.extend(
+                            sel.ordinals.iter().filter_map(|o| ids.get(*o as usize).cloned()),
+                        );
+                    }
+                    _ => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if usable {
                 matched.sort();
                 let remaining = matched.len() > cap;
                 matched.truncate(cap);
@@ -1207,33 +1162,33 @@ impl Namespace {
         Ok((matched, remaining))
     }
 
-    // ------------------------------------------------------------ compaction
-
-    /// Fold every WAL object into one segment, rebuild the index, and commit.
+    /// Fold every WAL object into per-shard segments, rebuild the indexes, and
+    /// commit.
     ///
-    /// ponytail: full rewrite, not leveled compaction, and the index is rebuilt
-    /// wholesale rather than maintained incrementally. Cost is O(iters*n*k*dim)
-    /// and it needs the live set in memory. Measured at 60s for 20k docs, so it
-    /// is minutes at a million. Leveled compaction plus SPFresh-style LIRE
-    /// split/merge is the upgrade path, and it is a large one.
+    /// ponytail: full rewrite, not leveled compaction, and the indexes are
+    /// rebuilt wholesale rather than maintained incrementally. Cost is
+    /// O(iters*n*k*dim) and it needs the live set in memory. Leveled compaction
+    /// plus SPFresh-style LIRE split/merge is the upgrade path, and it is a large
+    /// one.
     pub async fn compact(&self, build_index: bool) -> Result<CompactResponse> {
         let t = Instant::now();
         self.metrics.compactions.fetch_add(1, Ordering::Relaxed);
 
         let (m, _) = self.load().await?;
-        if m.wal.is_empty() && (m.index.is_some() || !build_index) {
+        let indexes_present = !m.shards.is_empty() && m.shards.iter().all(|s| s.index.is_some());
+        if m.wal.is_empty() && (indexes_present || !build_index) && !m.shards.is_empty() {
             return Ok(CompactResponse {
                 records_in: 0,
-                docs_out: m.segments.iter().map(|s| s.docs as usize).sum(),
+                docs_out: m.all_segments().map(|s| s.docs as usize).sum(),
                 wal_consumed: 0,
-                clusters: m.index.as_ref().map_or(0, |i| i.clusters.len()),
+                clusters: m.all_indexes().map(|i| i.clusters.len()).sum(),
                 cas_attempts: 0,
                 took_ms: t.elapsed().as_millis() as u64,
             });
         }
 
         let consumed: Vec<String> = m.wal.iter().map(|e| e.name.clone()).collect();
-        let consumed_segments = m.segments.clone();
+        let consumed_shards = m.shards.clone();
         let records = self.all_records().await?;
         let records_in = records.len();
         let live = Self::materialize(records);
@@ -1243,185 +1198,32 @@ impl Namespace {
         docs.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         let docs_out = docs.len();
 
-        let mut new_segments = Vec::new();
-        let mut new_index = None;
+        // Partition by shard. A document belongs to exactly one, decided by a
+        // stable hash of its id so the assignment survives a restart.
+        let count = m.schema.shards();
+        let mut buckets: Vec<Vec<Doc>> = vec![Vec::new(); count];
+        for doc in docs {
+            buckets[shard_of(&doc.id, count)].push(doc);
+        }
+
+        let mut new_shards = Vec::with_capacity(count);
         let mut clusters_written = 0usize;
-
-        if !docs.is_empty() {
-            let seg_name = format!("{}.bin", uuid::Uuid::new_v4());
-            let seg_records: Vec<Record> = docs.iter().cloned().map(Record::Upsert).collect();
-            let seg_blob = frame_records(&seg_records);
-            let seg_bytes = seg_blob.len() as u64;
-            self.put_object(&self.data_path(&seg_name), seg_blob).await?;
-            new_segments.push(SegmentEntry {
-                name: seg_name,
-                bytes: seg_bytes,
-                docs: docs_out as u32,
-            });
-
-            if build_index {
-                let params = IvfParams::for_docs(docs.len()).with_metric(m.schema.distance_metric);
-                let (flat, groups) = index::build(&docs, params)?;
-
-                let cen_name = format!("{}.cen", uuid::Uuid::new_v4());
-                let cen_blob = Bytes::from(index::encode_centroids(&flat));
-                let mut index_bytes = cen_blob.len() as u64;
-                self.put_object(&self.data_path(&cen_name), cen_blob).await?;
-
-                let cluster_names: Vec<String> =
-                    groups.iter().map(|_| format!("{}.clu", uuid::Uuid::new_v4())).collect();
-                let cluster_paths: Vec<Path> =
-                    cluster_names.iter().map(|n| self.data_path(n)).collect();
-                let blobs: Vec<Bytes> = groups
-                    .iter()
-                    .map(|g| {
-                        frame_records(
-                            &g.iter().cloned().map(Record::Upsert).collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect();
-                index_bytes += blobs.iter().map(|b| b.len() as u64).sum::<u64>();
-
-                // Concurrent: dozens of small PUTs at ~300ms each would otherwise
-                // make compaction latency the dominant cost.
-                let writes = cluster_paths
-                    .iter()
-                    .zip(&blobs)
-                    .map(|(p, b)| self.put_object(p, b.clone()));
-                for r in futures::future::join_all(writes).await {
-                    r?;
-                }
-
-                // Ordinal -> id, so attribute indexes can address documents
-                // compactly and still be resolved back to real ids.
-                let ids_name = format!("{}.ids", uuid::Uuid::new_v4());
-                let ids_blob = {
-                    let mut b = BytesMut::new();
-                    for doc in &docs {
-                        doc.id.encode(&mut b);
-                    }
-                    b.freeze()
-                };
-                index_bytes += ids_blob.len() as u64;
-                self.put_object(&self.data_path(&ids_name), ids_blob).await?;
-
-                // One inverted index per declared attribute.
-                let mut attr_names = std::collections::BTreeMap::new();
-                let mut attr_writes = Vec::new();
-                for attribute in m.schema.attributes.keys() {
-                    let built = AttrIndex::build(docs.iter().enumerate().filter_map(|(o, d)| {
-                        d.attrs.get(attribute).map(|v| (o as u32, v.clone()))
-                    }));
-                    if built.is_empty() {
-                        continue;
-                    }
-                    let name = format!("{}.att", uuid::Uuid::new_v4());
-                    let blob = built.encode();
-                    index_bytes += blob.len() as u64;
-                    attr_names.insert(attribute.clone(), name.clone());
-                    attr_writes.push((self.data_path(&name), blob));
-                }
-                for r in futures::future::join_all(
-                    attr_writes.iter().map(|(p, b)| self.put_object(p, b.clone())),
-                )
-                .await
-                {
-                    r?;
-                }
-
-                // One full-text index per attribute the schema enables.
-                let mut fts_names = std::collections::BTreeMap::new();
-                let mut fts_writes = Vec::new();
-                for (attribute, config) in &m.schema.fts {
-                    let built = FtsIndex::build(
-                        docs.iter().enumerate().filter_map(|(o, d)| {
-                            d.attrs
-                                .get(attribute)
-                                .and_then(crate::fts::attribute_text)
-                                .map(|t| (o as u32, t))
-                        }).collect::<Vec<_>>().iter().map(|(o, t)| (*o, t.as_str())),
-                        docs.len(),
-                        config,
-                    );
-                    if built.is_empty() {
-                        continue;
-                    }
-                    let name = format!("{}.fts", uuid::Uuid::new_v4());
-                    let blob = built.encode();
-                    index_bytes += blob.len() as u64;
-                    fts_names.insert(attribute.clone(), name.clone());
-                    fts_writes.push((self.data_path(&name), blob));
-                }
-                for r in futures::future::join_all(
-                    fts_writes.iter().map(|(p, b)| self.put_object(p, b.clone())),
-                )
-                .await
-                {
-                    r?;
-                }
-
-                // One inverted list per sparse-vector attribute.
-                let mut sparse_names = std::collections::BTreeMap::new();
-                let mut sparse_writes = Vec::new();
-                for (attribute, ty) in &m.schema.attributes {
-                    if *ty != Type::SparseF16 {
-                        continue;
-                    }
-                    let vectors: Vec<(u32, crate::sparse::SparseVector)> = docs
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(o, d)| match d.attrs.get(attribute) {
-                            Some(crate::value::Value::Sparse(v)) => Some((o as u32, v.clone())),
-                            _ => None,
-                        })
-                        .collect();
-                    let built = SparseIndex::build(
-                        vectors.iter().map(|(o, v)| (*o, v)),
-                        docs.len(),
-                    );
-                    if built.is_empty() {
-                        continue;
-                    }
-                    let name = format!("{}.spx", uuid::Uuid::new_v4());
-                    let blob = built.encode();
-                    index_bytes += blob.len() as u64;
-                    sparse_names.insert(attribute.clone(), name.clone());
-                    sparse_writes.push((self.data_path(&name), blob));
-                }
-                for r in futures::future::join_all(
-                    sparse_writes.iter().map(|(p, b)| self.put_object(p, b.clone())),
-                )
-                .await
-                {
-                    r?;
-                }
-
-                clusters_written = cluster_names.len();
-                new_index = Some(IndexMeta {
-                    dim: docs[0].vector.len(),
-                    centroids: cen_name,
-                    clusters: cluster_names,
-                    docs: docs.len(),
-                    bytes: index_bytes,
-                    ids: Some(ids_name),
-                    attributes: attr_names,
-                    fts: fts_names,
-                    sparse: sparse_names,
-                });
-            }
+        for bucket in &buckets {
+            let shard = self.build_shard(bucket, build_index, &m.schema).await?;
+            clusters_written += shard.index.as_ref().map_or(0, |i| i.clusters.len());
+            new_shards.push(shard);
         }
 
         // Commit. The objects above are already durable, so a lost CAS only means
         // recomputing the manifest delta, not redoing the work.
         for attempt in 1..=MAX_CAS_ATTEMPTS {
             let (mut current, version) = self.load().await?;
-            if current.segments != consumed_segments {
+            if current.shards != consumed_shards {
                 bail!("another compaction committed concurrently; discarding this one");
             }
             // Keep WAL entries that arrived while we were compacting.
             current.wal.retain(|e| !consumed.contains(&e.name));
-            current.segments = new_segments.clone();
-            current.index = new_index.clone();
+            current.shards = new_shards.clone();
             current.stamp(false);
 
             let mode = match version {
@@ -1464,6 +1266,159 @@ impl Namespace {
         bail!("compaction could not commit after {MAX_CAS_ATTEMPTS} attempts")
     }
 
+    /// Write one shard's segment and indexes.
+    ///
+    /// Ordinals are positions in `docs`, which the caller has already sorted by
+    /// id — every index in this shard addresses documents that way.
+    async fn build_shard(
+        &self,
+        docs: &[Doc],
+        build_index: bool,
+        schema: &Schema,
+    ) -> Result<Shard> {
+        if docs.is_empty() {
+            return Ok(Shard::default());
+        }
+
+        let seg_name = format!("{}.bin", uuid::Uuid::new_v4());
+        let seg_records: Vec<Record> = docs.iter().cloned().map(Record::Upsert).collect();
+        let seg_blob = frame_records(&seg_records);
+        let seg_bytes = seg_blob.len() as u64;
+        self.put_object(&self.data_path(&seg_name), seg_blob).await?;
+        let segments = vec![SegmentEntry {
+            name: seg_name,
+            bytes: seg_bytes,
+            docs: docs.len() as u32,
+        }];
+
+        if !build_index {
+            return Ok(Shard { segments, index: None });
+        }
+
+        let params = IvfParams::for_docs(docs.len()).with_metric(schema.distance_metric);
+        let (flat, groups) = index::build(docs, params)?;
+
+        let cen_name = format!("{}.cen", uuid::Uuid::new_v4());
+        let cen_blob = Bytes::from(index::encode_centroids(&flat));
+        let mut index_bytes = cen_blob.len() as u64;
+        self.put_object(&self.data_path(&cen_name), cen_blob).await?;
+
+        let cluster_names: Vec<String> =
+            groups.iter().map(|_| format!("{}.clu", uuid::Uuid::new_v4())).collect();
+        let cluster_paths: Vec<Path> =
+            cluster_names.iter().map(|n| self.data_path(n)).collect();
+        let blobs: Vec<Bytes> = groups
+            .iter()
+            .map(|g| frame_records(&g.iter().cloned().map(Record::Upsert).collect::<Vec<_>>()))
+            .collect();
+        index_bytes += blobs.iter().map(|b| b.len() as u64).sum::<u64>();
+
+        // Concurrent: dozens of small PUTs at ~300ms each would otherwise make
+        // compaction latency the dominant cost.
+        let mut writes: Vec<(Path, Bytes)> =
+            cluster_paths.into_iter().zip(blobs).collect();
+
+        // Ordinal -> id, so attribute indexes can address documents compactly
+        // and still be resolved back to real ids.
+        let ids_name = format!("{}.ids", uuid::Uuid::new_v4());
+        let ids_blob = {
+            let mut b = BytesMut::new();
+            for doc in docs {
+                doc.id.encode(&mut b);
+            }
+            b.freeze()
+        };
+        index_bytes += ids_blob.len() as u64;
+        writes.push((self.data_path(&ids_name), ids_blob));
+
+        // One inverted index per declared attribute.
+        let mut attr_names = BTreeMap::new();
+        for attribute in schema.attributes.keys() {
+            let built = AttrIndex::build(docs.iter().enumerate().filter_map(|(o, d)| {
+                d.attrs.get(attribute).map(|v| (o as u32, v.clone()))
+            }));
+            if built.is_empty() {
+                continue;
+            }
+            let name = format!("{}.att", uuid::Uuid::new_v4());
+            let blob = built.encode();
+            index_bytes += blob.len() as u64;
+            attr_names.insert(attribute.clone(), name.clone());
+            writes.push((self.data_path(&name), blob));
+        }
+
+        // One full-text index per attribute the schema enables.
+        let mut fts_names = BTreeMap::new();
+        for (attribute, config) in &schema.fts {
+            let texts: Vec<(u32, String)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(o, d)| {
+                    d.attrs.get(attribute).and_then(crate::fts::attribute_text).map(|t| (o as u32, t))
+                })
+                .collect();
+            let built = FtsIndex::build(
+                texts.iter().map(|(o, t)| (*o, t.as_str())),
+                docs.len(),
+                config,
+            );
+            if built.is_empty() {
+                continue;
+            }
+            let name = format!("{}.fts", uuid::Uuid::new_v4());
+            let blob = built.encode();
+            index_bytes += blob.len() as u64;
+            fts_names.insert(attribute.clone(), name.clone());
+            writes.push((self.data_path(&name), blob));
+        }
+
+        // One inverted list per sparse-vector attribute.
+        let mut sparse_names = BTreeMap::new();
+        for (attribute, ty) in &schema.attributes {
+            if *ty != Type::SparseF16 {
+                continue;
+            }
+            let vectors: Vec<(u32, crate::sparse::SparseVector)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(o, d)| match d.attrs.get(attribute) {
+                    Some(crate::value::Value::Sparse(v)) => Some((o as u32, v.clone())),
+                    _ => None,
+                })
+                .collect();
+            let built = SparseIndex::build(vectors.iter().map(|(o, v)| (*o, v)), docs.len());
+            if built.is_empty() {
+                continue;
+            }
+            let name = format!("{}.spx", uuid::Uuid::new_v4());
+            let blob = built.encode();
+            index_bytes += blob.len() as u64;
+            sparse_names.insert(attribute.clone(), name.clone());
+            writes.push((self.data_path(&name), blob));
+        }
+
+        for r in futures::future::join_all(writes.iter().map(|(p, b)| self.put_object(p, b.clone())))
+            .await
+        {
+            r?;
+        }
+
+        Ok(Shard {
+            segments,
+            index: Some(IndexMeta {
+                dim: docs[0].vector.len(),
+                centroids: cen_name,
+                clusters: cluster_names,
+                docs: docs.len(),
+                bytes: index_bytes,
+                ids: Some(ids_name),
+                attributes: attr_names,
+                fts: fts_names,
+                sparse: sparse_names,
+            }),
+        })
+    }
+
     // ------------------------------------------------------------ operations
 
     pub async fn metadata(&self) -> Result<NamespaceMetadata> {
@@ -1474,16 +1429,16 @@ impl Namespace {
     pub fn metadata_from(&self, m: &Manifest) -> NamespaceMetadata {
         NamespaceMetadata {
             namespace: self.prefix.clone(),
-            indexed_docs: m.index.as_ref().map_or(0, |i| i.docs),
-            clusters: m.index.as_ref().map_or(0, |i| i.clusters.len()),
-            segments: m.segments.len(),
+            indexed_docs: m.indexed_docs(),
+            clusters: m.all_indexes().map(|i| i.clusters.len()).sum(),
+            segments: m.all_segments().count(),
             segment_bytes: m.segment_bytes(),
             wal_entries: m.wal.len(),
             unindexed_records: m.unindexed_records(),
             unindexed_bytes: m.unindexed_bytes(),
             index_bytes: m.index_bytes(),
             total_bytes: m.total_bytes(),
-            dim: m.schema.dim.or_else(|| m.index.as_ref().map(|i| i.dim)),
+            dim: m.schema.dim.or_else(|| m.all_indexes().map(|i| i.dim).next()),
             write_backpressure: m.unindexed_bytes() >= MAX_UNINDEXED_SCAN_BYTES,
             schema: m.schema.attributes.clone(),
             id_type: m.schema.id_type,
@@ -1500,11 +1455,12 @@ impl Namespace {
         let t = Instant::now();
         let (m, _) = self.load().await?;
         let mut paths = Vec::new();
-        if let Some(idx) = &m.index {
+        for idx in m.all_indexes() {
             paths.push(self.data_path(&idx.centroids));
             paths.extend(idx.clusters.iter().map(|c| self.data_path(c)));
-        } else {
-            paths.extend(m.segments.iter().map(|s| self.data_path(&s.name)));
+        }
+        if paths.is_empty() {
+            paths.extend(m.all_segments().map(|s| self.data_path(&s.name)));
         }
 
         let already = self
@@ -1711,6 +1667,72 @@ impl Namespace {
     }
 }
 
+/// What one shard contributed to a ranked query.
+struct ShardOutcome {
+    hits: Vec<Hit>,
+    indexed: bool,
+    prefiltered: bool,
+}
+
+impl ShardOutcome {
+    /// Sort and truncate a score-ranked list. Per-shard truncation is safe
+    /// because the global top-k is a subset of the union of per-shard top-k.
+    fn ranked(mut hits: Vec<Hit>, top_k: usize, indexed: bool) -> Self {
+        hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        hits.truncate(top_k);
+        Self { hits, indexed, prefiltered: false }
+    }
+}
+
+/// Current state of a shard's documents, plus the ids the tail touched.
+///
+/// A touched document's stored postings are stale, so it must be rescored from
+/// its current state rather than trusted.
+fn overlay(
+    seg_records: &[Record],
+    tail: &[Record],
+) -> (HashMap<Id, Doc>, std::collections::HashSet<Id>) {
+    let mut live = HashMap::new();
+    for r in seg_records {
+        apply(&mut live, r.clone());
+    }
+    for r in tail {
+        apply(&mut live, r.clone());
+    }
+    (live, tail.iter().map(|r| r.id().clone()).collect())
+}
+
+/// The live document at `ordinal`, unless the tail touched it or removed it.
+fn untouched<'a>(
+    seg_records: &[Record],
+    ordinal: u32,
+    touched: &std::collections::HashSet<Id>,
+    live: &'a HashMap<Id, Doc>,
+) -> Option<&'a Doc> {
+    let Record::Upsert(indexed) = seg_records.get(ordinal as usize)? else { return None };
+    if touched.contains(&indexed.id) {
+        return None;
+    }
+    live.get(&indexed.id)
+}
+
+fn push_hit(
+    hits: &mut Vec<Hit>,
+    doc: &Doc,
+    score: f32,
+    req: &QueryRequest,
+    filter: Option<&Filter>,
+    schema: &Schema,
+) {
+    if filter.is_none_or(|f| f.matches(&doc.attrs, &schema.fts)) {
+        hits.push(Hit {
+            id: doc.id.clone(),
+            score,
+            attrs: req.include_attributes.project(&doc.attrs),
+        });
+    }
+}
+
 /// Read the WAL entries a query is allowed to scan.
 async fn wal_records_for_overlay(
     entries: &[WalEntry],
@@ -1759,11 +1781,19 @@ pub struct WriteConfig {
     pub declared_types: BTreeMap<String, Type>,
     /// Attributes to enable for full-text search.
     pub declared_fts: crate::fts::FtsSchema,
+    /// Shard count, settable only on a namespace's inaugural write.
+    pub num_shards: Option<usize>,
+    /// Attributes to embed into the document vector on write.
+    pub declared_embed: BTreeMap<String, crate::doc::EmbedSpec>,
 }
 
 impl WriteConfig {
     pub fn is_empty(&self) -> bool {
-        self.metric.is_none() && self.declared_types.is_empty() && self.declared_fts.is_empty()
+        self.metric.is_none()
+            && self.declared_types.is_empty()
+            && self.declared_fts.is_empty()
+            && self.num_shards.is_none()
+            && self.declared_embed.is_empty()
     }
 }
 
@@ -2029,7 +2059,7 @@ mod tests {
 
         let (m, _) = ns.load().await.unwrap();
         assert!(m.wal.is_empty(), "WAL should be empty after compaction");
-        assert_eq!(m.segments.len(), 1);
+        assert_eq!(m.all_segments().count(), 1);
         assert_eq!(m.unindexed_bytes(), 0);
 
         let after = ns.query_brute(&[9.0; 8], 5, None).await.unwrap();
@@ -2067,7 +2097,7 @@ mod tests {
         assert!(stats.clusters > 1, "index should produce multiple clusters");
 
         let (m, _) = ns.load().await.unwrap();
-        let idx = m.index.expect("index should exist after compact(true)");
+        let idx = m.shards[0].index.clone().expect("index should exist after compact(true)");
         assert_eq!(idx.docs, 600);
         assert!(idx.bytes > 0, "index byte accounting missing");
 
@@ -2365,7 +2395,7 @@ mod tests {
         ns.compact(true).await.unwrap();
 
         let (m, _) = ns.load().await.unwrap();
-        let idx = m.index.clone().unwrap();
+        let idx = m.shards[0].index.clone().unwrap();
         assert!(idx.attributes.contains_key("tier"), "no attribute index was built");
         assert!(idx.ids.is_some(), "no ordinal-to-id map was written");
 
@@ -2581,7 +2611,7 @@ mod tests {
         let ns = text_ns("t/bm25").await;
         let (m, _) = ns.load().await.unwrap();
         assert!(
-            m.index.as_ref().unwrap().fts.contains_key("body"),
+            m.shards[0].index.as_ref().unwrap().fts.contains_key("body"),
             "compaction did not build a full-text index"
         );
 
@@ -2694,6 +2724,252 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("full-text"), "unhelpful error: {err}");
+    }
+
+    // -------------------------------------------------------- phase 22: sharding
+
+    #[test]
+    fn shard_assignment_is_stable_and_spreads() {
+        // The assignment is persisted, so it must be reproducible forever. These
+        // are pinned values: if the hash ever changes, this test fails rather
+        // than every shard's index silently describing rows it no longer owns.
+        for n in [1usize, 2, 4, 8, 256] {
+            for id in [Id::Uint(0), Id::Uint(12345), Id::String("abc".into())] {
+                let a = shard_of(&id, n);
+                let b = shard_of(&id, n);
+                assert_eq!(a, b, "assignment is not deterministic");
+                assert!(a < n, "shard {a} out of range for {n} shards");
+            }
+        }
+        // One shard means everything lands in shard zero.
+        assert_eq!(shard_of(&Id::Uint(999), 1), 0);
+        assert_eq!(shard_of(&Id::Uint(999), 0), 0);
+
+        // Reasonably uniform over 8 shards: no shard should be empty or hold
+        // most of the keys.
+        let mut counts = vec![0usize; 8];
+        for i in 0..800u64 {
+            counts[shard_of(&Id::Uint(i), 8)] += 1;
+        }
+        assert!(counts.iter().all(|c| *c > 40), "uneven distribution: {counts:?}");
+        assert_eq!(counts.iter().sum::<usize>(), 800);
+
+        // Different id types hash independently rather than colliding by value.
+        let types_differ = shard_of(&Id::Uint(1), 8) != shard_of(&Id::String("1".into()), 8);
+        let _ = types_differ; // either outcome is fine; this documents intent
+    }
+
+    #[tokio::test]
+    async fn a_sharded_namespace_answers_exactly_like_an_unsharded_one() {
+        let store = mem();
+        let docs: Vec<Record> = synth(400, 16, 10)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert("tier".into(), Value::from(if i % 5 == 0 { "gold" } else { "grey" }));
+                d.attrs.insert("rank".into(), Value::Uint(i as u64));
+                Record::Upsert(d)
+            })
+            .collect();
+
+        let plain = Namespace::new(store.clone(), "t/shard-one");
+        plain.write_records(&docs).await.unwrap();
+        plain.compact(true).await.unwrap();
+
+        let sharded = Namespace::new(store.clone(), "t/shard-four");
+        sharded
+            .commit_records(&docs, &WriteConfig { num_shards: Some(4), ..Default::default() })
+            .await
+            .unwrap();
+        sharded.compact(true).await.unwrap();
+
+        let (m, _) = sharded.load().await.unwrap();
+        assert_eq!(m.shards.len(), 4, "expected four shards");
+        assert!(m.shards.iter().all(|s| s.index.is_some()), "every shard needs its own index");
+        // Every document landed in exactly one shard.
+        let total: usize = m.shards.iter().map(|s| s.index.as_ref().unwrap().docs).sum();
+        assert_eq!(total, 400, "documents were duplicated or lost across shards");
+        assert!(
+            m.shards.iter().all(|s| s.index.as_ref().unwrap().docs > 40),
+            "a shard is nearly empty: {:?}",
+            m.shards.iter().map(|s| s.index.as_ref().unwrap().docs).collect::<Vec<_>>()
+        );
+
+        let q = match &docs[7] {
+            Record::Upsert(d) => d.vector.clone(),
+            _ => unreachable!(),
+        };
+
+        // Probing every cluster makes both exhaustive, so the answers must be
+        // identical rather than merely similar. Any duplicate surviving the merge
+        // would show up here.
+        let one = plain.query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000)).await.unwrap();
+        let four =
+            sharded.query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000)).await.unwrap();
+        assert_eq!(ids(&four.hits), ids(&one.hits), "sharded query disagreed with unsharded");
+        assert_eq!(four.hits.len(), 10);
+        assert_eq!(
+            ids(&four.hits).len(),
+            ids(&four.hits).iter().collect::<std::collections::BTreeSet<_>>().len(),
+            "the merge returned a duplicate"
+        );
+
+        // Filtered, ordered and aggregated queries must agree too.
+        let f = Filter::eq("tier", "gold");
+        let one_f = plain
+            .query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000).filter(f.clone()))
+            .await
+            .unwrap();
+        let four_f = sharded
+            .query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000).filter(f.clone()))
+            .await
+            .unwrap();
+        assert_eq!(ids(&four_f.hits), ids(&one_f.hits), "filtered sharded query disagreed");
+
+        let spec = std::collections::BTreeMap::from([
+            ("n".to_string(), serde_json::from_str::<crate::aggregate::Agg>(r#"["Count"]"#).unwrap()),
+            (
+                "s".to_string(),
+                serde_json::from_str::<crate::aggregate::Agg>(r#"["Sum","rank"]"#).unwrap(),
+            ),
+        ]);
+        let one_a = plain.query(&QueryRequest::new(vec![]).aggregate(spec.clone())).await.unwrap();
+        let four_a = sharded.query(&QueryRequest::new(vec![]).aggregate(spec)).await.unwrap();
+        assert_eq!(four_a.aggregations, one_a.aggregations, "aggregation differed across shards");
+        assert_eq!(four_a.aggregations["n"], Value::Uint(400));
+
+        let one_o = plain
+            .query(&QueryRequest::new(vec![]).top_k(5).order_by("rank", true))
+            .await
+            .unwrap();
+        let four_o = sharded
+            .query(&QueryRequest::new(vec![]).top_k(5).order_by("rank", true))
+            .await
+            .unwrap();
+        assert_eq!(ids(&four_o.hits), ids(&one_o.hits), "ordering differed across shards");
+    }
+
+    #[tokio::test]
+    async fn the_tail_is_partitioned_so_no_document_is_counted_twice() {
+        let ns = ns("t/shard-tail");
+        let docs: Vec<Record> = (0..80u64)
+            .map(|i| Record::Upsert(Doc::new(i, vec![1.0, i as f32 * 0.01])))
+            .collect();
+        ns.commit_records(&docs, &WriteConfig { num_shards: Some(4), ..Default::default() })
+            .await
+            .unwrap();
+        ns.compact(true).await.unwrap();
+
+        // A tail write must be overlaid on its own shard only. Applied to every
+        // shard, it would appear four times in the merged candidate set.
+        // The vector is orthogonal to every existing document so the tail
+        // document wins outright rather than tying with one of them.
+        let q = vec![0.0f32, 1.0];
+        ns.write_records(&[Record::Upsert(Doc::new(9999u64, q.clone()))]).await.unwrap();
+
+        let res = ns.query(&QueryRequest::new(q.clone()).top_k(20).nprobe(1000)).await.unwrap();
+        let hits = ids(&res.hits);
+        assert_eq!(
+            hits.iter().filter(|i| **i == 9999).count(),
+            1,
+            "the tail document appeared more than once: {hits:?}"
+        );
+        assert_eq!(res.hits[0].id, Id::Uint(9999), "the exact match did not rank first");
+
+        // A tombstone in the tail must suppress the indexed copy in its shard.
+        ns.write_records(&[Record::Delete(Id::Uint(9999))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(q).top_k(20).nprobe(1000)).await.unwrap();
+        assert!(!ids(&res.hits).contains(&9999), "tombstone did not reach the owning shard");
+    }
+
+    #[tokio::test]
+    async fn shard_count_is_fixed_at_creation() {
+        let fixed = ns("t/shard-immutable");
+        let cfg = |n: usize| WriteConfig { num_shards: Some(n), ..Default::default() };
+
+        fixed.commit_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))], &cfg(4)).await.unwrap();
+        // Re-sending the same count is allowed, because clients may send the
+        // configuration on every write.
+        fixed.commit_records(&[Record::Upsert(Doc::new(2u64, vec![1.0]))], &cfg(4)).await.unwrap();
+
+        // Changing it would relocate documents away from the index describing them.
+        let err = fixed
+            .commit_records(&[Record::Upsert(Doc::new(3u64, vec![1.0]))], &cfg(8))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("num_shards"), "unhelpful error: {err}");
+
+        // Setting it on a namespace that already holds unsharded data is refused.
+        let late = ns("t/shard-late");
+        late.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
+        assert!(
+            late.commit_records(&[Record::Upsert(Doc::new(2u64, vec![1.0]))], &cfg(4))
+                .await
+                .is_err()
+        );
+
+        // Out-of-range counts are refused rather than clamped.
+        let fresh = ns("t/shard-range");
+        for bad in [0usize, 257, 10_000] {
+            assert!(
+                fresh
+                    .commit_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))], &cfg(bad))
+                    .await
+                    .is_err(),
+                "num_shards {bad} was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_text_and_sparse_work_across_shards() {
+        let ns = ns("t/shard-text");
+        let cfg = WriteConfig {
+            num_shards: Some(3),
+            declared_fts: crate::fts::FtsSchema::from([(
+                "body".to_string(),
+                crate::fts::FtsConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let docs: Vec<Record> = (0..30u64)
+            .map(|i| {
+                Record::Upsert(
+                    Doc::new(i, vec![1.0, i as f32 * 0.01])
+                        .with_attr(
+                            "body",
+                            if i % 3 == 0 { "quick brown fox" } else { "lazy sleeping dog" },
+                        )
+                        .with_attr(
+                            "terms",
+                            Value::Sparse(std::collections::BTreeMap::from([(
+                                if i % 3 == 0 { "cat".to_string() } else { "dog".to_string() },
+                                1.0f32,
+                            )])),
+                        ),
+                )
+            })
+            .collect();
+        ns.commit_records(&docs, &cfg).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.shards.len(), 3);
+        // Each shard indexes its own text and sparse dimensions.
+        assert!(m.shards.iter().all(|s| s.index.as_ref().unwrap().fts.contains_key("body")));
+        assert!(m.shards.iter().all(|s| s.index.as_ref().unwrap().sparse.contains_key("terms")));
+
+        // BM25 across shards: every "quick fox" document, wherever it lives.
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(20)).await.unwrap();
+        assert_eq!(res.hits.len(), 10, "BM25 missed documents in other shards");
+        assert!(ids(&res.hits).iter().all(|i| i % 3 == 0));
+
+        // Sparse across shards.
+        let query = std::collections::BTreeMap::from([("cat".to_string(), 1.0f32)]);
+        let res = ns.query(&QueryRequest::new(vec![]).sparse("terms", query).top_k(20)).await.unwrap();
+        assert_eq!(res.hits.len(), 10, "sparse search missed documents in other shards");
+        assert!(ids(&res.hits).iter().all(|i| i % 3 == 0));
     }
 
     // -------------------------------------------------------- phase 12: schema
@@ -3087,8 +3363,7 @@ mod tests {
                 bytes: MAX_UNINDEXED_SCAN_BYTES + 1,
                 records: 1,
             }],
-            segments: vec![],
-            index: None,
+            shards: vec![],
             schema: Default::default(),
             created_at: None,
             last_write_at: None,

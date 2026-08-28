@@ -29,6 +29,7 @@ use crate::store::{
 };
 use crate::wire::{QueryRequest, WriteRequest, WriteResponse};
 use crate::doc::Doc;
+use crate::embed::{Embedder, HttpEmbedder};
 use anyhow::Result;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path as AxPath, Request, State};
@@ -157,6 +158,9 @@ pub struct AppState {
     resident: Arc<Mutex<HashMap<String, Arc<Resident>>>>,
     auth: Auth,
     pricing: Pricing,
+    /// Absent when no embedding endpoint is configured, in which case requests
+    /// that need one are refused by name rather than served a zero vector.
+    embedder: Option<Arc<dyn Embedder>>,
     started: Instant,
 }
 
@@ -168,12 +172,21 @@ impl AppState {
             resident: Arc::new(Mutex::new(HashMap::new())),
             auth: Auth::from_env(),
             pricing: Pricing::from_env(),
+            embedder: HttpEmbedder::from_env().unwrap_or_else(|e| {
+                tracing::warn!("embedding endpoint is configured but unusable: {e:#}");
+                None
+            }),
             started: Instant::now(),
         }
     }
 
     pub fn with_auth(mut self, auth: Auth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = Some(embedder);
         self
     }
 
@@ -647,6 +660,7 @@ fn classify(e: anyhow::Error) -> AppError {
         "needs a numeric",
         "not enabled for full-text",
         "is not a sparse vector",
+        "num_shards",
         "has not been compacted",
         "dimensions",
         "distance_metric",
@@ -693,7 +707,30 @@ async fn v2_write(
         metric: body.distance_metric,
         declared_types: body.declared_types(),
         declared_fts: body.declared_fts(),
+        num_shards: body.sharding.map(|s| s.num_shards),
+        declared_embed: body.declared_embed(),
     };
+
+    // Auto-embedding: rows without a vector get one from the attribute the
+    // schema names. One batched call, because embedding endpoints charge and
+    // rate-limit per request.
+    let mut body = body;
+    let embed_spec = if config.declared_embed.is_empty() {
+        manifest.schema.embed.clone()
+    } else {
+        config.declared_embed.clone()
+    };
+    let pending = body.rows_needing_embedding(&embed_spec);
+    if !pending.is_empty() {
+        let model = embed_spec.values().next().and_then(|s| s.model.clone());
+        let texts: Vec<String> = pending.iter().map(|(_, t)| t.clone()).collect();
+        let vectors = crate::embed::embed_many(state.embedder.as_ref(), &texts, model.as_deref())
+            .await
+            .map_err(classify_embed)?;
+        body.attach_vectors(
+            pending.iter().map(|(i, _)| *i).zip(vectors).collect(),
+        );
+    }
     // Which counters to report is decided by what was asked for, before
     // translation loses that information.
     let asked_upsert = !body.upsert_rows.is_empty() || body.upsert_columns.is_some();
@@ -735,6 +772,29 @@ async fn v2_query(
     if let Some((subqueries, rerank, limit)) =
         body.clone().split_multi().map_err(classify_request)?
     {
+        // Every sub-query that embeds is resolved in ONE call to the endpoint.
+        // A hybrid query typically embeds the same text it also searches for
+        // lexically, and paying per sub-query would be gratuitous.
+        let mut subqueries = subqueries;
+        let pending: Vec<(usize, String, Option<String>)> = subqueries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, q)| q.pending_embed().map(|(t, m)| (i, t, m)))
+            .collect();
+        if !pending.is_empty() {
+            let model = pending[0].2.clone();
+            if pending.iter().any(|(_, _, m)| *m != model) {
+                return Err(bad("sub-queries must request the same embedding model"));
+            }
+            let texts: Vec<String> = pending.iter().map(|(_, t, _)| t.clone()).collect();
+            let vectors =
+                crate::embed::embed_many(state.embedder.as_ref(), &texts, model.as_deref())
+                    .await
+                    .map_err(classify_embed)?;
+            for ((index, _, _), vector) in pending.into_iter().zip(vectors) {
+                subqueries[index].resolve_embed(vector);
+            }
+        }
         let handle = state.resident(&org, &name);
         let (manifest, _) = handle.ns.load().await?;
         let metric = manifest.schema.distance_metric;
@@ -762,11 +822,31 @@ async fn v2_query(
         };
     }
 
+    let mut body = body;
+    if let Some((text, model)) = body.pending_embed() {
+        let vector = crate::embed::embed_one(state.embedder.as_ref(), &text, model.as_deref())
+            .await
+            .map_err(classify_embed)?;
+        body.resolve_embed(vector);
+    }
+
     let handle = state.resident(&org, &name);
     let (manifest, _) = handle.ns.load().await?;
     let metric = manifest.schema.distance_metric;
     let response = run_v2_query(&handle, body, metric).await?;
     Ok(Json(response).into_response())
+}
+
+/// An embedding failure is somebody else's service failing, which is neither the
+/// caller's fault nor this server's: 501 when unconfigured, 502 when the
+/// endpoint itself refused.
+fn classify_embed(e: anyhow::Error) -> AppError {
+    let msg = format!("{e:#}");
+    if msg.contains("not configured") {
+        AppError(StatusCode::NOT_IMPLEMENTED, msg)
+    } else {
+        AppError(StatusCode::BAD_GATEWAY, msg)
+    }
 }
 
 /// Execute one compatibility query and shape its response.
@@ -2149,6 +2229,208 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    fn embedding_state() -> (AppState, Arc<crate::embed::testing::StubEmbedder>) {
+        let stub = Arc::new(crate::embed::testing::StubEmbedder::new(8));
+        let dynamic: Arc<dyn crate::embed::Embedder> = stub.clone();
+        (test_state().with_embedder(dynamic), stub)
+    }
+
+    #[tokio::test]
+    async fn v2_embed_at_query_time() {
+        let (state, stub) = embedding_state();
+        // Write with explicit vectors so only the query embeds.
+        let a = json!([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let b = json!([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpe",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": a, "body": "one" },
+                { "id": 2, "vector": b, "body": "two" },
+            ]})),
+        )
+        .await;
+
+        // The stub embeds "aaaa" to a vector with weight in slot 4 (len 4 + i 0).
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpe/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", ["Embed", "aaaa"]], "top_k": 2 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows"].as_array().unwrap().len(), 2);
+        assert!(stub.call_count() >= 1, "the query did not embed");
+
+        // The model option reaches the endpoint.
+        let before = stub.call_count();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpe/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", ["Embed", "aaaa", { "model": "m1" }]] })),
+        )
+        .await;
+        let calls = stub.calls.lock().unwrap();
+        assert!(calls.len() > before);
+        assert_eq!(calls.last().unwrap().1.as_deref(), Some("m1"));
+    }
+
+    #[tokio::test]
+    async fn embedding_is_refused_by_name_when_unconfigured() {
+        // No embedder: a request needing one must say so, never quietly rank on
+        // a zero vector, which would look like a working search.
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpne",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] })),
+        )
+        .await;
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpne/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", ["Embed", "anything"]] })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{res}");
+        assert!(res["error"].as_str().unwrap().contains("FCKDB_EMBED_URL"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_embedding_endpoint_is_a_bad_gateway() {
+        let stub: Arc<dyn crate::embed::Embedder> =
+            Arc::new(crate::embed::testing::StubEmbedder::failing("rate limited"));
+        let state = test_state().with_embedder(stub);
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpfe",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] })),
+        )
+        .await;
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpfe/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", ["Embed", "x"]] })),
+        )
+        .await;
+        // Somebody else's service failing is neither the caller's fault nor ours.
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{res}");
+        assert!(res["error"].as_str().unwrap().contains("rate limited"));
+    }
+
+    #[tokio::test]
+    async fn v2_embed_at_write_time() {
+        let (state, stub) = embedding_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpwe",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "body": "quick brown fox" },
+                    { "id": 2, "body": "lazy sleeping dog" },
+                ],
+                "schema": { "body": { "type": "string", "embed": { "model": "m1" } } }
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows_upserted"], 2);
+        // One call for the whole batch, not one per document.
+        assert_eq!(stub.call_count(), 1, "the batch became several requests");
+
+        // The documents are queryable, so a vector really was attached.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpwe/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", ["Embed", "quick brown fox"]], "top_k": 2 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows"][0]["id"], 1, "the matching document did not rank first");
+
+        // An explicit vector always wins: a caller correcting a document must not
+        // have it silently overwritten by a re-embedding.
+        let before = stub.call_count();
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpwe",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 3, "vector": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "body": "text" }
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(stub.call_count(), before, "an explicit vector was re-embedded anyway");
+
+        // The metadata reports the embedding configuration.
+        let (_, md) = call(&state, "GET", "/v1/namespaces/tpwe/metadata", Some(TOKEN_A), None).await;
+        assert_eq!(md["schema"]["body"]["embed"]["model"], "m1");
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_query_embeds_once_for_all_sub_queries() {
+        let (state, stub) = embedding_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tphe",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "body": "quick brown fox" },
+                    { "id": 2, "body": "lazy sleeping dog" },
+                ],
+                "schema": { "body": { "type": "string", "full_text_search": true,
+                                      "embed": {} } }
+            })),
+        )
+        .await;
+        call(&state, "POST", "/v1/namespaces/tphe/compact", Some(TOKEN_A), None).await;
+        let before = stub.call_count();
+
+        // Two sub-queries embedding the same text should cost one call, not two:
+        // a hybrid query almost always embeds the text it also searches for
+        // lexically.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tphe/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "top_k": 2,
+                "rerank_by": ["RRF"],
+                "queries": [
+                    { "rank_by": ["vector", "ANN", ["Embed", "quick fox"]], "top_k": 2 },
+                    { "rank_by": ["body", "BM25", "quick fox"], "top_k": 2 },
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(stub.call_count(), before + 1, "the sub-queries embedded separately");
+        assert!(!res["rows"].as_array().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn v2_order_by_attribute() {
         let state = test_state();
@@ -2570,8 +2852,7 @@ mod tests {
                 bytes: WRITE_BACKPRESSURE_BYTES + 1,
                 records: 1,
             }],
-            segments: vec![],
-            index: None,
+            shards: vec![],
             schema: Default::default(),
             created_at: None,
             last_write_at: None,

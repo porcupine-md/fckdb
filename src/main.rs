@@ -313,6 +313,42 @@ async fn run_e2e() -> Result<()> {
     assert!(ok_typed, "typed range/array filter selected the wrong documents");
     assert!(ok_patch, "patch was not visible through the indexed query path");
 
+    // -------------------------------------------------- phase 22: sharding
+    print!("[11b] sharded namespace ....... ");
+    // Both namespaces are built fresh from the same documents. Comparing against
+    // the main namespace would be wrong: earlier stages have patched and deleted
+    // documents in it, including the one this query is looking for.
+    let upserts: Vec<Record> = docs.iter().cloned().map(Record::Upsert).collect();
+    let plain = Namespace::new(store.clone(), format!("ns/e2e-{run}-plain"));
+    let sharded = Namespace::new(store.clone(), format!("ns/e2e-{run}-sharded"));
+    let t = Instant::now();
+    plain.write_records(&upserts).await?;
+    sharded
+        .commit_records(
+            &upserts,
+            &fckdb::store::WriteConfig { num_shards: Some(4), ..Default::default() },
+        )
+        .await?;
+    plain.compact(true).await?;
+    sharded.compact(true).await?;
+    let (sm, _) = sharded.load().await?;
+    let per_shard: Vec<usize> =
+        sm.shards.iter().map(|s| s.index.as_ref().map_or(0, |i| i.docs)).collect();
+    // Probing every cluster makes both exhaustive, so the answers must be
+    // identical rather than merely similar — any document duplicated or lost
+    // across shards shows up here.
+    let one = plain.query(&QueryRequest::new(q.clone()).top_k(top_k).nprobe(10_000)).await?;
+    let four = sharded.query(&QueryRequest::new(q.clone()).top_k(top_k).nprobe(10_000)).await?;
+    let agree = ids(&four.hits) == ids(&one.hits);
+    println!(
+        "{:.1?}  {} shards {:?} docs, matches unsharded: {agree}",
+        t.elapsed(),
+        sm.shards.len(),
+        per_shard
+    );
+    assert_eq!(per_shard.iter().sum::<usize>(), n, "documents lost or duplicated across shards");
+    assert!(agree, "sharded query disagreed with the unsharded one");
+
     // -------------------------------------------------- phase 9: HTTP surface
     print!("[12] HTTP surface ............. ");
     let http = http_smoke(store.clone()).await?;
@@ -382,7 +418,9 @@ async fn run_e2e() -> Result<()> {
         let a = ns.destroy().await?;
         let b = branched.destroy().await?;
         let c = probe.destroy().await?;
-        println!("\ncleanup  {} objects removed", a + b + c);
+        let d = sharded.destroy().await?;
+        let e = plain.destroy().await?;
+        println!("\ncleanup  {} objects removed", a + b + c + d + e);
     }
     println!("\nOK: phases 0-10 green");
     Ok(())

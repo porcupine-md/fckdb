@@ -11,6 +11,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 futures = "0.3.34"
 object_store = { version = "0.14.1", features = ["aws"] }
 regex = "1.13.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 rust-stemmers = "1.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

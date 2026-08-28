@@ -208,7 +208,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 211 tests
+cargo test                       # 227 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -223,6 +223,7 @@ no credentials and no network.
 | `FCKDB_ADDR` | listen address, default `127.0.0.1:8080` |
 | `FCKDB_CACHE_PATH` / `FCKDB_CACHE_BYTES` | NVMe ring buffer; unset means no cache |
 | `FCKDB_PRICE_*` | override the R2 list prices in the cost model |
+| `FCKDB_EMBED_URL` / `_MODEL` / `_KEY` | OpenAI-compatible embeddings endpoint; unset means `Embed` returns 501 |
 | `FCKDB_DOCS` / `FCKDB_DIM` / `FCKDB_NPROBE` | e2e dataset shape |
 | `FCKDB_KEEP` | keep e2e objects instead of deleting them |
 
@@ -269,7 +270,9 @@ architecture*, not a drop-in replacement.
 | Sparse vectors | `{}f16` attributes, `SparseKNN` | ✅ inverted list per dimension |
 | Multi-query, hybrid | `queries` (≤16), `rerank_by: ["RRF"]` | ✅ both, separate results or fused |
 | Aggregations | `aggregate_by`, `group_by`, `ForEachUnique` | ✅ Count/Sum/Min/Max/Avg, grouped or not, composing with ranking |
-| Sharding, CMEK, `compute_attributes`, `Embed` | yes | no — the unsupported ones return **501** |
+| Sharding | `sharding: {num_shards}`, ≤256 | ✅ fan-out and merge |
+| Native embedding | `["Embed", "text", {model}]`, schema `embed` | ✅ via an OpenAI-compatible endpoint |
+| CMEK, `compute_attributes`, `Highlight`, diversification | yes | no — unsupported features return **501** |
 
 BM25 is in. The common subset now works: a client doing row or column upserts, deletes,
 patches, filter-based writes, ANN or kNN queries with typed filters and
@@ -335,9 +338,14 @@ Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
   since a BM25 relevance score and a cosine distance live on incomparable scales
   and only their *ranks* can be combined
 
-**Next, in dependency order**
-
-1. Sharding, native embedding
+- **Sharding**: `num_shards` up to 256, fixed at the namespace's inaugural
+  write. Shards share the WAL so a write still commits once, but each indexes
+  only its own documents. Ranked queries fan out and merge; aggregations and
+  ordering gather instead, because a partial average cannot be combined from
+  finalized per-shard averages
+- **Native embedding** (`src/embed.rs`): `rank_by: [..., "ANN", ["Embed", "text"]]`
+  and schema-declared auto-embedding on write, through any OpenAI-compatible
+  `/v1/embeddings` endpoint
 
 Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
 a similarity, so the conversion inverts ordering — that needs a test asserting
@@ -374,6 +382,8 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Aggregations scan every matching document | `Namespace::query` | answer Count from the attribute index's posting lengths, Min/Max from its sorted ends |
 | Sparse weights are stored f32, not f16 | `value::Value::Sparse` | half-precision, when sparse namespaces get large enough for the size to matter |
 | Sub-queries in a multi-query run sequentially | `server::v2_query` | they are independent; run them concurrently |
+| Shards are queried sequentially, so latency is the sum not the max | `Namespace::query` | fan out concurrently — every shard must answer anyway |
+| Shard count cannot change after creation | `doc::Schema::set_shards` | copy into a new namespace, as turbopuffer does |
 | HTTP status is chosen by matching engine error text | `server::classify` | a typed error enum carrying its own kind |
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |

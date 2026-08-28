@@ -52,6 +52,9 @@ pub struct SchemaAttr {
     pub glob: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_text_search: Option<FullText>,
+    /// Embed this attribute's text into the document's vector on write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<crate::doc::EmbedSpec>,
 }
 
 /// `full_text_search` is either a flag or a tokenizer configuration.
@@ -92,6 +95,14 @@ pub struct V2Write {
     pub distance_metric: Option<DistanceMetric>,
     #[serde(default)]
     pub schema: Option<BTreeMap<String, SchemaAttr>>,
+    /// Settable on a namespace's inaugural write only.
+    #[serde(default)]
+    pub sharding: Option<Sharding>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct Sharding {
+    pub num_shards: usize,
 }
 
 impl V2Write {
@@ -111,6 +122,52 @@ impl V2Write {
             .as_ref()
             .map(|s| s.iter().map(|(k, v)| (k.clone(), v.ty)).collect())
             .unwrap_or_default()
+    }
+
+    /// Attributes the client asked to auto-embed.
+    pub fn declared_embed(&self) -> BTreeMap<String, crate::doc::EmbedSpec> {
+        self.schema
+            .as_ref()
+            .map(|s| {
+                s.iter()
+                    .filter_map(|(k, v)| v.embed.as_ref().map(|e| (k.clone(), e.clone())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The rows that need a vector produced for them, as (row index, text).
+    ///
+    /// Only rows that did not send one: an explicit vector always wins over
+    /// re-embedding, so a caller can backfill or correct a document without the
+    /// server silently overwriting what they sent.
+    pub fn rows_needing_embedding(
+        &self,
+        embed: &BTreeMap<String, crate::doc::EmbedSpec>,
+    ) -> Vec<(usize, String)> {
+        if embed.is_empty() {
+            return vec![];
+        }
+        self.upsert_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.vector.is_none())
+            .filter_map(|(i, r)| {
+                embed
+                    .keys()
+                    .find_map(|k| r.attrs.get(k).and_then(crate::fts::attribute_text))
+                    .map(|t| (i, t))
+            })
+            .collect()
+    }
+
+    /// Attach produced vectors to the rows that asked for them.
+    pub fn attach_vectors(&mut self, resolved: Vec<(usize, Vec<f32>)>) {
+        for (index, vector) in resolved {
+            if let Some(row) = self.upsert_rows.get_mut(index) {
+                row.vector = Some(vector);
+            }
+        }
     }
 
     /// Attributes the client enabled for full-text search, with their tokenizer.
@@ -176,9 +233,9 @@ pub struct V2WriteResponse {
 #[derive(Debug, Clone, PartialEq)]
 pub enum RankBy {
     /// Approximate nearest neighbour over a vector attribute.
-    Ann { attribute: String, vector: Vec<f32> },
+    Ann { attribute: String, source: VectorSource },
     /// Exact nearest neighbour: the same ranking, without the index.
-    Knn { attribute: String, vector: Vec<f32> },
+    Knn { attribute: String, source: VectorSource },
     /// Rank by an attribute value.
     Order { attribute: String, descending: bool },
     /// BM25 full-text ranking over a text attribute.
@@ -249,23 +306,49 @@ fn parse_rank_by(raw: &serde_json::Value) -> Result<RankBy> {
             Ok(RankBy::Bm25 { attribute, query })
         }
         "ANN" | "kNN" => {
-            let vector: Vec<f32> = serde_json::from_value(arr[2].clone()).map_err(|_| {
-                // Embed takes text instead of a vector; say so precisely rather
-                // than reporting a generic parse failure.
-                if arr[2].get(0).and_then(|v| v.as_str()) == Some("Embed") {
-                    anyhow::anyhow!("native embedding (Embed) is not implemented")
-                } else {
-                    anyhow::anyhow!("rank_by {func} expects an array of numbers")
-                }
-            })?;
+            let source = parse_vector_source(&arr[2], func)?;
             Ok(if func == "ANN" {
-                RankBy::Ann { attribute, vector }
+                RankBy::Ann { attribute, source }
             } else {
-                RankBy::Knn { attribute, vector }
+                RankBy::Knn { attribute, source }
             })
         }
         other => Ok(RankBy::Unsupported(other.to_string())),
     }
+}
+
+/// Where a query's vector comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VectorSource {
+    /// Sent by the client.
+    Literal(Vec<f32>),
+    /// To be produced by an embedding model from text.
+    Embed { text: String, model: Option<String> },
+}
+
+/// A literal vector, or an `["Embed", "text", {options}]` request.
+fn parse_vector_source(raw: &serde_json::Value, func: &str) -> Result<VectorSource> {
+    if let Some(items) = raw.as_array()
+        && items.first().and_then(|v| v.as_str()) == Some("Embed")
+    {
+        let text = items
+            .get(1)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Embed expects the text to embed as a string"))?
+            .to_string();
+        if text.trim().is_empty() {
+            bail!("Embed was given empty text");
+        }
+        let model = items
+            .get(2)
+            .and_then(|o| o.get("model"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
+        return Ok(VectorSource::Embed { text, model });
+    }
+    let vector: Vec<f32> = serde_json::from_value(raw.clone())
+        .map_err(|_| anyhow::anyhow!("rank_by {func} expects an array of numbers or an Embed"))?;
+    Ok(VectorSource::Literal(vector))
 }
 
 /// `limit` is an object; `top_k` is an alias for `limit.total`.
@@ -326,6 +409,32 @@ impl V2Query {
     /// index should be bypassed (`kNN` means exact).
     /// Up to this many sub-queries per request, matching turbopuffer.
     pub const MAX_SUBQUERIES: usize = 16;
+
+    /// The text this query needs embedded, if any.
+    ///
+    /// Resolution is a separate step because it needs the network, and
+    /// translating a request must stay pure — a sub-query in a multi-query is
+    /// translated the same way whether or not it embeds.
+    pub fn pending_embed(&self) -> Option<(String, Option<String>)> {
+        let source = match &self.rank_by {
+            Some(RankBy::Ann { source, .. }) | Some(RankBy::Knn { source, .. }) => source,
+            _ => return None,
+        };
+        match source {
+            VectorSource::Embed { text, model } => Some((text.clone(), model.clone())),
+            VectorSource::Literal(_) => None,
+        }
+    }
+
+    /// Substitute an embedded vector for the text that produced it.
+    pub fn resolve_embed(&mut self, vector: Vec<f32>) {
+        match &mut self.rank_by {
+            Some(RankBy::Ann { source, .. }) | Some(RankBy::Knn { source, .. }) => {
+                *source = VectorSource::Literal(vector);
+            }
+            _ => {}
+        }
+    }
 
     /// Validate a multi-query and hand back its sub-queries.
     ///
@@ -400,9 +509,19 @@ impl V2Query {
             bail!("rank_by is required");
         };
         let mut sparse = None;
+        let unwrap_source = |source: VectorSource| -> Result<Vec<f32>> {
+            match source {
+                VectorSource::Literal(v) => Ok(v),
+                // The server resolves this before translating; reaching here
+                // means nobody did, and guessing a vector would be worse.
+                VectorSource::Embed { .. } => {
+                    bail!("this query needs an embedding that was never resolved")
+                }
+            }
+        };
         let (vector, exact, order_by, text) = match rank_by {
-            RankBy::Ann { vector, .. } => (vector, false, None, None),
-            RankBy::Knn { vector, .. } => (vector, true, None, None),
+            RankBy::Ann { source, .. } => (unwrap_source(source)?, false, None, None),
+            RankBy::Knn { source, .. } => (unwrap_source(source)?, true, None, None),
             RankBy::Order { attribute, descending } => {
                 (vec![], false, Some(crate::doc::OrderBy { attribute, descending }), None)
             }
@@ -634,6 +753,8 @@ pub struct V2IndexInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct V2Metadata {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sharding: Option<Sharding>,
     pub approx_row_count: usize,
     pub approx_logical_bytes: u64,
     pub schema: BTreeMap<String, SchemaAttr>,
@@ -652,9 +773,10 @@ pub fn to_v2_metadata(name: &str, m: &Manifest) -> V2Metadata {
     let iso = |n: Option<i64>| n.map(crate::value::format_datetime);
     V2Metadata {
         id: name.to_string(),
+        sharding: m.schema.num_shards.map(|num_shards| Sharding { num_shards }),
         // Approximate on purpose: the indexed count is exact but the unindexed
         // tail may contain updates and tombstones for documents already counted.
-        approx_row_count: m.index.as_ref().map_or(0, |i| i.docs) + m.unindexed_records(),
+        approx_row_count: m.indexed_docs() + m.unindexed_records(),
         approx_logical_bytes: m.total_bytes(),
         schema: m
             .schema
@@ -672,6 +794,7 @@ pub fn to_v2_metadata(name: &str, m: &Manifest) -> V2Metadata {
                             .fts
                             .get(k)
                             .map(|c| FullText::Config(Box::new(c.clone()))),
+                        embed: m.schema.embed.get(k).cloned(),
                     },
                 )
             })
@@ -694,9 +817,21 @@ mod tests {
     #[test]
     fn rank_by_parses_ann_and_knn() {
         let ann: RankBy = serde_json::from_str(r#"["vector","ANN",[0.1,0.2]]"#).unwrap();
-        assert_eq!(ann, RankBy::Ann { attribute: "vector".into(), vector: vec![0.1, 0.2] });
+        assert_eq!(
+            ann,
+            RankBy::Ann {
+                attribute: "vector".into(),
+                source: VectorSource::Literal(vec![0.1, 0.2])
+            }
+        );
         let knn: RankBy = serde_json::from_str(r#"["vector","kNN",[0.1,0.2]]"#).unwrap();
-        assert_eq!(knn, RankBy::Knn { attribute: "vector".into(), vector: vec![0.1, 0.2] });
+        assert_eq!(
+            knn,
+            RankBy::Knn {
+                attribute: "vector".into(),
+                source: VectorSource::Literal(vec![0.1, 0.2])
+            }
+        );
     }
 
     #[test]
@@ -921,11 +1056,42 @@ mod tests {
     }
 
     #[test]
-    fn embed_is_reported_precisely() {
-        let err = serde_json::from_str::<RankBy>(r#"["content","ANN",["Embed","foxes"]]"#)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Embed"), "unhelpful error: {err}");
+    fn embed_is_parsed_and_resolved_separately() {
+        let got: RankBy =
+            serde_json::from_str(r#"["content","ANN",["Embed","foxes that jump"]]"#).unwrap();
+        assert_eq!(
+            got,
+            RankBy::Ann {
+                attribute: "content".into(),
+                source: VectorSource::Embed { text: "foxes that jump".into(), model: None },
+            }
+        );
+
+        // With a model option.
+        let got: RankBy = serde_json::from_str(
+            r#"["content","ANN",["Embed","foxes",{"model":"text-embedding-3-small"}]]"#,
+        )
+        .unwrap();
+        match &got {
+            RankBy::Ann { source: VectorSource::Embed { model, .. }, .. } => {
+                assert_eq!(model.as_deref(), Some("text-embedding-3-small"))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Translating before resolving is refused rather than guessing a vector.
+        let mut q = V2Query { rank_by: Some(got), ..Default::default() };
+        assert_eq!(q.pending_embed().unwrap().0, "foxes");
+        assert!(q.clone().into_native(8).is_err(), "an unresolved embed produced a query");
+
+        q.resolve_embed(vec![0.5, 0.5]);
+        assert!(q.pending_embed().is_none());
+        let (req, _) = q.into_native(8).unwrap();
+        assert_eq!(req.vector, vec![0.5, 0.5]);
+
+        // Empty text is a client error: it would embed to something meaningless.
+        assert!(serde_json::from_str::<RankBy>(r#"["c","ANN",["Embed","  "]]"#).is_err());
+        assert!(serde_json::from_str::<RankBy>(r#"["c","ANN",["Embed"]]"#).is_err());
     }
 
     #[test]
