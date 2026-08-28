@@ -471,8 +471,10 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
         Some("e2e-token"),
         Some(serde_json::json!({
             "upsert_rows": [
-                { "id": 10, "vector": [1.0, 0.0], "lang": "id", "when": "2024-03-05T00:00:00Z" },
-                { "id": 11, "vector": [0.0, 1.0], "lang": "en", "when": "2023-01-01T00:00:00Z" },
+                { "id": 10, "vector": [1.0, 0.0], "lang": "id", "rank": 3,
+                  "when": "2024-03-05T00:00:00Z" },
+                { "id": 11, "vector": [0.0, 1.0], "lang": "en", "rank": 4,
+                  "when": "2023-01-01T00:00:00Z" },
             ],
             "schema": { "when": { "type": "datetime" } }
         })),
@@ -585,6 +587,39 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
     }
     let _ = send("DELETE", format!("/v1/namespaces/{fts_ns}"), Some("e2e-token"), None).await;
 
+    // Aggregations and grouping, through /v2 against the same backend.
+    let (status, body) = send(
+        "POST",
+        format!("/v2/namespaces/{ns}/query"),
+        Some("e2e-token"),
+        Some(serde_json::json!({
+            "aggregate_by": { "n": ["Count"], "total": ["Sum", "rank"] },
+            "group_by": ["lang"]
+        })),
+    )
+    .await;
+    if status != StatusCode::OK {
+        anyhow::bail!("aggregation returned {status}: {body}");
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    let groups = parsed["aggregation_groups"].as_array().cloned().unwrap_or_default();
+    // A grouped result must not also report an ungrouped total. Documents
+    // without the attribute form their own null group rather than vanishing, so
+    // the group counts still add up to the document count.
+    if parsed.get("aggregations").is_some() {
+        anyhow::bail!("a grouped result also reported a total: {body}");
+    }
+    let find = |lang: &str| {
+        groups
+            .iter()
+            .find(|g| g["lang"] == lang)
+            .map(|g| (g["n"].as_u64().unwrap_or(0), g["total"].as_u64().unwrap_or(0)))
+    };
+    let has_null_group = groups.iter().any(|g| g["lang"].is_null());
+    if find("id") != Some((1, 3)) || find("en") != Some((1, 4)) || !has_null_group {
+        anyhow::bail!("group_by computed the wrong values: {body}");
+    }
+
     let (_, metrics) = send("GET", "/metrics".into(), None, None).await;
     let scraped = metrics.lines().filter(|l| !l.starts_with('#')).count();
 
@@ -597,6 +632,6 @@ async fn http_smoke(store: Arc<dyn object_store::ObjectStore>) -> Result<String>
 
     Ok(format!(
         "401 on no token, v1+v2 write/query/delete OK, BM25+phrase OK, \
-         {scraped} metrics exposed"
+         group_by OK, {scraped} metrics exposed"
     ))
 }

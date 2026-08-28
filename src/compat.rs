@@ -18,6 +18,7 @@
 use crate::doc::{Attrs, DistanceMetric, Doc, Filter, Id, Include};
 use crate::store::Manifest;
 use crate::value::Type;
+use crate::aggregate::{Agg, AggregationGroup, GroupKey};
 use crate::fts::{FtsConfig, FtsSchema};
 use crate::wire::{Columns, Consistency, FilterPatch, QueryRequest, WriteRequest};
 use anyhow::{Result, bail};
@@ -295,7 +296,9 @@ pub struct V2Query {
     #[serde(default)]
     pub queries: Option<Vec<serde_json::Value>>,
     #[serde(default)]
-    pub aggregate_by: Option<serde_json::Value>,
+    pub aggregate_by: Option<BTreeMap<String, Agg>>,
+    #[serde(default)]
+    pub group_by: Vec<GroupKey>,
 }
 
 /// Default eventual-consistency staleness window, matching turbopuffer's
@@ -309,16 +312,40 @@ impl V2Query {
         if self.queries.is_some() {
             bail!("multi-queries are not implemented");
         }
-        if self.aggregate_by.is_some() {
-            bail!("aggregations are not implemented");
-        }
         if let Some(enc) = &self.vector_encoding
             && enc != "float"
         {
             bail!("vector_encoding {enc:?} is not implemented; only \"float\" is supported");
         }
 
+        if !self.group_by.is_empty() && self.aggregate_by.is_none() {
+            bail!("group_by requires aggregate_by");
+        }
+        // rank_by is required unless the query is purely an aggregation, which
+        // returns no rows to rank.
         let Some(rank_by) = self.rank_by else {
+            if self.aggregate_by.is_some() {
+                return Ok((
+                    QueryRequest {
+                        vector: vec![],
+                        top_k: 1,
+                        filter: self.filters,
+                        nprobe,
+                        consistency: match self.consistency.map(|c| c.level) {
+                            Some(ConsistencyLevel::Eventual) => {
+                                Consistency::Eventual { max_age_ms: EVENTUAL_MAX_AGE_MS }
+                            }
+                            _ => Consistency::Strong,
+                        },
+                        include_attributes: Include::None,
+                        order_by: None,
+                        text: None,
+                        aggregate_by: self.aggregate_by,
+                        group_by: self.group_by,
+                    },
+                    false,
+                ));
+            }
             bail!("rank_by is required");
         };
         let (vector, exact, order_by, text) = match rank_by {
@@ -367,6 +394,8 @@ impl V2Query {
                 include_attributes: self.include_attributes,
                 order_by,
                 text,
+                aggregate_by: self.aggregate_by,
+                group_by: self.group_by,
             },
             exact,
         ))
@@ -385,9 +414,36 @@ pub struct V2Row {
     pub attrs: Attrs,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct V2QueryResponse {
-    pub rows: Vec<V2Row>,
+    /// Omitted entirely for a pure aggregation, which ranks nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<V2Row>>,
+    /// Present only when aggregating WITHOUT grouping. A caller must be able to
+    /// tell an ungrouped result from an empty grouped one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregations: Option<BTreeMap<String, crate::value::Value>>,
+    /// Present only when grouping. Each row flattens its group key alongside the
+    /// computed values, the way turbopuffer returns them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregation_groups: Option<Vec<BTreeMap<String, crate::value::Value>>>,
+}
+
+/// Shape an engine response into the compatibility surface's aggregation form.
+pub fn to_v2_aggregations(
+    aggregations: BTreeMap<String, crate::value::Value>,
+    groups: Vec<AggregationGroup>,
+    grouped: bool,
+) -> V2QueryResponse {
+    if grouped {
+        V2QueryResponse {
+            rows: None,
+            aggregations: None,
+            aggregation_groups: Some(groups.iter().map(|g| g.flatten()).collect()),
+        }
+    } else {
+        V2QueryResponse { rows: None, aggregations: Some(aggregations), aggregation_groups: None }
+    }
 }
 
 /// Convert native hits into compatibility rows.
@@ -504,6 +560,53 @@ mod tests {
     }
 
     #[test]
+    fn a_pure_aggregation_needs_no_rank_by() {
+        let (req, _) = serde_json::from_str::<V2Query>(
+            r#"{"aggregate_by":{"n":["Count"]},"filters":["x","Eq",1]}"#,
+        )
+        .unwrap()
+        .into_native(8)
+        .unwrap();
+        assert!(req.aggregate_by.is_some());
+        assert!(req.vector.is_empty(), "an aggregation needs no vector");
+        assert!(req.filter.is_some(), "the filter selects what is aggregated");
+
+        // Without either, there is nothing to do.
+        assert!(
+            serde_json::from_str::<V2Query>(r#"{"top_k":5}"#).unwrap().into_native(8).is_err()
+        );
+        // Grouping without aggregating computes nothing.
+        assert!(
+            serde_json::from_str::<V2Query>(r#"{"group_by":["color"]}"#)
+                .unwrap()
+                .into_native(8)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn aggregation_response_shapes_are_mutually_exclusive() {
+        use crate::value::Value;
+        let flat = BTreeMap::from([("n".to_string(), Value::Uint(42))]);
+        let ungrouped = to_v2_aggregations(flat.clone(), vec![], false);
+        let json = serde_json::to_value(&ungrouped).unwrap();
+        assert_eq!(json["aggregations"]["n"], 42);
+        assert!(json.get("aggregation_groups").is_none());
+        assert!(json.get("rows").is_none(), "an aggregation reported rows");
+
+        let group = AggregationGroup {
+            key: BTreeMap::from([("color".to_string(), Value::from("red"))]),
+            values: flat,
+        };
+        let grouped = to_v2_aggregations(BTreeMap::new(), vec![group], true);
+        let json = serde_json::to_value(&grouped).unwrap();
+        assert!(json.get("aggregations").is_none(), "a grouped result also reported a total");
+        // The group key is flattened alongside the computed value.
+        assert_eq!(json["aggregation_groups"][0]["color"], "red");
+        assert_eq!(json["aggregation_groups"][0]["n"], 42);
+    }
+
+    #[test]
     fn rank_by_parses_bm25() {
         let got: RankBy = serde_json::from_str(r#"["content","BM25","quick fox"]"#).unwrap();
         assert_eq!(
@@ -540,7 +643,9 @@ mod tests {
         assert_eq!(req.order_by.unwrap().descending, true);
 
         let rows = to_v2_ordered_rows(vec![Hit::new(1u64, 0.0)]);
-        let json = serde_json::to_value(V2QueryResponse { rows }).unwrap();
+        let json =
+            serde_json::to_value(V2QueryResponse { rows: Some(rows), ..Default::default() })
+                .unwrap();
         assert!(
             json["rows"][0].get("$dist").is_none(),
             "an ordered row reported a distance; zero would read as a perfect match"
@@ -650,7 +755,6 @@ mod tests {
     fn unimplemented_query_features_are_refused_not_ignored() {
         for json in [
             r#"{"queries":[{"rank_by":["v","ANN",[1.0]]}]}"#,
-            r#"{"rank_by":["v","ANN",[1.0]],"aggregate_by":{"n":["Count"]}}"#,
             r#"{"rank_by":["v","ANN",[1.0]],"vector_encoding":"base64"}"#,
             r#"{"top_k":5}"#,
         ] {
@@ -705,7 +809,9 @@ mod tests {
         let mut attrs = Attrs::new();
         attrs.insert("title".into(), Value::from("puffer"));
         let rows = vec![V2Row { id: Id::Uint(8), dist: Some(1.7), attrs }];
-        let json = serde_json::to_value(V2QueryResponse { rows }).unwrap();
+        let json =
+            serde_json::to_value(V2QueryResponse { rows: Some(rows), ..Default::default() })
+                .unwrap();
         let row = &json["rows"][0];
         assert_eq!(row["id"], 8);
         // f32 widened to f64, so compare with tolerance rather than exactly:

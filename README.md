@@ -208,7 +208,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 174 tests
+cargo test                       # 193 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -266,7 +266,7 @@ architecture*, not a drop-in replacement.
 | Order by attribute | `rank_by: ["attr","desc"]` | ✅ same shape, `$dist` omitted |
 | Attribute index | inverted, per attribute | ✅ built by compaction; drives exact filtered search |
 | BM25 full-text | `rank_by: ["body","BM25","query"]`, `ContainsAllTokens`, `ContainsTokenSequence`, `Fuzzy` | ✅ all four, with stemming and phrase positions |
-| Aggregations | `aggregate_by`, group-by | none — returns **501** |
+| Aggregations | `aggregate_by`, `group_by`, `ForEachUnique` | ✅ Count/Sum/Min/Max/Avg, grouped or not, composing with ranking |
 | Multi-vector, sharding, CMEK | yes | no |
 
 BM25 is in. The common subset now works: a client doing row or column upserts, deletes,
@@ -320,9 +320,14 @@ Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
   attribute; textbook BM25 scoring; and the `ContainsAllTokens`,
   `ContainsTokenSequence` (phrase) and `Fuzzy` filter operators
 
+- **Aggregations** (`src/aggregate.rs`): `Count`, `Sum`, `Min`, `Max`, `Avg`,
+  with `group_by` over several attributes and `ForEachUnique` to explode array
+  attributes into one group per element. Ranking and aggregating compose, so a
+  faceted result page is one round trip
+
 **Next, in dependency order**
 
-1. **Aggregations**, sparse vectors, multi-query, sharding — each its own project
+1. Sparse vectors, multi-query / RRF, sharding, native embedding
 
 Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
 a similarity, so the conversion inverts ordering — that needs a test asserting
@@ -356,6 +361,8 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | A full-text query fetches the whole term index object | `fts::FtsIndex` | term dictionary with offsets at the tail, then range-request only the query's terms |
 | Stopword lists exist for English only | `fts::EN_STOPWORDS` | a data change, not a code change — the stemmer already switches by language |
 | BM25 scores the unindexed tail one document at a time | `Namespace::query` | index the tail incrementally |
+| Aggregations scan every matching document | `Namespace::query` | answer Count from the attribute index's posting lengths, Min/Max from its sorted ends |
+| HTTP status is chosen by matching engine error text | `server::classify` | a typed error enum carrying its own kind |
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |
 | Blocking `pread` on the async runtime | `cache::RingCache` | `spawn_blocking` or io_uring |

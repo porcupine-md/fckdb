@@ -763,6 +763,44 @@ impl Namespace {
         let unindexed_records: usize = wal_entries.iter().map(|e| e.records as usize).sum();
         let unindexed_bytes: u64 = wal_entries.iter().map(|e| e.bytes).sum();
 
+        // Aggregations scan the documents matching the filter. They compose with
+        // ranking rather than replacing it: a request carrying both gets rows AND
+        // totals, which is how a faceted search page is built in one round trip.
+        let (aggregations, aggregation_groups) = match &req.aggregate_by {
+            None => (BTreeMap::new(), vec![]),
+            Some(aggs) => {
+                let mut paths: Vec<Path> =
+                    m.segments.iter().map(|s| self.data_path(&s.name)).collect();
+                paths.extend(wal_entries.iter().map(|e| self.wal_path(&e.name)));
+                let live = Self::materialize(self.read_records_parallel(paths).await?);
+                let matching: Vec<&Doc> = live
+                    .values()
+                    .filter(|d| filter.as_ref().is_none_or(|f| f.matches(&d.attrs, &m.schema.fts)))
+                    .collect();
+                crate::aggregate::aggregate(matching.into_iter(), aggs, &req.group_by)?
+            }
+        };
+
+        // A request that only aggregates has nothing to rank.
+        let ranking_requested =
+            !req.vector.is_empty() || req.text.is_some() || req.order_by.is_some();
+        if req.aggregate_by.is_some() && !ranking_requested {
+            return Ok(QueryResponse {
+                hits: vec![],
+                consistent: !from_snapshot && !truncated,
+                indexed: false,
+                prefiltered: false,
+                ordered: false,
+                aggregations,
+                aggregation_groups,
+                unindexed_records,
+                unindexed_bytes,
+                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
+                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
+                took_ms: t.elapsed().as_millis() as u64,
+            });
+        }
+
         // Full-text ranking: score from the term index, then score the tail on
         // the same scale so recent writes remain rankable.
         if let Some(text) = &req.text {
@@ -854,6 +892,8 @@ impl Namespace {
                 indexed: true,
                 prefiltered: false,
                 ordered: false,
+                aggregations: aggregations.clone(),
+                aggregation_groups: aggregation_groups.clone(),
                 unindexed_records,
                 unindexed_bytes,
                 object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
@@ -883,6 +923,8 @@ impl Namespace {
                 indexed: false,
                 prefiltered: false,
                 ordered: true,
+                aggregations: aggregations.clone(),
+                aggregation_groups: aggregation_groups.clone(),
                 unindexed_records,
                 unindexed_bytes,
                 object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
@@ -936,6 +978,8 @@ impl Namespace {
                     indexed: true,
                     prefiltered,
                     ordered: false,
+                    aggregations: aggregations.clone(),
+                    aggregation_groups: aggregation_groups.clone(),
                     unindexed_records,
                     unindexed_bytes,
                     object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
@@ -1013,6 +1057,8 @@ impl Namespace {
             indexed,
             prefiltered,
             ordered: false,
+            aggregations,
+            aggregation_groups,
             unindexed_records,
             unindexed_bytes,
             object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,

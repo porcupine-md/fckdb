@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod attrindex;
 pub mod cache;
 pub mod compat;

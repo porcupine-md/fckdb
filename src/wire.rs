@@ -4,6 +4,7 @@
 //! server cannot drift, and the e2e driver exercises the same shapes real
 //! clients send.
 
+use crate::aggregate::{Agg, AggregationGroup, GroupKey};
 use crate::doc::{Attrs, DistanceMetric, Doc, Filter, Id, IdType, Include, OrderBy};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -54,6 +55,13 @@ pub struct QueryRequest {
     /// Rank by BM25 over a full-text attribute. When set, `vector` is ignored.
     #[serde(default)]
     pub text: Option<TextSearch>,
+    /// Compute aggregates over the documents matching `filter`. When set, no
+    /// rows are returned unless a ranking is also requested.
+    #[serde(default)]
+    pub aggregate_by: Option<BTreeMap<String, Agg>>,
+    /// Compute the aggregates separately per group.
+    #[serde(default)]
+    pub group_by: Vec<GroupKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,6 +81,8 @@ impl QueryRequest {
             include_attributes: Include::None,
             order_by: None,
             text: None,
+            aggregate_by: None,
+            group_by: vec![],
         }
     }
     pub fn top_k(mut self, k: usize) -> Self {
@@ -103,6 +113,14 @@ impl QueryRequest {
         self.text = Some(TextSearch { attribute: attribute.into(), query: query.into() });
         self
     }
+    pub fn aggregate(mut self, spec: BTreeMap<String, Agg>) -> Self {
+        self.aggregate_by = Some(spec);
+        self
+    }
+    pub fn group_by(mut self, keys: Vec<GroupKey>) -> Self {
+        self.group_by = keys;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +139,12 @@ pub struct QueryResponse {
     /// so `score` carries no meaning.
     #[serde(default)]
     pub ordered: bool,
+    /// Ungrouped aggregates. Empty when `group_by` was used.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aggregations: BTreeMap<String, crate::value::Value>,
+    /// Grouped aggregates. Empty when `group_by` was not used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregation_groups: Vec<AggregationGroup>,
     /// Records read from the unindexed WAL tail for this query.
     pub unindexed_records: usize,
     pub unindexed_bytes: u64,

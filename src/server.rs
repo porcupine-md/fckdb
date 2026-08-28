@@ -435,8 +435,12 @@ async fn query(
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
-    if req.order_by.is_none() && req.text.is_none() && req.vector.is_empty() {
-        return Err(bad("query requires a vector, order_by, or text"));
+    if req.order_by.is_none()
+        && req.text.is_none()
+        && req.aggregate_by.is_none()
+        && req.vector.is_empty()
+    {
+        return Err(bad("query requires a vector, order_by, text, or aggregate_by"));
     }
     if req.vector.iter().any(|f| !f.is_finite()) {
         return Err(bad("query vector must not contain NaN or infinity"));
@@ -589,12 +593,32 @@ async fn list_namespaces(
 
 // ---------------------------------------------------------------- /v2 compat
 
+/// Map a request-translation failure to a status.
+///
+/// Every error from `into_native` describes something wrong with the request, so
+/// none of them can be a 500. Keyword-matching those against a list of phrases —
+/// as `classify` must do for engine errors — would silently turn each new
+/// validation message into an internal server error until someone noticed.
+fn classify_request(e: anyhow::Error) -> AppError {
+    let msg = format!("{e:#}");
+    if msg.contains("not implemented") {
+        AppError(StatusCode::NOT_IMPLEMENTED, msg)
+    } else {
+        AppError(StatusCode::BAD_REQUEST, msg)
+    }
+}
+
 /// Map an engine error to the right status. Shared by both surfaces so a client
 /// mistake never reads as a server fault on one and not the other.
 fn classify(e: anyhow::Error) -> AppError {
     let msg = format!("{e:#}");
+    // ponytail: matching on message text. Fragile in exactly the way it looks —
+    // a new engine error defaults to 500 until someone adds its phrase here, and
+    // this list has already had to grow twice. The fix is a typed error enum in
+    // the engine that carries its own kind; worth doing when the list next grows.
     let client = [
         "declared",
+        "needs a numeric",
         "not enabled for full-text",
         "has not been compacted",
         "dimensions",
@@ -652,7 +676,7 @@ async fn v2_write(
     let asked_delete = !body.deletes.is_empty() || body.delete_by_filter.is_some();
     let asked_filter = body.delete_by_filter.is_some() || body.patch_by_filter.is_some();
 
-    let native = body.into_native().map_err(classify)?;
+    let native = body.into_native().map_err(classify_request)?;
     let plan = assemble(&handle.ns, native).await?;
     let affected = plan.upserted + plan.patched + plan.deleted;
 
@@ -677,8 +701,10 @@ async fn v2_query(
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
-    let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify)?;
-    let ordering = req.order_by.is_some() || req.text.is_some();
+    let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify_request)?;
+    let aggregating = req.aggregate_by.is_some();
+    let grouped = !req.group_by.is_empty();
+    let ordering = req.order_by.is_some() || req.text.is_some() || aggregating;
     if !ordering && (req.vector.is_empty() || req.vector.iter().any(|f| !f.is_finite())) {
         return Err(bad("rank_by vector must be non-empty and finite"));
     }
@@ -687,15 +713,29 @@ async fn v2_query(
     let (manifest, _) = handle.ns.load().await?;
     let metric = manifest.schema.distance_metric;
 
-    let hits = if exact {
+    // A pure aggregation ranks nothing and reports no rows.
+    if aggregating && req.vector.is_empty() && req.text.is_none() && req.order_by.is_none() {
+        let res = handle.ns.query(&req).await.map_err(classify)?;
+        return Ok(Json(crate::compat::to_v2_aggregations(
+            res.aggregations,
+            res.aggregation_groups,
+            grouped,
+        ))
+        .into_response());
+    }
+
+    let (hits, aggregated) = if exact {
         // kNN means exact, so bypass the index entirely rather than probing more.
-        handle
+        let hits = handle
             .ns
             .query_brute(&req.vector, req.top_k, req.filter.as_ref())
             .await
-            .map_err(classify)?
+            .map_err(classify)?;
+        (hits, None)
     } else {
-        handle.ns.query(&req).await.map_err(classify)?.hits
+        let res = handle.ns.query(&req).await.map_err(classify)?;
+        let agg = aggregating.then(|| (res.aggregations, res.aggregation_groups));
+        (res.hits, agg)
     };
 
     let rows = if req.order_by.is_some() {
@@ -709,7 +749,15 @@ async fn v2_query(
     } else {
         crate::compat::to_v2_rows(hits, metric)
     };
-    Ok(Json(V2QueryResponse { rows }).into_response())
+    // Ranking and aggregating in one request yields both, which is how a faceted
+    // result page is fetched in a single round trip.
+    let mut response = V2QueryResponse { rows: Some(rows), ..Default::default() };
+    if let Some((aggregations, groups)) = aggregated {
+        let shaped = crate::compat::to_v2_aggregations(aggregations, groups, grouped);
+        response.aggregations = shaped.aggregations;
+        response.aggregation_groups = shaped.aggregation_groups;
+    }
+    Ok(Json(response).into_response())
 }
 
 async fn v2_metadata(
@@ -1359,8 +1407,6 @@ mod tests {
 
         for body in [
             json!({ "rank_by": ["vec", "SparseKNN", [1.0]] }),
-            json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]],
-                    "aggregate_by": { "n": ["Count"] } }),
             json!({ "queries": [{ "rank_by": ["vector", "ANN", [1.0, 0.0]] }] }),
             json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]], "vector_encoding": "base64" }),
         ] {
@@ -1654,6 +1700,164 @@ mod tests {
         // Fuzzy tolerates a typo on a long enough token.
         assert_eq!(query(json!(["body", "Fuzzy", "databse"])).await, vec![3]);
         assert!(query(json!(["body", "Fuzzy", "zzzzzzzz"])).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v2_aggregations_and_group_by() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpa",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0], "color": "red",  "size": "L",  "price": 10,
+                  "tags": ["a", "b"] },
+                { "id": 2, "vector": [0.9, 0.1], "color": "red",  "size": "L",  "price": 20,
+                  "tags": ["b"] },
+                { "id": 3, "vector": [0.0, 1.0], "color": "blue", "size": "XL", "price": 5,
+                  "tags": [] },
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+
+        // A pure aggregation: no rank_by, and therefore no rows.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpa/query",
+            Some(TOKEN_A),
+            Some(json!({ "aggregate_by": {
+                "n": ["Count"], "total": ["Sum", "price"],
+                "cheapest": ["Min", "price"], "mean": ["Avg", "price"],
+            }})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["aggregations"]["n"], 3);
+        assert_eq!(res["aggregations"]["total"], 35);
+        assert_eq!(res["aggregations"]["cheapest"], 5);
+        assert!((res["aggregations"]["mean"].as_f64().unwrap() - 35.0 / 3.0).abs() < 1e-9);
+        assert!(res.get("rows").is_none(), "a pure aggregation returned rows");
+        assert!(res.get("aggregation_groups").is_none());
+
+        // Filters select what is aggregated.
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpa/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "aggregate_by": { "n": ["Count"], "total": ["Sum", "price"] },
+                "filters": ["color", "Eq", "red"],
+            })),
+        )
+        .await;
+        assert_eq!(res["aggregations"]["n"], 2);
+        assert_eq!(res["aggregations"]["total"], 30);
+
+        // group_by reports aggregation_groups instead, with the key flattened in.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpa/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "aggregate_by": { "n": ["Count"] },
+                "group_by": ["color", "size"],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert!(res.get("aggregations").is_none(), "a grouped result also reported a total");
+        let groups = res["aggregation_groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        let red = groups.iter().find(|g| g["color"] == "red").unwrap();
+        assert_eq!(red["size"], "L");
+        assert_eq!(red["n"], 2);
+
+        // ForEachUnique explodes an array attribute into one group per element.
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpa/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "aggregate_by": { "n": ["Count"] },
+                "group_by": [["ForEachUnique", "tags"]],
+            })),
+        )
+        .await;
+        let groups = res["aggregation_groups"].as_array().unwrap();
+        let by_tag = |t: &str| {
+            groups.iter().find(|g| g["tags"] == t).map(|g| g["n"].as_u64().unwrap())
+        };
+        assert_eq!(by_tag("a"), Some(1));
+        assert_eq!(by_tag("b"), Some(2), "a document tagged twice should count in both groups");
+
+        // Ranking and aggregating together yields BOTH, so a faceted page is one
+        // round trip rather than two.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpa/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "rank_by": ["vector", "ANN", [1.0, 0.0]],
+                "top_k": 2,
+                "aggregate_by": { "n": ["Count"] },
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(res["rows"][0]["id"], 1);
+        assert_eq!(res["aggregations"]["n"], 3, "aggregation was dropped alongside ranking");
+    }
+
+    #[tokio::test]
+    async fn v2_malformed_aggregations_are_rejected() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpae",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0], "color": "red", "price": 10 }
+            ]})),
+        )
+        .await;
+
+        for body in [
+            // Sum without an attribute.
+            json!({ "aggregate_by": { "s": ["Sum"] } }),
+            // Unknown function.
+            json!({ "aggregate_by": { "s": ["Frobnicate", "price"] } }),
+            // Grouping with nothing to compute.
+            json!({ "group_by": ["color"] }),
+            // Neither ranking nor aggregating.
+            json!({ "top_k": 5 }),
+            // Malformed group key.
+            json!({ "aggregate_by": { "n": ["Count"] }, "group_by": [["Explode", "tags"]] }),
+        ] {
+            let (status, res) =
+                call(&state, "POST", "/v2/namespaces/tpae/query", Some(TOKEN_A), Some(body.clone()))
+                    .await;
+            assert!(status.is_client_error(), "{body} was accepted with {status}: {res}");
+        }
+
+        // Summing a string is a type error the caller can act on, not a 500.
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpae/query",
+            Some(TOKEN_A),
+            Some(json!({ "aggregate_by": { "s": ["Sum", "color"] } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
     }
 
     #[tokio::test]
