@@ -1,5 +1,6 @@
 pub mod aggregate;
 pub mod attrindex;
+pub mod bench;
 pub mod cache;
 pub mod compat;
 pub mod doc;

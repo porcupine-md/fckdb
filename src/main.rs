@@ -1,7 +1,8 @@
 //! fckdb — two modes:
 //!
 //!   cargo run -- serve      HTTP service on FCKDB_ADDR (default 127.0.0.1:8080)
-//!   cargo run -- e2e        end-to-end exercise of phases 0-10 (default)
+//!   cargo run -- e2e        end-to-end exercise of every phase (default)
+//!   cargo run -- bench      benchmark, emitting markdown tables
 //!
 //! Both run against whatever `open_store` resolves: InMemory with no env, MinIO
 //! or R2 with FCKDB_* set.
@@ -63,8 +64,12 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).unwrap_or_else(|| "e2e".into()).as_str() {
         "serve" => run_serve().await,
         "e2e" => run_e2e().await,
+        "bench" => {
+            let (store, backend) = open_store()?;
+            fckdb::bench::run(store, &backend).await
+        }
         other => {
-            eprintln!("unknown mode {other:?}; expected `serve` or `e2e`");
+            eprintln!("unknown mode {other:?}; expected `serve`, `e2e`, or `bench`");
             std::process::exit(2);
         }
     }

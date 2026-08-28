@@ -207,9 +207,12 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 
 ```bash
 cargo run --release -- serve     # HTTP service
-cargo run --release -- e2e       # 15-stage end-to-end exercise
+cargo run --release -- e2e       # 17-stage end-to-end exercise
+cargo run --release -- bench     # benchmark, emits markdown
 cargo test                       # 227 tests
 ```
+
+Measured numbers, and what they mean, live in [BENCHMARK.md](BENCHMARK.md).
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
 no credentials and no network.
@@ -382,7 +385,6 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Aggregations scan every matching document | `Namespace::query` | answer Count from the attribute index's posting lengths, Min/Max from its sorted ends |
 | Sparse weights are stored f32, not f16 | `value::Value::Sparse` | half-precision, when sparse namespaces get large enough for the size to matter |
 | Sub-queries in a multi-query run sequentially | `server::v2_query` | they are independent; run them concurrently |
-| Shards are queried sequentially, so latency is the sum not the max | `Namespace::query` | fan out concurrently — every shard must answer anyway |
 | Shard count cannot change after creation | `doc::Schema::set_shards` | copy into a new namespace, as turbopuffer does |
 | HTTP status is chosen by matching engine error text | `server::classify` | a typed error enum carrying its own kind |
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |

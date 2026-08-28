@@ -68,28 +68,56 @@ pub const MAX_PATCH_BY_FILTER_ROWS: usize = 50_000;
 /// cannot turn one query into an unbounded amount of work.
 const PREFILTER_MAX_CANDIDATES: usize = 8192;
 
+/// A filtered probe needs this many survivors per requested result before its
+/// recall is trustworthy. Below it, the probed clusters are starved and the
+/// exact path is taken however much it reads.
+const PREFILTER_SURVIVOR_MARGIN: usize = 4;
+
 /// Should a filtered query scan its candidates exactly, or probe clusters and
 /// filter after?
 ///
-/// Compare what each path actually reads. The exact path reads `candidates`
-/// documents. The cluster path reads roughly `docs * nprobe / clusters` of them.
-/// So the exact path wins precisely when the filter is more selective than the
-/// fraction of the index a probe would touch — which makes the decision
-/// self-tuning as `nprobe` changes, rather than a constant that happens to fit
-/// one dataset size.
+/// Two independent reasons to take the exact path, and the second is the one
+/// that matters:
 ///
-/// It is also the path with no recall loss: probing and then filtering can return
-/// fewer than `top_k` results, or none, when every surviving document lives in a
-/// cluster the query never probed.
-fn should_prefilter(candidates: usize, docs: usize, clusters: usize, nprobe: usize) -> bool {
+/// 1. **Cost.** The exact path reads `candidates` documents; the cluster path
+///    reads roughly `docs * nprobe / clusters`. So exact is cheaper precisely
+///    when the filter is more selective than the fraction of the index a probe
+///    would touch — self-tuning as `nprobe` changes.
+///
+/// 2. **Recall.** Filtering AFTER probing throws away most of what it read. If
+///    the probed clusters are expected to yield fewer than a few survivors per
+///    requested result, the ranked list is drawn from almost nothing and recall
+///    collapses — measured at 30% for a 5%-selective filter at nprobe=1, which is
+///    the exact failure the attribute index exists to prevent. In that case the
+///    exact path is taken even though it reads more, because a cheap wrong answer
+///    is not a bargain.
+fn should_prefilter(
+    candidates: usize,
+    docs: usize,
+    clusters: usize,
+    nprobe: usize,
+    top_k: usize,
+) -> bool {
     if candidates > PREFILTER_MAX_CANDIDATES {
         return false;
     }
-    if clusters == 0 {
+    if clusters == 0 || docs == 0 {
         return true;
     }
-    let probed_docs = docs.saturating_mul(nprobe.max(1)) / clusters;
-    candidates <= probed_docs.max(1)
+    let probed_docs = (docs.saturating_mul(nprobe.max(1)) / clusters).max(1);
+
+    // Cheaper to scan than to probe.
+    if candidates <= probed_docs {
+        return true;
+    }
+
+    // Or: probing would leave too little to rank. Survivors are estimated by
+    // assuming the filter is independent of the clustering, which is the
+    // assumption that fails when a filter correlates with the vector space —
+    // and failing towards the exact path is the safe direction.
+    let selectivity = candidates as f64 / docs as f64;
+    let expected_survivors = probed_docs as f64 * selectivity;
+    expected_survivors < (top_k.max(1) * PREFILTER_SURVIVOR_MARGIN) as f64
 }
 
 // ---------------------------------------------------------------- framing
@@ -912,17 +940,38 @@ impl Namespace {
         let empty = [Shard::default()];
         let resident: &[Shard] = if m.shards.is_empty() { &empty } else { &m.shards };
 
+        // Partition the tail before fanning out, so each shard sees only its own.
+        let tails: Vec<Vec<Record>> = if shards <= 1 || resident.len() <= 1 {
+            vec![tail.clone()]
+        } else {
+            (0..resident.len())
+                .map(|number| {
+                    tail.iter()
+                        .filter(|r| shard_of(r.id(), shards) == number)
+                        .cloned()
+                        .collect()
+                })
+                .collect()
+        };
+
+        // Concurrently: every shard must answer before the query can, so running
+        // them in sequence makes latency the SUM of the shards rather than the
+        // MAX. Measured at 6.5x worse on eight shards before this.
+        let outcomes = futures::future::join_all(
+            resident
+                .iter()
+                .zip(&tails)
+                .map(|(shard, shard_tail)| {
+                    self.shard_hits(shard, req, filter.as_ref(), shard_tail, &m)
+                })
+        )
+        .await;
+
         let mut merged: Vec<Hit> = Vec::new();
         let mut indexed_any = false;
         let mut prefiltered_all = true;
-
-        for (number, shard) in resident.iter().enumerate() {
-            let shard_tail: Vec<Record> = if shards <= 1 || resident.len() <= 1 {
-                tail.clone()
-            } else {
-                tail.iter().filter(|r| shard_of(r.id(), shards) == number).cloned().collect()
-            };
-            let outcome = self.shard_hits(shard, req, filter.as_ref(), &shard_tail, &m).await?;
+        for outcome in outcomes {
+            let outcome = outcome?;
             indexed_any |= outcome.indexed;
             prefiltered_all &= outcome.prefiltered;
             merged.extend(outcome.hits);
@@ -1024,7 +1073,13 @@ impl Namespace {
         {
             let indexes = self.load_attr_indexes(idx, f).await?;
             if let Some(sel) = attrindex::evaluate(f, &indexes, idx.docs as u32)
-                && should_prefilter(sel.ordinals.len(), idx.docs, idx.clusters.len(), req.nprobe)
+                && should_prefilter(
+                    sel.ordinals.len(),
+                    idx.docs,
+                    idx.clusters.len(),
+                    req.nprobe,
+                    req.top_k,
+                )
             {
                 let seg_records = self.read_records_parallel(seg_paths).await?;
                 let mut candidates = HashMap::new();
@@ -1932,9 +1987,13 @@ impl GroupCommit {
 /// cannot work on it. Verified — `verify_cas` rejects it outright. Use InMemory
 /// for tests, or MinIO for a local backend that does enforce CAS.
 pub fn open_store() -> Result<(Arc<dyn ObjectStore>, String)> {
-    let Ok(bucket) = std::env::var("FCKDB_BUCKET") else {
+    // An empty value counts as unset. Blanking the variable is the obvious way
+    // to switch back to in-memory, and building an S3 client with a blank bucket
+    // name fails with something far less helpful.
+    let bucket = std::env::var("FCKDB_BUCKET").unwrap_or_default();
+    if bucket.trim().is_empty() {
         return Ok((Arc::new(object_store::memory::InMemory::new()), "InMemory".into()));
-    };
+    }
 
     use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
     let mut builder = AmazonS3Builder::from_env()
@@ -1946,7 +2005,7 @@ pub fn open_store() -> Result<(Arc<dyn ObjectStore>, String)> {
         .with_conditional_put(S3ConditionalPut::ETagMatch);
 
     let mut label = format!("S3 bucket={bucket}");
-    if let Ok(endpoint) = std::env::var("FCKDB_ENDPOINT") {
+    if let Some(endpoint) = std::env::var("FCKDB_ENDPOINT").ok().filter(|e| !e.trim().is_empty()) {
         let http = endpoint.starts_with("http://");
         label = format!("{endpoint} bucket={bucket}");
         builder = builder.with_endpoint(endpoint).with_allow_http(http);
@@ -3309,20 +3368,35 @@ mod tests {
     fn prefilter_decision_compares_what_each_path_reads() {
         // 1000 docs in 40 clusters: one probe touches about 25 of them.
         // A filter selecting fewer than that is cheaper to scan exactly.
-        assert!(should_prefilter(20, 1000, 40, 1), "a highly selective filter should scan exactly");
-        assert!(!should_prefilter(500, 1000, 40, 1), "a broad filter should probe clusters");
+        // 1000 docs in 40 clusters: one probe touches about 25 of them.
+        assert!(should_prefilter(20, 1000, 40, 1, 10), "a selective filter should scan exactly");
 
         // Raising nprobe widens the cluster path, so exact scanning wins for
         // larger candidate sets too. The decision self-tunes.
-        assert!(should_prefilter(200, 1000, 40, 8), "nprobe=8 touches ~200 docs");
-        assert!(!should_prefilter(300, 1000, 40, 8));
+        assert!(should_prefilter(200, 1000, 40, 8, 10), "nprobe=8 touches ~200 docs");
+
+        // The recall guard: 400 of 8000 documents match and one probe of 82
+        // clusters touches ~97, so about 5 survive — far too few to rank 10 from.
+        // Cost alone would say "probe"; recall says otherwise, and recall wins.
+        assert!(
+            should_prefilter(400, 8000, 82, 1, 10),
+            "a starved probe must fall back to the exact path"
+        );
+        // Asking for fewer results needs fewer survivors, so the same shape can
+        // stay on the cluster path.
+        assert!(!should_prefilter(400, 8000, 82, 1, 1));
+
+        // A broad filter leaves plenty in the probed clusters, so probing is both
+        // cheaper and accurate.
+        assert!(!should_prefilter(7600, 8000, 82, 1, 10), "a broad filter should probe");
+        assert!(!should_prefilter(500, 1000, 40, 8, 1));
 
         // The absolute ceiling still applies, however selective the filter looks.
-        assert!(!should_prefilter(PREFILTER_MAX_CANDIDATES + 1, 100_000_000, 10, 1));
+        assert!(!should_prefilter(PREFILTER_MAX_CANDIDATES + 1, 100_000_000, 10, 1, 10));
         // No clusters means nothing to probe, so scanning is the only option.
-        assert!(should_prefilter(5, 5, 0, 8));
+        assert!(should_prefilter(5, 5, 0, 8, 10));
         // Degenerate inputs must not divide by zero or panic.
-        assert!(should_prefilter(0, 0, 0, 0));
+        assert!(should_prefilter(0, 0, 0, 0, 0));
     }
 
     #[test]
