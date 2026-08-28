@@ -33,6 +33,13 @@ pub struct IndexMeta {
     /// answerable from the manifest without a LIST.
     #[serde(default)]
     pub bytes: u64,
+    /// Object holding the segment's document ids in ordinal order. Attribute
+    /// indexes address documents by ordinal, and this resolves them back.
+    #[serde(default)]
+    pub ids: Option<String>,
+    /// Attribute name to its inverted-index object.
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]

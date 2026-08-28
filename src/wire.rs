@@ -4,7 +4,7 @@
 //! server cannot drift, and the e2e driver exercises the same shapes real
 //! clients send.
 
-use crate::doc::{Attrs, DistanceMetric, Doc, Filter, Id, IdType, Include};
+use crate::doc::{Attrs, DistanceMetric, Doc, Filter, Id, IdType, Include, OrderBy};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use crate::value::{Type, Value};
@@ -47,6 +47,10 @@ pub struct QueryRequest {
     /// Which attributes to return: `true`, `false`, or a list of names.
     #[serde(default)]
     pub include_attributes: Include,
+    /// Rank by an attribute instead of by vector similarity. When set, `vector`
+    /// is ignored.
+    #[serde(default)]
+    pub order_by: Option<OrderBy>,
 }
 
 impl QueryRequest {
@@ -58,6 +62,7 @@ impl QueryRequest {
             nprobe: default_nprobe(),
             consistency: Consistency::Strong,
             include_attributes: Include::None,
+            order_by: None,
         }
     }
     pub fn top_k(mut self, k: usize) -> Self {
@@ -80,6 +85,10 @@ impl QueryRequest {
         self.include_attributes = i;
         self
     }
+    pub fn order_by(mut self, attribute: &str, descending: bool) -> Self {
+        self.order_by = Some(OrderBy { attribute: attribute.into(), descending });
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +99,14 @@ pub struct QueryResponse {
     pub consistent: bool,
     /// False means the vector index was not used and this was an exhaustive scan.
     pub indexed: bool,
+    /// True when a selective filter was answered from the attribute index and
+    /// scored exactly, rather than by probing clusters and filtering after.
+    #[serde(default)]
+    pub prefiltered: bool,
+    /// True when results were ranked by an attribute rather than by similarity,
+    /// so `score` carries no meaning.
+    #[serde(default)]
+    pub ordered: bool,
     /// Records read from the unindexed WAL tail for this query.
     pub unindexed_records: usize,
     pub unindexed_bytes: u64,

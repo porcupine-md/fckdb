@@ -62,7 +62,7 @@ impl Id {
         })
     }
 
-    fn encode(&self, b: &mut BytesMut) {
+    pub fn encode(&self, b: &mut BytesMut) {
         match self {
             Id::Uint(v) => {
                 b.put_u8(ID_UINT);
@@ -80,7 +80,7 @@ impl Id {
         }
     }
 
-    fn decode(buf: &[u8], pos: &mut usize) -> Result<Id> {
+    pub fn decode(buf: &[u8], pos: &mut usize) -> Result<Id> {
         Ok(match take(buf, pos, 1)?[0] {
             ID_UINT => Id::Uint(u64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap())),
             ID_UUID => {
@@ -954,6 +954,57 @@ impl<'de> Deserialize<'de> for Include {
     }
 }
 
+/// Which attribute to order by, and in which direction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderBy {
+    pub attribute: String,
+    #[serde(default)]
+    pub descending: bool,
+}
+
+/// Rank `docs` by an attribute rather than by vector similarity.
+///
+/// Documents missing the attribute sort LAST in both directions. Sorting them
+/// first under `descending` would put the least informative rows at the top of
+/// the page, and `Value::Null` ordering low would do exactly that.
+///
+/// ponytail: scans the candidate set. The sorted attribute index could answer
+/// this from `ids` plus one index object without reading a single vector — worth
+/// doing when ordered queries over large namespaces show up.
+pub fn order_by<'a>(
+    docs: impl Iterator<Item = &'a Doc>,
+    order: &OrderBy,
+    top_k: usize,
+    filter: Option<&Filter>,
+    include: &Include,
+) -> Vec<Hit> {
+    let mut rows: Vec<(Option<Value>, Hit)> = docs
+        .filter(|d| filter.is_none_or(|f| f.matches(&d.attrs)))
+        .map(|d| {
+            let key = d.attrs.get(&order.attribute).filter(|v| !v.is_null()).cloned();
+            (key, Hit { id: d.id.clone(), score: 0.0, attrs: include.project(&d.attrs) })
+        })
+        .collect();
+
+    rows.sort_unstable_by(|(a, ha), (b, hb)| {
+        use std::cmp::Ordering::*;
+        match (a, b) {
+            (None, None) => ha.id.cmp(&hb.id),
+            // Missing sorts last regardless of direction.
+            (None, Some(_)) => Greater,
+            (Some(_), None) => Less,
+            (Some(x), Some(y)) => {
+                let base = x.compare(y).unwrap_or(Equal);
+                let cmp = if order.descending { base.reverse() } else { base };
+                // Ties break by id, so an ordered page is stable across calls.
+                cmp.then_with(|| ha.id.cmp(&hb.id))
+            }
+        }
+    });
+
+    rows.into_iter().map(|(_, h)| h).take(top_k).collect()
+}
+
 /// Rank `docs` against `vector` and return the best `top_k`, descending.
 pub fn top_k<'a>(
     docs: impl Iterator<Item = &'a Doc>,
@@ -1283,6 +1334,58 @@ mod tests {
         let mut f: Filter = serde_json::from_str(r#"["when","Lt","2024-01-01"]"#).unwrap();
         f.coerce(&schema).unwrap();
         assert!(!f.matches(&attrs));
+    }
+
+    #[test]
+    fn order_by_sorts_and_puts_missing_values_last() {
+        let docs = vec![
+            Doc::new(1u64, vec![1.0]).with_attr("n", 30u64),
+            Doc::new(2u64, vec![1.0]).with_attr("n", 10u64),
+            Doc::new(3u64, vec![1.0]).with_attr("n", 20u64),
+            Doc::new(4u64, vec![1.0]), // no value at all
+            Doc::new(5u64, vec![1.0]).with_attr("n", Value::Null),
+        ];
+        let asc = OrderBy { attribute: "n".into(), descending: false };
+        let got = order_by(docs.iter(), &asc, 10, None, &Include::None);
+        assert_eq!(
+            got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(),
+            vec![2, 3, 1, 4, 5]
+        );
+
+        // Missing values stay last when descending too: putting the least
+        // informative rows at the top of a page would be worse than useless.
+        let desc = OrderBy { attribute: "n".into(), descending: true };
+        let got = order_by(docs.iter(), &desc, 10, None, &Include::None);
+        assert_eq!(
+            got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(),
+            vec![1, 3, 2, 4, 5]
+        );
+
+        // top_k truncates, filters apply, and attributes project.
+        let got = order_by(docs.iter(), &asc, 2, None, &Include::All);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].attrs["n"], Value::Uint(10));
+        let got = order_by(
+            docs.iter(),
+            &asc,
+            10,
+            Some(&Filter::cmp("n", Op::Gte, 20u64)),
+            &Include::None,
+        );
+        assert_eq!(got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(), vec![3, 1]);
+    }
+
+    #[test]
+    fn ordered_ties_break_by_id_for_stable_pages() {
+        let docs: Vec<Doc> =
+            [5u64, 1, 9, 3].iter().map(|i| Doc::new(*i, vec![1.0]).with_attr("n", 7u64)).collect();
+        let asc = OrderBy { attribute: "n".into(), descending: false };
+        let got = order_by(docs.iter(), &asc, 4, None, &Include::None);
+        assert_eq!(
+            got.iter().map(|h| h.id.as_uint().unwrap()).collect::<Vec<_>>(),
+            vec![1, 3, 5, 9],
+            "an ordered page must be stable across identical calls"
+        );
     }
 
     #[test]

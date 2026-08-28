@@ -12,6 +12,7 @@
 //! property buys three things for free: the read cache needs no invalidation, a
 //! failed CAS leaves garbage rather than corruption, and GC is a set difference.
 
+use crate::attrindex::{self, AttrIndex};
 use crate::cache::RingCache;
 use crate::doc::{DistanceMetric, Doc, Filter, Id, Include, Record, Schema};
 use crate::value::Type;
@@ -60,6 +61,34 @@ pub const MAX_UNINDEXED_SCAN_BYTES: u64 = 128 << 20;
 /// up. Callers reissue the request until `rows_remaining` is false.
 pub const MAX_DELETE_BY_FILTER_ROWS: usize = 5_000_000;
 pub const MAX_PATCH_BY_FILTER_ROWS: usize = 50_000;
+
+/// Absolute ceiling on an exact filtered scan, so a pathological namespace
+/// cannot turn one query into an unbounded amount of work.
+const PREFILTER_MAX_CANDIDATES: usize = 8192;
+
+/// Should a filtered query scan its candidates exactly, or probe clusters and
+/// filter after?
+///
+/// Compare what each path actually reads. The exact path reads `candidates`
+/// documents. The cluster path reads roughly `docs * nprobe / clusters` of them.
+/// So the exact path wins precisely when the filter is more selective than the
+/// fraction of the index a probe would touch — which makes the decision
+/// self-tuning as `nprobe` changes, rather than a constant that happens to fit
+/// one dataset size.
+///
+/// It is also the path with no recall loss: probing and then filtering can return
+/// fewer than `top_k` results, or none, when every surviving document lives in a
+/// cluster the query never probed.
+fn should_prefilter(candidates: usize, docs: usize, clusters: usize, nprobe: usize) -> bool {
+    if candidates > PREFILTER_MAX_CANDIDATES {
+        return false;
+    }
+    if clusters == 0 {
+        return true;
+    }
+    let probed_docs = docs.saturating_mul(nprobe.max(1)) / clusters;
+    candidates <= probed_docs.max(1)
+}
 
 // ---------------------------------------------------------------- framing
 
@@ -428,6 +457,45 @@ impl Namespace {
         Ok(out)
     }
 
+    /// Load the attribute indexes a filter actually reads. Nothing else is
+    /// fetched, and these objects hold no vectors, so they are far smaller than
+    /// the segment they describe.
+    async fn load_attr_indexes(
+        &self,
+        idx: &IndexMeta,
+        filter: &Filter,
+    ) -> Result<BTreeMap<String, AttrIndex>> {
+        let mut wanted = Vec::new();
+        filter.keys(&mut wanted);
+        wanted.sort();
+        wanted.dedup();
+
+        let targets: Vec<(String, Path)> = wanted
+            .into_iter()
+            .filter_map(|k| idx.attributes.get(&k).map(|n| (k, self.data_path(n))))
+            .collect();
+
+        let blobs =
+            futures::future::join_all(targets.iter().map(|(_, p)| self.read_immutable(p))).await;
+
+        let mut out = BTreeMap::new();
+        for ((key, _), blob) in targets.into_iter().zip(blobs) {
+            out.insert(key, AttrIndex::decode(&blob?)?);
+        }
+        Ok(out)
+    }
+
+    async fn load_ids(&self, idx: &IndexMeta) -> Result<Vec<Id>> {
+        let Some(name) = &idx.ids else { return Ok(vec![]) };
+        let blob = self.read_immutable(&self.data_path(name)).await?;
+        let mut pos = 0usize;
+        let mut out = Vec::with_capacity(idx.docs);
+        while pos < blob.len() {
+            out.push(Id::decode(&blob, &mut pos)?);
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------ writes
 
     /// Write one WAL object holding every entry in `batch`, then advance the
@@ -692,6 +760,87 @@ impl Namespace {
         let unindexed_records: usize = wal_entries.iter().map(|e| e.records as usize).sum();
         let unindexed_bytes: u64 = wal_entries.iter().map(|e| e.bytes).sum();
 
+        // Ordering by attribute has no vector to probe with, so it is always a
+        // scan of the candidate set.
+        if let Some(order) = &req.order_by {
+            let mut paths: Vec<Path> =
+                m.segments.iter().map(|s| self.data_path(&s.name)).collect();
+            paths.extend(wal_entries.iter().map(|e| self.wal_path(&e.name)));
+            let live = Self::materialize(self.read_records_parallel(paths).await?);
+            let hits = crate::doc::order_by(
+                live.values(),
+                order,
+                req.top_k,
+                filter.as_ref(),
+                &req.include_attributes,
+            );
+            return Ok(QueryResponse {
+                hits,
+                consistent: !from_snapshot && !truncated,
+                indexed: false,
+                prefiltered: false,
+                ordered: true,
+                unindexed_records,
+                unindexed_bytes,
+                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
+                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
+                took_ms: t.elapsed().as_millis() as u64,
+            });
+        }
+
+        // Selective filters take an exact path. Probing clusters and then
+        // filtering can return fewer than top_k results, or none, when every
+        // surviving document sits in a cluster the query never probed — so for a
+        // filter the index can bound, scan the bounded set instead.
+        let mut prefiltered = false;
+        if let (Some(idx), Some(f)) = (&m.index, filter.as_ref())
+            && idx.ids.is_some()
+        {
+            let indexes = self.load_attr_indexes(idx, f).await?;
+            if let Some(sel) = attrindex::evaluate(f, &indexes, idx.docs as u32)
+                && should_prefilter(sel.ordinals.len(), idx.docs, idx.clusters.len(), req.nprobe)
+            {
+                prefiltered = true;
+                let seg_paths: Vec<Path> =
+                    m.segments.iter().map(|s| self.data_path(&s.name)).collect();
+                let seg_records = self.read_records_parallel(seg_paths).await?;
+
+                // Segment order is ordinal order: compaction sorts by id.
+                let mut candidates = HashMap::new();
+                for ordinal in &sel.ordinals {
+                    if let Some(Record::Upsert(d)) = seg_records.get(*ordinal as usize) {
+                        candidates.insert(d.id.clone(), d.clone());
+                    }
+                }
+                // The tail still overrides: it may add matches the index never
+                // saw, or remove ones it did.
+                for r in wal_records_for_overlay(&wal_entries, self, &m).await? {
+                    apply(&mut candidates, r);
+                }
+
+                let hits = crate::doc::top_k(
+                    candidates.values(),
+                    &req.vector,
+                    req.top_k,
+                    filter.as_ref(),
+                    &req.include_attributes,
+                    m.schema.distance_metric,
+                );
+                return Ok(QueryResponse {
+                    hits,
+                    consistent: !from_snapshot && !truncated,
+                    indexed: true,
+                    prefiltered,
+                    ordered: false,
+                    unindexed_records,
+                    unindexed_bytes,
+                    object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
+                    cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
+                    took_ms: t.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
         let (hits, indexed) = match &m.index {
             None => {
                 // No index: fall back to scanning every segment plus the tail.
@@ -756,6 +905,8 @@ impl Namespace {
             // fresh commit point AND read the whole tail.
             consistent: !from_snapshot && !truncated,
             indexed,
+            prefiltered,
+            ordered: false,
             unindexed_records,
             unindexed_bytes,
             object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
@@ -772,6 +923,35 @@ impl Namespace {
     /// `rows_remaining` is false. The attribute index (phase 17) is what makes
     /// this cheap rather than what makes it correct.
     pub async fn ids_matching(&self, filter: &Filter, cap: usize) -> Result<(Vec<Id>, bool)> {
+        let (m, _) = self.load().await?;
+        let mut filter = filter.clone();
+        filter.coerce(&m.schema.attributes)?;
+
+        // The fast path needs both an exact answer AND an empty tail: the index
+        // describes the segment only, so an unindexed WAL entry could have
+        // patched a document into or out of the match set. When the tail is
+        // empty the index is the whole truth, and this touches no vectors at all.
+        if m.wal.is_empty()
+            && let Some(idx) = &m.index
+            && idx.ids.is_some()
+        {
+            let indexes = self.load_attr_indexes(idx, &filter).await?;
+            if let Some(sel) = attrindex::evaluate(&filter, &indexes, idx.docs as u32)
+                && sel.exact
+            {
+                let ids = self.load_ids(idx).await?;
+                let mut matched: Vec<Id> = sel
+                    .ordinals
+                    .iter()
+                    .filter_map(|o| ids.get(*o as usize).cloned())
+                    .collect();
+                matched.sort();
+                let remaining = matched.len() > cap;
+                matched.truncate(cap);
+                return Ok((matched, remaining));
+            }
+        }
+
         let live = Self::materialize(self.all_records().await?);
         let mut matched: Vec<Id> = live
             .values()
@@ -871,6 +1051,43 @@ impl Namespace {
                     r?;
                 }
 
+                // Ordinal -> id, so attribute indexes can address documents
+                // compactly and still be resolved back to real ids.
+                let ids_name = format!("{}.ids", uuid::Uuid::new_v4());
+                let ids_blob = {
+                    let mut b = BytesMut::new();
+                    for doc in &docs {
+                        doc.id.encode(&mut b);
+                    }
+                    b.freeze()
+                };
+                index_bytes += ids_blob.len() as u64;
+                self.put_object(&self.data_path(&ids_name), ids_blob).await?;
+
+                // One inverted index per declared attribute.
+                let mut attr_names = std::collections::BTreeMap::new();
+                let mut attr_writes = Vec::new();
+                for attribute in m.schema.attributes.keys() {
+                    let built = AttrIndex::build(docs.iter().enumerate().filter_map(|(o, d)| {
+                        d.attrs.get(attribute).map(|v| (o as u32, v.clone()))
+                    }));
+                    if built.is_empty() {
+                        continue;
+                    }
+                    let name = format!("{}.att", uuid::Uuid::new_v4());
+                    let blob = built.encode();
+                    index_bytes += blob.len() as u64;
+                    attr_names.insert(attribute.clone(), name.clone());
+                    attr_writes.push((self.data_path(&name), blob));
+                }
+                for r in futures::future::join_all(
+                    attr_writes.iter().map(|(p, b)| self.put_object(p, b.clone())),
+                )
+                .await
+                {
+                    r?;
+                }
+
                 clusters_written = cluster_names.len();
                 new_index = Some(IndexMeta {
                     dim: docs[0].vector.len(),
@@ -878,6 +1095,8 @@ impl Namespace {
                     clusters: cluster_names,
                     docs: docs.len(),
                     bytes: index_bytes,
+                    ids: Some(ids_name),
+                    attributes: attr_names,
                 });
             }
         }
@@ -1180,6 +1399,16 @@ impl Namespace {
     pub fn fetch_count(&self) -> usize {
         self.metrics.gets.load(Ordering::Relaxed)
     }
+}
+
+/// Read the WAL entries a query is allowed to scan.
+async fn wal_records_for_overlay(
+    entries: &[WalEntry],
+    ns: &Namespace,
+    _m: &Manifest,
+) -> Result<Vec<Record>> {
+    let paths: Vec<Path> = entries.iter().map(|e| ns.wal_path(&e.name)).collect();
+    ns.read_records_parallel(paths).await
 }
 
 /// Apply one record to a live set. The single definition of mutation semantics,
@@ -1799,6 +2028,209 @@ mod tests {
         assert!(ns.query(&QueryRequest::new(vec![1.0; 4])).await.is_err());
     }
 
+    // -------------------------------------------------------- phase 17: attr index
+
+    /// The failure this exists to prevent: a selective filter whose surviving
+    /// documents are spread across clusters the query never probes. Post-filtering
+    /// returns almost nothing; the attribute index makes the answer exact.
+    #[tokio::test]
+    async fn a_selective_filter_no_longer_loses_recall() {
+        let ns = ns("t/prefilter-recall");
+        // 800 documents across 20 well-separated clusters. One in forty is
+        // "rare", and those are deliberately spread across every cluster.
+        let docs: Vec<Record> = synth(800, 16, 20)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert(
+                    "tier".into(),
+                    Value::from(if i % 40 == 0 { "rare" } else { "common" }),
+                );
+                Record::Upsert(d)
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        let idx = m.index.clone().unwrap();
+        assert!(idx.attributes.contains_key("tier"), "no attribute index was built");
+        assert!(idx.ids.is_some(), "no ordinal-to-id map was written");
+
+        let q = match &docs[0] {
+            Record::Upsert(d) => d.vector.clone(),
+            _ => unreachable!(),
+        };
+
+        // nprobe=1 probes a single cluster, so post-filtering would find at most
+        // the one or two rare documents that happen to live in it.
+        let res = ns
+            .query(
+                &QueryRequest::new(q.clone())
+                    .top_k(10)
+                    .nprobe(1)
+                    .filter(Filter::eq("tier", "rare")),
+            )
+            .await
+            .unwrap();
+        assert!(res.prefiltered, "the selective filter did not take the exact path");
+        assert_eq!(res.hits.len(), 10, "prefiltered query returned short: {:?}", res.hits.len());
+
+        // And it agrees exactly with brute force, which is the definition of no
+        // recall loss.
+        let exact = ns.query_brute(&q, 10, Some(&Filter::eq("tier", "rare"))).await.unwrap();
+        assert_eq!(res.hits, exact, "prefiltered result disagreed with brute force");
+        assert_eq!(crate::index::recall(&exact, &res.hits), 1.0);
+
+        // A non-selective filter is left to the cluster path, which is what the
+        // threshold is for.
+        let broad = ns
+            .query(
+                &QueryRequest::new(q)
+                    .top_k(10)
+                    .nprobe(8)
+                    .filter(Filter::eq("tier", "common")),
+            )
+            .await
+            .unwrap();
+        assert!(!broad.prefiltered, "a broad filter should not force an exact scan");
+        assert!(!broad.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ids_matching_uses_the_index_and_touches_no_vectors() {
+        let store = mem();
+        let seed = Namespace::new(store.clone(), "t/ids-index");
+        let docs: Vec<Record> = synth(400, 32, 8)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert("tier".into(), Value::from(if i % 4 == 0 { "gold" } else { "grey" }));
+                Record::Upsert(d)
+            })
+            .collect();
+        seed.write_records(&docs).await.unwrap();
+        seed.compact(true).await.unwrap();
+
+        // Fresh namespace handle so byte counters start clean.
+        let ns = Namespace::new(store.clone(), "t/ids-index");
+        let (ids, remaining) = ns.ids_matching(&Filter::eq("tier", "gold"), 1000).await.unwrap();
+        assert_eq!(ids.len(), 100);
+        assert!(!remaining);
+        let indexed_bytes = ns.metrics.snapshot().bytes_get;
+
+        // Compare against the scan path, which has to pull every vector.
+        let scanner = Namespace::new(store, "t/ids-index");
+        let live = Namespace::materialize(scanner.all_records().await.unwrap());
+        let scanned: Vec<Id> = {
+            let mut v: Vec<Id> = live
+                .values()
+                .filter(|d| Filter::eq("tier", "gold").matches(&d.attrs))
+                .map(|d| d.id.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        let scan_bytes = scanner.metrics.snapshot().bytes_get;
+
+        assert_eq!(ids, scanned, "the index disagreed with the scan");
+        assert!(
+            indexed_bytes * 4 < scan_bytes,
+            "index path read {indexed_bytes} bytes vs scan {scan_bytes}; it should avoid vectors"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unindexed_tail_forces_the_scan_path() {
+        let ns = ns("t/ids-tail");
+        let docs: Vec<Record> = (0..40u64)
+            .map(|i| {
+                Record::Upsert(
+                    Doc::new(i, vec![1.0, i as f32])
+                        .with_attr("tier", if i < 20 { "gold" } else { "grey" }),
+                )
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        // A patch in the tail moves a document out of the match set. The index
+        // describes the segment only, so trusting it here would return a stale id.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(0),
+            attrs: std::collections::BTreeMap::from([("tier".to_string(), Value::from("grey"))]),
+        }])
+        .await
+        .unwrap();
+
+        let (ids, _) = ns.ids_matching(&Filter::eq("tier", "gold"), 100).await.unwrap();
+        assert_eq!(ids.len(), 19, "the index was trusted over an unindexed patch");
+        assert!(!ids.contains(&Id::Uint(0)), "returned a document the tail had moved out");
+
+        // And a document patched INTO the set is found.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(25),
+            attrs: std::collections::BTreeMap::from([("tier".to_string(), Value::from("gold"))]),
+        }])
+        .await
+        .unwrap();
+        let (ids, _) = ns.ids_matching(&Filter::eq("tier", "gold"), 100).await.unwrap();
+        assert!(ids.contains(&Id::Uint(25)), "missed a document the tail moved in");
+        assert_eq!(ids.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn prefiltered_queries_still_honour_the_tail() {
+        let ns = ns("t/prefilter-tail");
+        let docs: Vec<Record> = synth(200, 8, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert("tier".into(), Value::from(if i % 50 == 0 { "rare" } else { "x" }));
+                Record::Upsert(d)
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+        let q = match &docs[0] {
+            Record::Upsert(d) => d.vector.clone(),
+            _ => unreachable!(),
+        };
+
+        // A brand-new rare document lives only in the tail, so the attribute
+        // index has never seen it.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(999_999u64, q.clone()).with_attr("tier", "rare"),
+        )])
+        .await
+        .unwrap();
+
+        let res = ns
+            .query(&QueryRequest::new(q.clone()).top_k(5).nprobe(1).filter(Filter::eq("tier", "rare")))
+            .await
+            .unwrap();
+        assert!(res.prefiltered);
+        assert!(
+            ids(&res.hits).contains(&999_999),
+            "prefiltered query missed a document that is only in the tail"
+        );
+
+        // A tombstone in the tail must suppress an indexed match.
+        let victim = match &docs[0] {
+            Record::Upsert(d) => d.id.clone(),
+            _ => unreachable!(),
+        };
+        ns.write_records(&[Record::Delete(victim.clone())]).await.unwrap();
+        let res = ns
+            .query(&QueryRequest::new(q).top_k(5).nprobe(1).filter(Filter::eq("tier", "rare")))
+            .await
+            .unwrap();
+        assert!(
+            !res.hits.iter().any(|h| h.id == victim),
+            "prefiltered query returned a tombstoned document"
+        );
+    }
+
     // -------------------------------------------------------- phase 12: schema
 
     #[tokio::test]
@@ -2130,6 +2562,26 @@ mod tests {
             .await
             .unwrap();
         assert!(ids(&res.hits).contains(&4242), "eventual read missed this node's own write");
+    }
+
+    #[test]
+    fn prefilter_decision_compares_what_each_path_reads() {
+        // 1000 docs in 40 clusters: one probe touches about 25 of them.
+        // A filter selecting fewer than that is cheaper to scan exactly.
+        assert!(should_prefilter(20, 1000, 40, 1), "a highly selective filter should scan exactly");
+        assert!(!should_prefilter(500, 1000, 40, 1), "a broad filter should probe clusters");
+
+        // Raising nprobe widens the cluster path, so exact scanning wins for
+        // larger candidate sets too. The decision self-tunes.
+        assert!(should_prefilter(200, 1000, 40, 8), "nprobe=8 touches ~200 docs");
+        assert!(!should_prefilter(300, 1000, 40, 8));
+
+        // The absolute ceiling still applies, however selective the filter looks.
+        assert!(!should_prefilter(PREFILTER_MAX_CANDIDATES + 1, 100_000_000, 10, 1));
+        // No clusters means nothing to probe, so scanning is the only option.
+        assert!(should_prefilter(5, 5, 0, 8));
+        // Degenerate inputs must not divide by zero or panic.
+        assert!(should_prefilter(0, 0, 0, 0));
     }
 
     #[test]

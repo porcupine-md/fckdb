@@ -435,8 +435,8 @@ async fn query(
     if !valid_namespace(&name) {
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
-    if req.vector.is_empty() {
-        return Err(bad("query vector must not be empty"));
+    if req.order_by.is_none() && req.vector.is_empty() {
+        return Err(bad("query requires either a vector or order_by"));
     }
     if req.vector.iter().any(|f| !f.is_finite()) {
         return Err(bad("query vector must not contain NaN or infinity"));
@@ -675,7 +675,8 @@ async fn v2_query(
         return Err(bad("namespace must be 1-64 chars of [A-Za-z0-9_-]"));
     }
     let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify)?;
-    if req.vector.is_empty() || req.vector.iter().any(|f| !f.is_finite()) {
+    let ordering = req.order_by.is_some();
+    if !ordering && (req.vector.is_empty() || req.vector.iter().any(|f| !f.is_finite())) {
         return Err(bad("rank_by vector must be non-empty and finite"));
     }
 
@@ -694,7 +695,12 @@ async fn v2_query(
         handle.ns.query(&req).await.map_err(classify)?.hits
     };
 
-    Ok(Json(V2QueryResponse { rows: crate::compat::to_v2_rows(hits, metric) }).into_response())
+    let rows = if ordering {
+        crate::compat::to_v2_ordered_rows(hits)
+    } else {
+        crate::compat::to_v2_rows(hits, metric)
+    };
+    Ok(Json(V2QueryResponse { rows }).into_response())
 }
 
 async fn v2_metadata(
@@ -1478,6 +1484,65 @@ mod tests {
         let ids: Vec<u64> =
             res["rows"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
         assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[tokio::test]
+    async fn v2_order_by_attribute() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpo",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0], "rank": 30 },
+                { "id": 2, "vector": [0.0, 1.0], "rank": 10 },
+                { "id": 3, "vector": [0.5, 0.5], "rank": 20 },
+                { "id": 4, "vector": [0.1, 0.9] },
+            ]})),
+        )
+        .await;
+
+        for (direction, expected) in
+            [("asc", vec![2, 3, 1, 4]), ("desc", vec![1, 3, 2, 4])]
+        {
+            let (status, res) = call(
+                &state,
+                "POST",
+                "/v2/namespaces/tpo/query",
+                Some(TOKEN_A),
+                Some(json!({ "rank_by": ["rank", direction], "top_k": 10 })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{direction}: {res}");
+            let ids: Vec<u64> =
+                res["rows"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
+            assert_eq!(ids, expected, "{direction} ordering wrong");
+            // No vector was ranked, so no distance is reported.
+            assert!(
+                res["rows"][0].get("$dist").is_none(),
+                "an ordered row carried a distance"
+            );
+        }
+
+        // Ordering combines with filters and attribute projection.
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpo/query",
+            Some(TOKEN_A),
+            Some(json!({
+                "rank_by": ["rank", "asc"],
+                "top_k": 10,
+                "filters": ["rank", "Gte", 20],
+                "include_attributes": ["rank"],
+            })),
+        )
+        .await;
+        let rows = res["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["rank"], 20);
+        assert_eq!(rows[1]["rank"], 30);
     }
 
     #[tokio::test]

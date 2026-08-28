@@ -145,6 +145,8 @@ pub enum RankBy {
     Ann { attribute: String, vector: Vec<f32> },
     /// Exact nearest neighbour: the same ranking, without the index.
     Knn { attribute: String, vector: Vec<f32> },
+    /// Rank by an attribute value.
+    Order { attribute: String, descending: bool },
     /// Recognised but not implemented yet, so it can be reported as such rather
     /// than mis-parsed as something else.
     Unsupported(String),
@@ -161,6 +163,25 @@ fn parse_rank_by(raw: &serde_json::Value) -> Result<RankBy> {
     let Some(arr) = raw.as_array() else {
         bail!("rank_by must be an array, got {raw}");
     };
+    // Ordering by attribute is the one two-element form: ["created_at", "desc"].
+    if arr.len() == 2 {
+        let attribute = arr[0]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("rank_by attribute must be a string"))?
+            .to_string();
+        return match arr[1].as_str() {
+            Some("asc") => Ok(RankBy::Order { attribute, descending: false }),
+            Some("desc") => Ok(RankBy::Order { attribute, descending: true }),
+            // A ranking function that takes an argument is missing it, which is a
+            // shape error. Reporting "not implemented" for a function that IS
+            // implemented would send the caller looking in the wrong place.
+            Some(f @ ("ANN" | "kNN" | "BM25" | "SparseKNN")) => {
+                bail!("rank_by {f} requires an argument: [attribute, \"{f}\", …]")
+            }
+            Some(other) => Ok(RankBy::Unsupported(other.to_string())),
+            None => bail!("rank_by direction must be \"asc\" or \"desc\""),
+        };
+    }
     if arr.len() != 3 {
         bail!("rank_by must be [attribute, function, argument], got {} elements", arr.len());
     }
@@ -258,9 +279,14 @@ impl V2Query {
         let Some(rank_by) = self.rank_by else {
             bail!("rank_by is required");
         };
-        let (vector, exact) = match rank_by {
-            RankBy::Ann { vector, .. } => (vector, false),
-            RankBy::Knn { vector, .. } => (vector, true),
+        let (vector, exact, order_by) = match rank_by {
+            RankBy::Ann { vector, .. } => (vector, false, None),
+            RankBy::Knn { vector, .. } => (vector, true, None),
+            RankBy::Order { attribute, descending } => (
+                vec![],
+                false,
+                Some(crate::doc::OrderBy { attribute, descending }),
+            ),
             RankBy::Unsupported(f) => bail!("rank_by function {f:?} is not implemented"),
         };
 
@@ -293,6 +319,7 @@ impl V2Query {
                 nprobe,
                 consistency,
                 include_attributes: self.include_attributes,
+                order_by,
             },
             exact,
         ))
@@ -303,8 +330,10 @@ impl V2Query {
 #[derive(Debug, Clone, Serialize)]
 pub struct V2Row {
     pub id: Id,
-    #[serde(rename = "$dist")]
-    pub dist: f32,
+    /// Absent when ordering by an attribute: there is no distance to report, and
+    /// emitting a zero would read as a perfect match.
+    #[serde(rename = "$dist", skip_serializing_if = "Option::is_none")]
+    pub dist: Option<f32>,
     #[serde(flatten)]
     pub attrs: Attrs,
 }
@@ -324,17 +353,22 @@ pub fn to_v2_rows(hits: Vec<crate::doc::Hit>, metric: DistanceMetric) -> Vec<V2R
     hits.into_iter()
         .map(|h| V2Row {
             id: h.id,
-            dist: match metric {
+            dist: Some(match metric {
                 // score is cosine similarity in [-1, 1]; the distance is 1 - it.
                 DistanceMetric::CosineDistance => 1.0 - h.score,
                 // score is the negated squared distance.
                 DistanceMetric::EuclideanSquared => -h.score,
                 // score is the dot product; larger is nearer, so negate.
                 DistanceMetric::DotProduct => -h.score,
-            },
+            }),
             attrs: h.attrs,
         })
         .collect()
+}
+
+/// Rows for an attribute-ordered query, which carries no distance.
+pub fn to_v2_ordered_rows(hits: Vec<crate::doc::Hit>) -> Vec<V2Row> {
+    hits.into_iter().map(|h| V2Row { id: h.id, dist: None, attrs: h.attrs }).collect()
 }
 
 // ---------------------------------------------------------------- metadata
@@ -409,8 +443,32 @@ mod tests {
     }
 
     #[test]
+    fn rank_by_parses_attribute_ordering() {
+        let asc: RankBy = serde_json::from_str(r#"["created_at","asc"]"#).unwrap();
+        assert_eq!(asc, RankBy::Order { attribute: "created_at".into(), descending: false });
+        let desc: RankBy = serde_json::from_str(r#"["created_at","desc"]"#).unwrap();
+        assert_eq!(desc, RankBy::Order { attribute: "created_at".into(), descending: true });
+
+        // An ordered query needs no vector, and reports no distance.
+        let (req, exact) = serde_json::from_str::<V2Query>(r#"{"rank_by":["n","desc"]}"#)
+            .unwrap()
+            .into_native(8)
+            .unwrap();
+        assert!(!exact);
+        assert!(req.vector.is_empty());
+        assert_eq!(req.order_by.unwrap().descending, true);
+
+        let rows = to_v2_ordered_rows(vec![Hit::new(1u64, 0.0)]);
+        let json = serde_json::to_value(V2QueryResponse { rows }).unwrap();
+        assert!(
+            json["rows"][0].get("$dist").is_none(),
+            "an ordered row reported a distance; zero would read as a perfect match"
+        );
+    }
+
+    #[test]
     fn unimplemented_rank_functions_are_named_not_swallowed() {
-        for f in ["BM25", "SparseKNN", "asc"] {
+        for f in ["BM25", "SparseKNN"] {
             let got: RankBy =
                 serde_json::from_str(&format!(r#"["a","{f}",[1.0]]"#)).unwrap();
             assert_eq!(got, RankBy::Unsupported(f.into()));
@@ -432,9 +490,22 @@ mod tests {
 
     #[test]
     fn rank_by_shape_errors() {
-        for bad in [r#""vector""#, r#"[]"#, r#"["vector","ANN"]"#, r#"[1,"ANN",[1.0]]"#] {
+        for bad in [
+            r#""vector""#,
+            r#"[]"#,
+            // A function that takes an argument, missing it: a shape error, not
+            // an "unimplemented function" error.
+            r#"["vector","ANN"]"#,
+            r#"["text","BM25"]"#,
+            r#"[1,"ANN",[1.0]]"#,
+            r#"["n",5]"#,
+        ] {
             assert!(serde_json::from_str::<RankBy>(bad).is_err(), "accepted {bad}");
         }
+        // An unknown two-element direction is reported as unimplemented, not as
+        // malformed: the shape is right, the function is not supported.
+        let got: RankBy = serde_json::from_str(r#"["n","sideways"]"#).unwrap();
+        assert_eq!(got, RankBy::Unsupported("sideways".into()));
     }
 
     #[test]
@@ -522,35 +593,37 @@ mod tests {
             DistanceMetric::EuclideanSquared,
             DistanceMetric::DotProduct,
         ] {
-            let rows = to_v2_rows(hits.clone(), metric);
-            assert_eq!(rows.len(), 3);
+            let d: Vec<f32> =
+                to_v2_rows(hits.clone(), metric).iter().map(|r| r.dist.unwrap()).collect();
+            assert_eq!(d.len(), 3);
             // Best score must become the smallest distance.
             assert!(
-                rows[0].dist < rows[1].dist && rows[1].dist < rows[2].dist,
-                "{metric:?} did not invert the ordering: {:?}",
-                rows.iter().map(|r| r.dist).collect::<Vec<_>>()
+                d[0] < d[1] && d[1] < d[2],
+                "{metric:?} did not invert the ordering: {d:?}"
             );
         }
     }
 
     #[test]
     fn cosine_distance_matches_the_conventional_definition() {
+        let dist = |score| {
+            to_v2_rows(vec![Hit::new(1u64, score)], DistanceMetric::CosineDistance)[0]
+                .dist
+                .unwrap()
+        };
         // Identical vectors: similarity 1, distance 0.
-        let rows = to_v2_rows(vec![Hit::new(1u64, 1.0)], DistanceMetric::CosineDistance);
-        assert!((rows[0].dist - 0.0).abs() < 1e-6, "got {}", rows[0].dist);
+        assert!((dist(1.0) - 0.0).abs() < 1e-6, "got {}", dist(1.0));
         // Orthogonal: similarity 0, distance 1.
-        let rows = to_v2_rows(vec![Hit::new(1u64, 0.0)], DistanceMetric::CosineDistance);
-        assert!((rows[0].dist - 1.0).abs() < 1e-6);
+        assert!((dist(0.0) - 1.0).abs() < 1e-6);
         // Opposed: similarity -1, distance 2.
-        let rows = to_v2_rows(vec![Hit::new(1u64, -1.0)], DistanceMetric::CosineDistance);
-        assert!((rows[0].dist - 2.0).abs() < 1e-6);
+        assert!((dist(-1.0) - 2.0).abs() < 1e-6);
     }
 
     #[test]
     fn rows_serialize_with_dist_and_flattened_attributes() {
         let mut attrs = Attrs::new();
         attrs.insert("title".into(), Value::from("puffer"));
-        let rows = vec![V2Row { id: Id::Uint(8), dist: 1.7, attrs }];
+        let rows = vec![V2Row { id: Id::Uint(8), dist: Some(1.7), attrs }];
         let json = serde_json::to_value(V2QueryResponse { rows }).unwrap();
         let row = &json["rows"][0];
         assert_eq!(row["id"], 8);

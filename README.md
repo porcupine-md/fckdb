@@ -77,6 +77,12 @@ manifest         │ centroid index       │ probed clusters
  eventual)       │ (concurrent)         │
 ```
 
+A filtered query takes one of two paths, chosen by comparing what each would
+read. The exact path reads `candidates` documents; the cluster path reads roughly
+`docs × nprobe / clusters`. So the exact path wins precisely when the filter is
+more selective than the fraction of the index a probe would touch — self-tuning
+as `nprobe` changes, rather than a constant that fits one dataset size.
+
 Indexed candidates are overlaid with the WAL tail, so recent upserts and
 tombstones always win over what the index still believes.
 
@@ -202,7 +208,7 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 ```bash
 cargo run --release -- serve     # HTTP service
 cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 131 tests
+cargo test                       # 149 tests
 ```
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
@@ -257,6 +263,8 @@ architecture*, not a drop-in replacement.
 | Document ids | uint / string / uuid | ✅ all three |
 | `distance_metric` | cosine, euclidean, … | ✅ cosine, euclidean-squared, dot product |
 | Partial update | `patch_rows`, `patch_columns` | ✅ `Record::Patch` — merge, with null removing an attribute |
+| Order by attribute | `rank_by: ["attr","desc"]` | ✅ same shape, `$dist` omitted |
+| Attribute index | inverted, per attribute | ✅ built by compaction; drives exact filtered search |
 | Aggregations | `aggregate_by`, group-by | none — returns **501** |
 | Multi-vector, sharding, CMEK | yes | no |
 
@@ -298,11 +306,17 @@ Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
   `consistency`, flattened result rows with `$dist`, `rows_affected` counters,
   client-declared `schema`, and `GET /v1/namespaces/{ns}/metadata`
 
+- **Inverted attribute indexes**, one object per attribute, built by compaction.
+  The prize is not speed: probing clusters and *then* filtering can return fewer
+  than `top_k` results — or none — when every surviving document lives in a
+  cluster the query never probed. A filter the index can bound is now scanned
+  exactly instead, so **filtered vector search stops losing recall**
+- **Order by attribute** (`rank_by: ["created_at","desc"]`), with missing values
+  last in both directions and ties broken by id so pages are stable
+
 **Next, in dependency order**
 
-1. Inverted attribute index (filters are still evaluated per candidate)
-2. Order by attribute
-3. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
+1. **BM25** full-text, **aggregations**, sparse vectors, multi-query, sharding —
    each its own project
 
 Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
@@ -331,8 +345,9 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Index rebuilt wholesale, O(iters·n·k·dim) | `index::build` | SPFresh LIRE incremental split/merge |
 | Full-rewrite compaction, needs live set in RAM | `Namespace::compact` | leveled/tiered compaction |
 | Write throughput = `MAX_BATCH_LEN` ÷ commit latency | `store` | raise the cap; ~257 docs/s observed |
-| Filters evaluated per candidate during the scan | `doc::Filter` | inverted attribute index |
-| `ids_matching` full-scans the live set for filter-based writes | `Namespace::ids_matching` | attribute index |
+| Order-by scans candidates instead of walking the sorted index | `doc::order_by` | answer from `ids` + one index object, reading no vectors |
+| `ids_matching` falls back to a full scan whenever the WAL is non-empty | `Namespace::ids_matching` | index the tail, or resolve only WAL-touched ids |
+| Negations (`NotEq`, `NotIn`, …) are not answerable from the index | `attrindex::AttrIndex::select` | store the document universe per attribute |
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |
 | Blocking `pread` on the async runtime | `cache::RingCache` | `spawn_blocking` or io_uring |
