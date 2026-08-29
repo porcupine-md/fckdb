@@ -277,7 +277,15 @@ Two things produce orphans, and **the second is the common one**:
 
 So GC is not an error-recovery path that rarely runs. It is the second half of
 compaction, and a namespace that never runs it grows forever while its manifest
-stays small.
+stays small. Measured: four compactions of a 200-document namespace left 109
+objects of which 33 were live — **70% garbage**, and the manifest reported only
+the live portion.
+
+A background sweeper runs every 10 minutes and collects anything unreferenced and
+older than the grace window. It skips namespaces that have not compacted since
+their last sweep, and deliberately does *not* mark a namespace done while orphans
+were spared for being too young — doing so would mean never returning for them,
+which is the leak it exists to close.
 
 The **grace window is not optional**. A freshly written WAL object is unreferenced
 for the moment between its PUT and its CAS; deleting inside that window destroys a

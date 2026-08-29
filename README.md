@@ -307,7 +307,6 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | BM25 scores the unindexed tail one document at a time | `Namespace::query` | index the tail incrementally |
 | Aggregations scan every matching document | `Namespace::query` | answer Count from the attribute index's posting lengths, Min/Max from its sorted ends |
 | Sparse weights are stored f32, not f16 | `value::Value::Sparse` | half-precision, when sparse namespaces get large enough for the size to matter |
-| Sub-queries in a multi-query run sequentially | `server::v2_query` | they are independent; run them concurrently |
 | Shard count cannot change after creation | `doc::Schema::set_shards` | copy into a new namespace, as turbopuffer does |
 | HTTP status is chosen by matching engine error text | `server::classify` | a typed error enum carrying its own kind |
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
