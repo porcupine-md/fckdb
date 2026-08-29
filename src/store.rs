@@ -390,10 +390,22 @@ pub struct Namespace {
     pub store: Arc<dyn ObjectStore>,
     pub prefix: String,
     cache: Option<Arc<RingCache>>,
+    /// Last known size, refreshed whenever the manifest is read or written.
+    ///
+    /// Exists so a metrics scrape can report stored bytes without touching
+    /// object storage. Monitoring that costs a request per namespace per scrape
+    /// bills you for observing, and gets slower as you add the namespaces that
+    /// make observing worthwhile.
+    last_known_bytes: AtomicU64,
     /// Last known commit point, for `Consistency::Eventual`. Never consulted by
     /// writes: a stale manifest there would mean a lost write, not a stale read.
     snapshot: Mutex<Option<Snapshot>>,
-    pub metrics: Metrics,
+    /// Shared with every other namespace in the process.
+    ///
+    /// Counters must outlive the namespace they describe: holding them per
+    /// namespace meant destroying one made the process totals go DOWN, and
+    /// Prometheus reads a falling counter as a restart and emits a garbage rate.
+    pub metrics: Arc<Metrics>,
 }
 
 impl Namespace {
@@ -402,9 +414,21 @@ impl Namespace {
             store,
             prefix: prefix.into(),
             cache: None,
+            last_known_bytes: AtomicU64::new(0),
             snapshot: Mutex::new(None),
-            metrics: Metrics::default(),
+            metrics: Arc::new(Metrics::default()),
         }
+    }
+
+    /// Share one metrics registry across every namespace in a process.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Stored bytes as of the last manifest read. No IO.
+    pub fn known_bytes(&self) -> u64 {
+        self.last_known_bytes.load(Ordering::Relaxed)
     }
 
     pub fn with_cache(mut self, cache: Arc<RingCache>) -> Self {
@@ -459,6 +483,7 @@ impl Namespace {
     }
 
     fn remember(&self, manifest: Manifest, version: Option<UpdateVersion>) {
+        self.last_known_bytes.store(manifest.total_bytes(), Ordering::Relaxed);
         *self.snapshot.lock().unwrap() = Some(Snapshot { manifest, version, at: Instant::now() });
     }
 
@@ -765,14 +790,12 @@ impl Namespace {
     /// Every COMMITTED record, in commit order: segments first, then WAL.
     pub async fn all_records(&self) -> Result<Vec<Record>> {
         let (m, _) = self.load().await?;
-        let mut out = Vec::new();
-        for s in m.all_segments() {
-            out.extend(self.read_records(&self.data_path(&s.name)).await?);
-        }
-        for e in &m.wal {
-            out.extend(self.read_records(&self.wal_path(&e.name)).await?);
-        }
-        Ok(out)
+        // Segments first, then the WAL: order is what makes later mutations win.
+        // Fetched concurrently — they are independent objects, and reading them
+        // in sequence makes latency their sum.
+        let mut paths: Vec<Path> = m.all_segments().map(|s| self.data_path(&s.name)).collect();
+        paths.extend(m.wal.iter().map(|e| self.wal_path(&e.name)));
+        self.read_records_parallel(paths).await
     }
 
     /// Apply records in order: later upserts win, tombstones remove.
@@ -882,11 +905,54 @@ impl Namespace {
         // The tail is shared by every shard, so it is read once.
         let tail = self.read_records_parallel(wal_paths).await?;
 
-        // Aggregations and attribute ordering both scan the whole live set, so
-        // they gather across shards rather than fanning out and merging: a
-        // partial average cannot be combined from finalized per-shard averages.
-        let gather_all = req.aggregate_by.is_some() || req.order_by.is_some();
-        let live_all = if gather_all {
+        // Aggregations and attribute ordering scan rather than probe, and both
+        // need every shard: a partial average cannot be combined from finalized
+        // per-shard averages.
+        //
+        // They differ in how much they must hold. Aggregation accumulates into
+        // fixed-size state, so it streams one shard at a time and drops each
+        // before reading the next — peak memory is one segment plus the tail
+        // rather than the entire namespace. Ordering has to compare documents to
+        // each other, so it still gathers.
+        let (aggregations, aggregation_groups) = match &req.aggregate_by {
+            None => (BTreeMap::new(), vec![]),
+            Some(aggs) => {
+                let mut acc = crate::aggregate::Aggregator::new(aggs, &req.group_by)?;
+                let matches = |d: &Doc| {
+                    filter.as_ref().is_none_or(|f| f.matches(&d.attrs, &m.schema.fts))
+                };
+                let shards = m.schema.shards();
+
+                if m.shards.is_empty() {
+                    // Never compacted: everything lives in the tail.
+                    for doc in Self::materialize(tail.clone()).values().filter(|d| matches(d)) {
+                        acc.feed(doc)?;
+                    }
+                } else {
+                    for (number, shard) in m.shards.iter().enumerate() {
+                        let seg_paths: Vec<Path> =
+                            shard.segments.iter().map(|s| self.data_path(&s.name)).collect();
+                        let mut records = self.read_records_parallel(seg_paths).await?;
+                        // This shard's slice of the tail, so a document is
+                        // neither counted twice nor scored from a stale segment.
+                        records.extend(tail.iter().filter(|r| {
+                            shards <= 1 || shard_of(r.id(), shards) == number
+                        }).cloned());
+                        for doc in Self::materialize(records).values().filter(|d| matches(d)) {
+                            acc.feed(doc)?;
+                        }
+                        // `records` and the materialized map both drop here.
+                    }
+                }
+                acc.finish()
+            }
+        };
+
+        let live_all = if req.order_by.is_some() {
+            // ponytail: ordering still materializes every shard, because a top-k
+            // by attribute compares documents against each other. A bounded heap
+            // fed per shard would hold only top_k; worth doing when ordered
+            // queries over large namespaces show up.
             let seg_paths: Vec<Path> =
                 m.all_segments().map(|s| self.data_path(&s.name)).collect();
             let mut records = self.read_records_parallel(seg_paths).await?;
@@ -894,17 +960,6 @@ impl Namespace {
             Self::materialize(records)
         } else {
             HashMap::new()
-        };
-
-        let (aggregations, aggregation_groups) = match &req.aggregate_by {
-            None => (BTreeMap::new(), vec![]),
-            Some(aggs) => {
-                let matching: Vec<&Doc> = live_all
-                    .values()
-                    .filter(|d| filter.as_ref().is_none_or(|f| f.matches(&d.attrs, &m.schema.fts)))
-                    .collect();
-                crate::aggregate::aggregate(matching.into_iter(), aggs, &req.group_by)?
-            }
         };
 
         let ranking_requested = !req.vector.is_empty()
@@ -1261,10 +1316,17 @@ impl Namespace {
             buckets[shard_of(&doc.id, count)].push(doc);
         }
 
+        // Shards are built concurrently: each writes its own objects and shares
+        // nothing. join_all preserves order, which matters because a shard's
+        // position IS its identity.
+        let built = futures::future::join_all(
+            buckets.iter().map(|bucket| self.build_shard(bucket, build_index, &m.schema)),
+        )
+        .await;
         let mut new_shards = Vec::with_capacity(count);
         let mut clusters_written = 0usize;
-        for bucket in &buckets {
-            let shard = self.build_shard(bucket, build_index, &m.schema).await?;
+        for shard in built {
+            let shard = shard?;
             clusters_written += shard.index.as_ref().map_or(0, |i| i.clusters.len());
             new_shards.push(shard);
         }
