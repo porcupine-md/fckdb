@@ -197,6 +197,82 @@ impl Accumulator {
     }
 }
 
+/// Accumulates aggregates one document at a time.
+///
+/// Exists so a namespace larger than memory can still be aggregated: the caller
+/// feeds a shard, drops it, and feeds the next. Building the whole live set first
+/// was not slow on a large namespace, it was fatal — a `Count` over ten million
+/// documents took the process down rather than taking a while.
+pub struct Aggregator<'a> {
+    aggs: &'a BTreeMap<String, Agg>,
+    group_by: &'a [GroupKey],
+    groups: BTreeMap<Vec<OrderedValue>, BTreeMap<String, Accumulator>>,
+}
+
+impl<'a> Aggregator<'a> {
+    pub fn new(aggs: &'a BTreeMap<String, Agg>, group_by: &'a [GroupKey]) -> Result<Self> {
+        if aggs.is_empty() {
+            bail!("aggregate_by requires at least one aggregation");
+        }
+        Ok(Self { aggs, group_by, groups: BTreeMap::new() })
+    }
+
+    fn fresh(&self) -> BTreeMap<String, Accumulator> {
+        self.aggs.keys().map(|k| (k.clone(), Accumulator::new())).collect()
+    }
+
+    pub fn feed(&mut self, doc: &Doc) -> Result<()> {
+        for key in expand_keys(self.group_by, &doc.attrs) {
+            let slot = match self.groups.get_mut(&key) {
+                Some(existing) => existing,
+                None => {
+                    let fresh = self.fresh();
+                    self.groups.entry(key).or_insert(fresh)
+                }
+            };
+            for (label, agg) in self.aggs {
+                accumulate(slot.get_mut(label).expect("label present"), agg, &doc.attrs)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> (BTreeMap<String, Value>, Vec<AggregationGroup>) {
+        if self.group_by.is_empty() {
+            // One implicit group. An empty namespace still reports a zero count,
+            // which is different from reporting nothing.
+            let fresh: BTreeMap<String, Accumulator> =
+                self.aggs.keys().map(|k| (k.clone(), Accumulator::new())).collect();
+            let state = self.groups.into_values().next().unwrap_or(fresh);
+            let out = self
+                .aggs
+                .iter()
+                .map(|(label, agg)| (label.clone(), finalize(&state[label], agg)))
+                .collect();
+            return (out, vec![]);
+        }
+
+        let rows = self
+            .groups
+            .into_iter()
+            .map(|(key, state)| AggregationGroup {
+                key: self
+                    .group_by
+                    .iter()
+                    .zip(key)
+                    .map(|(g, v)| (g.attribute().to_string(), v.0))
+                    .collect(),
+                values: self
+                    .aggs
+                    .iter()
+                    .map(|(l, a)| (l.clone(), finalize(&state[l], a)))
+                    .collect(),
+            })
+            .collect();
+        (BTreeMap::new(), rows)
+    }
+}
+
 /// Aggregate `docs`, optionally grouped.
 ///
 /// Returns (ungrouped results, grouped results). Exactly one is populated:
@@ -208,48 +284,11 @@ pub fn aggregate<'a>(
     aggs: &BTreeMap<String, Agg>,
     group_by: &[GroupKey],
 ) -> Result<(BTreeMap<String, Value>, Vec<AggregationGroup>)> {
-    if aggs.is_empty() {
-        bail!("aggregate_by requires at least one aggregation");
-    }
-
-    // Group key -> per-label accumulators. BTreeMap so groups come out in a
-    // deterministic order rather than hash order.
-    let mut groups: BTreeMap<Vec<OrderedValue>, BTreeMap<String, Accumulator>> = BTreeMap::new();
-    let fresh =
-        || -> BTreeMap<String, Accumulator> { aggs.keys().map(|k| (k.clone(), Accumulator::new())).collect() };
-
+    let mut agg = Aggregator::new(aggs, group_by)?;
     for doc in docs {
-        for key in expand_keys(group_by, &doc.attrs) {
-            let slot = groups.entry(key).or_insert_with(fresh);
-            for (label, agg) in aggs {
-                accumulate(slot.get_mut(label).expect("label present"), agg, &doc.attrs)?;
-            }
-        }
+        agg.feed(doc)?;
     }
-
-    if group_by.is_empty() {
-        // One implicit group. An empty namespace still reports a zero count,
-        // which is different from reporting nothing.
-        let state = groups.into_values().next().unwrap_or_else(fresh);
-        let mut out = BTreeMap::new();
-        for (label, agg) in aggs {
-            out.insert(label.clone(), finalize(&state[label], agg));
-        }
-        return Ok((out, vec![]));
-    }
-
-    let rows = groups
-        .into_iter()
-        .map(|(key, state)| AggregationGroup {
-            key: group_by
-                .iter()
-                .zip(key)
-                .map(|(g, v)| (g.attribute().to_string(), v.0))
-                .collect(),
-            values: aggs.iter().map(|(l, a)| (l.clone(), finalize(&state[l], a))).collect(),
-        })
-        .collect();
-    Ok((BTreeMap::new(), rows))
+    Ok(agg.finish())
 }
 
 /// The cartesian product of each key's values, so a document with two exploded
@@ -666,6 +705,33 @@ mod tests {
         for bad in [r#"[5]"#, r#"[["Explode","tags"]]"#, r#"[["ForEachUnique"]]"#, r#"[[]]"#] {
             assert!(serde_json::from_str::<Vec<GroupKey>>(bad).is_err(), "accepted {bad}");
         }
+    }
+
+    #[test]
+    fn feeding_in_pieces_matches_feeding_all_at_once() {
+        // The property that makes streaming safe: how the documents are split
+        // across calls must not change the answer.
+        let d = docs();
+        let spec = agg(r#"{"n":["Count"],"s":["Sum","price"],"a":["Avg","price"],"m":["Min","price"]}"#);
+        let keys = [GroupKey::Attribute("color".into())];
+
+        let (whole_flat, whole_groups) = aggregate(d.iter(), &spec, &keys).unwrap();
+        for split in [1usize, 2, 3] {
+            let mut streamed = Aggregator::new(&spec, &keys).unwrap();
+            for chunk in d.chunks(split) {
+                for doc in chunk {
+                    streamed.feed(doc).unwrap();
+                }
+            }
+            let (flat, groups) = streamed.finish();
+            assert_eq!(flat, whole_flat, "chunk size {split} changed the ungrouped result");
+            assert_eq!(groups, whole_groups, "chunk size {split} changed the groups");
+        }
+
+        // Feeding nothing still reports a zero count rather than nothing.
+        let empty = Aggregator::new(&spec, &[]).unwrap().finish();
+        assert_eq!(empty.0["n"], Value::Uint(0));
+        assert_eq!(empty.0["a"], Value::Null);
     }
 
     #[test]

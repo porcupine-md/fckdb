@@ -327,6 +327,12 @@ backpressure with an error the caller can act on.
 | `ops` | cost accounting and Prometheus output |
 | `bench` | the benchmark harness |
 
+Metrics counters live on the process, not on a namespace: they have to outlive
+the namespace they describe, or deleting one makes the totals fall and Prometheus
+reads that as a restart. A scrape reads only atomics and the last-known size each
+namespace recorded when it last loaded its manifest — **monitoring must not cost
+requests**, or it bills you for observing and gets slower as the system grows.
+
 `compat` deliberately contains **no search logic**. If it starts to, the two
 surfaces have diverged and one of them is lying about what the engine does.
 
@@ -342,7 +348,10 @@ tabulates all of them. The four that matter most:
    plus SPFresh-style incremental cluster maintenance is the upgrade, and it is a
    large one.
 2. **The IVF index is not SPFresh.** Right shape, no incremental split/merge.
-3. **A full-text query fetches the whole term index object.** A term dictionary
+3. **Ordering by attribute still materializes every shard**, because a top-k by
+   attribute compares documents against each other. Aggregation no longer does:
+   it accumulates into fixed-size state and streams one shard at a time.
+4. **A full-text query fetches the whole term index object.** A term dictionary
    with offsets at the tail would allow range-requesting only the query's terms.
-4. **HTTP status is chosen by matching engine error text.** Fragile in exactly the
+5. **HTTP status is chosen by matching engine error text.** Fragile in exactly the
    way it looks; a typed error enum is the fix.

@@ -172,6 +172,10 @@ pub struct AppState {
     resident: Arc<Mutex<HashMap<String, Arc<Resident>>>>,
     auth: Auth,
     pricing: Pricing,
+    /// One registry for the whole process. Counters have to outlive the
+    /// namespaces they describe, or destroying one makes the totals fall and
+    /// every rate built on them goes wrong.
+    metrics: Arc<crate::store::Metrics>,
     /// Absent when no embedding endpoint is configured, in which case requests
     /// that need one are refused by name rather than served a zero vector.
     embedder: Option<Arc<dyn Embedder>>,
@@ -186,6 +190,7 @@ impl AppState {
             resident: Arc::new(Mutex::new(HashMap::new())),
             auth: Auth::from_env(),
             pricing: Pricing::from_env(),
+            metrics: Arc::new(crate::store::Metrics::default()),
             embedder: HttpEmbedder::from_env().unwrap_or_else(|e| {
                 tracing::warn!("embedding endpoint is configured but unusable: {e:#}");
                 None
@@ -216,7 +221,8 @@ impl AppState {
         if let Some(found) = map.get(&key) {
             return found.clone();
         }
-        let mut ns = Namespace::new(self.store.clone(), key.clone());
+        let mut ns = Namespace::new(self.store.clone(), key.clone())
+            .with_metrics(self.metrics.clone());
         if let Some(cache) = &self.cache {
             ns = ns.with_cache(cache.clone());
         }
@@ -966,24 +972,16 @@ async fn healthz() -> &'static str {
 /// Prometheus scrape. Aggregates every resident namespace, and reports the one
 /// number that tells you whether the commit protocol is healthy.
 async fn metrics(State(state): State<AppState>) -> Response {
+    // Deliberately touches nothing but memory.
+    //
+    // This used to call metadata() per resident namespace, one object storage
+    // GET each, sequentially. Measured at 140ms per namespace: 4.2s at thirty,
+    // past Prometheus' ten-second default timeout at about seventy. Monitoring
+    // that slows down as the system grows stops working exactly when it is
+    // needed, and it fails silently — the server answers, just too late.
     let residents = state.all_resident();
-    let mut agg = crate::store::MetricsSnapshot::default();
-    let mut bytes = 0u64;
-    for r in &residents {
-        let s = r.ns.metrics.snapshot();
-        agg.gets += s.gets;
-        agg.puts += s.puts;
-        agg.deletes += s.deletes;
-        agg.lists += s.lists;
-        agg.bytes_get += s.bytes_get;
-        agg.bytes_put += s.bytes_put;
-        agg.cas_conflicts += s.cas_conflicts;
-        agg.queries += s.queries;
-        agg.writes += s.writes;
-        agg.compactions += s.compactions;
-        agg.backpressure_rejects += s.backpressure_rejects;
-        bytes += r.ns.metadata().await.map(|m| m.total_bytes).unwrap_or(0);
-    }
+    let bytes: u64 = residents.iter().map(|r| r.ns.known_bytes()).sum();
+    let agg = state.metrics.snapshot();
     let cost = ops::estimate(&agg, bytes, state.started.elapsed(), &state.pricing);
     let body = ops::prometheus(&agg, &cost, residents.len());
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
@@ -1000,21 +998,24 @@ pub fn spawn_compactor(state: AppState) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(COMPACT_SWEEP_INTERVAL).await;
-            for r in state.all_resident() {
-                let Ok((m, version)) = r.ns.load().await else { continue };
-                if version.is_none() {
-                    continue;
-                }
+            // Deciding whether each namespace is due costs one GET. Checked
+            // concurrently, because sequentially it takes longer than the sweep
+            // interval itself once there are more than a handful, and the loop
+            // never rests.
+            let residents = state.all_resident();
+            let due = futures::future::join_all(residents.iter().map(|r| async move {
+                let (m, version) = r.ns.load().await.ok()?;
+                version?;
                 let due = m.unindexed_bytes() >= COMPACT_TRIGGER_BYTES
                     || m.wal.len() >= COMPACT_TRIGGER_ENTRIES;
-                if !due {
-                    continue;
-                }
+                due.then(|| (m.wal.len(), m.unindexed_bytes()))
+            }))
+            .await;
+
+            for (r, stats) in residents.iter().zip(due) {
+                let Some((wal_entries, unindexed_bytes)) = stats else { continue };
                 tracing::info!(
-                    namespace = %r.ns.prefix,
-                    wal_entries = m.wal.len(),
-                    unindexed_bytes = m.unindexed_bytes(),
-                    "compacting"
+                    namespace = %r.ns.prefix, wal_entries, unindexed_bytes, "compacting"
                 );
                 if let Err(e) = r.ns.compact(true).await {
                     // A concurrent compaction winning is expected, not an
@@ -2329,6 +2330,112 @@ mod tests {
         )
         .await;
         assert!(status.is_client_error(), "a bad sub-query was tolerated: {status}");
+    }
+
+    #[tokio::test]
+    async fn metrics_touch_no_object_storage_and_survive_deletion() {
+        let state = test_state();
+        for i in 0..4 {
+            call(
+                &state,
+                "POST",
+                &format!("/v2/namespaces/m{i}"),
+                Some(TOKEN_A),
+                Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] })),
+            )
+            .await;
+        }
+
+        // A scrape must cost nothing. It used to cost one GET per namespace,
+        // sequentially, which broke Prometheus' timeout at around seventy.
+        let before = state.metrics.snapshot().gets;
+        let (status, _) = call(&state, "GET", "/metrics", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = call(&state, "GET", "/metrics", None, None).await;
+        assert_eq!(
+            state.metrics.snapshot().gets,
+            before,
+            "a metrics scrape read from object storage"
+        );
+
+        let sample = |text: &str, name: &str| -> f64 {
+            text.lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .and_then(|l| l.split(' ').nth(1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(-1.0)
+        };
+        let text = body["raw"].as_str().unwrap_or_default();
+        assert_eq!(sample(text, "fckdb_namespaces"), 4.0);
+        assert!(sample(text, "fckdb_bytes_stored") > 0.0, "stored bytes were not reported");
+
+        // Counters must not fall when a namespace goes away. Prometheus reads a
+        // falling counter as a restart and produces a garbage rate.
+        let gets_before = state.metrics.snapshot().gets;
+        let writes_before = state.metrics.snapshot().writes;
+        assert!(gets_before > 0 && writes_before > 0);
+        for i in 0..3 {
+            call(&state, "DELETE", &format!("/v1/namespaces/m{i}"), Some(TOKEN_A), None).await;
+        }
+        let after = state.metrics.snapshot();
+        assert!(
+            after.gets >= gets_before && after.writes >= writes_before,
+            "counters went backwards when namespaces were deleted: \
+             gets {gets_before} -> {}, writes {writes_before} -> {}",
+            after.gets,
+            after.writes
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregation_streams_rather_than_gathering() {
+        // Sharded, so the streaming path actually iterates more than once, and
+        // the answer must match the unsharded one exactly.
+        let state = test_state();
+        let rows: Vec<Value> = (0..120)
+            .map(|i| json!({ "id": i, "vector": [1.0, i as f64 * 0.01],
+                             "n": i, "tier": if i % 4 == 0 { "gold" } else { "grey" } }))
+            .collect();
+        for (ns, shards) in [("agg1", 1), ("agg8", 8)] {
+            call(
+                &state,
+                "POST",
+                &format!("/v2/namespaces/{ns}"),
+                Some(TOKEN_A),
+                Some(json!({ "sharding": { "num_shards": shards }, "upsert_rows": rows })),
+            )
+            .await;
+            call(&state, "POST", &format!("/v1/namespaces/{ns}/compact"), Some(TOKEN_A), None).await;
+        }
+
+        for body in [
+            json!({ "aggregate_by": { "n": ["Count"], "s": ["Sum","n"], "a": ["Avg","n"],
+                                      "lo": ["Min","n"], "hi": ["Max","n"] } }),
+            json!({ "aggregate_by": { "n": ["Count"] }, "group_by": ["tier"] }),
+            json!({ "aggregate_by": { "n": ["Count"], "s": ["Sum","n"] },
+                    "filters": ["tier","Eq","gold"] }),
+        ] {
+            let (_, one) =
+                call(&state, "POST", "/v2/namespaces/agg1/query", Some(TOKEN_A), Some(body.clone()))
+                    .await;
+            let (_, eight) =
+                call(&state, "POST", "/v2/namespaces/agg8/query", Some(TOKEN_A), Some(body.clone()))
+                    .await;
+            assert_eq!(one, eight, "sharded aggregation disagreed for {body}");
+        }
+
+        // Spot-check the arithmetic, so "they agree" cannot mean "both wrong".
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/agg8/query",
+            Some(TOKEN_A),
+            Some(json!({ "aggregate_by": { "n": ["Count"], "s": ["Sum","n"], "hi": ["Max","n"] } })),
+        )
+        .await;
+        assert_eq!(res["aggregations"]["n"], 120);
+        assert_eq!(res["aggregations"]["s"], 119 * 120 / 2);
+        assert_eq!(res["aggregations"]["hi"], 119);
     }
 
     #[tokio::test]
