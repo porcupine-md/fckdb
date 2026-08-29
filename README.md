@@ -17,7 +17,7 @@ costs a refetch rather than a wrong answer.
 One caveat worth stating plainly: the single-committer-per-namespace invariant is
 **process-local**. Two server processes writing the same namespace stay correct —
 CAS is what enforces that — but they contend on the manifest and lose the batching
-that makes writes cheap. See [ARCHITECTURE.md](ARCHITECTURE.md#running-more-than-one-node).
+that makes writes cheap. See [ARCHITECTURE.md](docs/ARCHITECTURE.md#running-more-than-one-node).
 
 ## The one idea
 
@@ -81,7 +81,7 @@ except that manifest is immutable and uniquely named, so the cache needs no
 invalidation, a failed CAS leaves garbage rather than corruption, and GC is a set
 difference.
 
-**[ARCHITECTURE.md](ARCHITECTURE.md)** covers the write path and its two pointers,
+**[ARCHITECTURE.md](docs/ARCHITECTURE.md)** covers the write path and its two pointers,
 the query planner's two filtered paths, consistency modes, sharding, durability,
 garbage collection, backpressure, and every known ceiling.
 
@@ -131,8 +131,11 @@ cargo run --release -- bench     # benchmark, emits markdown
 cargo test                       # 227 tests
 ```
 
-How it works, in depth: [ARCHITECTURE.md](ARCHITECTURE.md).
-Measured numbers, and what they mean: [BENCHMARK.md](BENCHMARK.md).
+| doc | what it covers |
+|---|---|
+| **[docs/USAGE.md](docs/USAGE.md)** | every endpoint as runnable curl, with real responses |
+| **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** | how it works, and why each piece is shaped that way |
+| **[docs/BENCHMARK.md](docs/BENCHMARK.md)** | measured numbers across three backends |
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
 no credentials and no network.
