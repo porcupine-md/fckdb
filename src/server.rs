@@ -57,6 +57,20 @@ const COMPACT_TRIGGER_BYTES: u64 = 8 << 20;
 const COMPACT_TRIGGER_ENTRIES: usize = 32;
 const COMPACT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How often to look for garbage.
+///
+/// Rarer than compaction because a sweep costs two LISTs per namespace, and
+/// orphans are not urgent — only unbounded.
+const GC_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How old an unreferenced object must be before it is deleted.
+///
+/// Must comfortably exceed the longest single commit: an object is unreferenced
+/// for the moment between its PUT and its CAS, and deleting inside that window
+/// destroys a write that is about to succeed. Commits take about a second on a
+/// distant bucket, so an hour is a wide margin on purpose.
+const GC_GRACE: Duration = Duration::from_secs(3600);
+
 // ---------------------------------------------------------------- auth
 
 #[derive(Clone, Debug)]
@@ -804,13 +818,17 @@ async fn v2_query(
         let (manifest, _) = handle.ns.load().await?;
         let metric = manifest.schema.distance_metric;
 
-        let mut results = Vec::with_capacity(subqueries.len());
-        for mut sub in subqueries {
+        // Concurrently: sub-queries are independent, so running them in sequence
+        // makes latency their SUM rather than their MAX. `join_all` preserves
+        // input order, which the response contract depends on — `results[i]`
+        // must be the answer to `queries[i]`.
+        let running = subqueries.into_iter().map(|mut sub| {
             // Consistency is a property of the request, not of each sub-query.
             sub.consistency = consistency;
-            let one = run_v2_query(&handle, sub, metric).await?;
-            results.push(one);
-        }
+            run_v2_query(&handle, sub, metric)
+        });
+        let results: Vec<V2QueryResponse> =
+            futures::future::join_all(running).await.into_iter().collect::<ApiResult<_>>()?;
 
         return match rerank {
             None => Ok(Json(V2MultiResponse { results }).into_response()),
@@ -1008,6 +1026,64 @@ pub fn spawn_compactor(state: AppState) {
     });
 }
 
+/// Delete orphaned objects across every resident namespace.
+///
+/// This is not an error-recovery path. **Compaction is the main producer of
+/// garbage**: it writes a fresh segment and a fresh set of indexes, which leaves
+/// the entire previous segment and index unreferenced, on top of the WAL objects
+/// it retired. Without this running, a namespace under continuous writes grows
+/// without bound while its manifest stays small — so nothing in `metadata` shows
+/// it, and the first symptom is the storage bill.
+///
+/// `seen` records the compaction count each namespace was last collected at, so
+/// a namespace that has not compacted since is skipped rather than paying for a
+/// pointless LIST.
+async fn collect_once(
+    state: &AppState,
+    seen: &mut HashMap<String, usize>,
+    grace: Duration,
+) -> usize {
+    let mut deleted = 0usize;
+    for r in state.all_resident() {
+        let compactions = r.ns.metrics.snapshot().compactions;
+        if seen.get(&r.ns.prefix) == Some(&compactions) {
+            continue;
+        }
+        match r.ns.gc(grace).await {
+            Ok(res) => {
+                deleted += res.deleted;
+                if res.deleted > 0 {
+                    tracing::info!(
+                        namespace = %r.ns.prefix,
+                        deleted = res.deleted,
+                        "collected orphaned objects"
+                    );
+                }
+                // Only mark this namespace done when nothing was left behind.
+                // Orphans younger than the grace window are spared, and marking
+                // it done here would mean never coming back for them — which is
+                // the leak this whole function exists to close.
+                if res.spared_recent == 0 {
+                    seen.insert(r.ns.prefix.clone(), compactions);
+                }
+            }
+            Err(e) => tracing::warn!(namespace = %r.ns.prefix, "gc skipped: {e:#}"),
+        }
+    }
+    deleted
+}
+
+/// Reclaim storage that compaction leaves behind.
+pub fn spawn_collector(state: AppState) {
+    tokio::spawn(async move {
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        loop {
+            tokio::time::sleep(GC_SWEEP_INTERVAL).await;
+            collect_once(&state, &mut seen, GC_GRACE).await;
+        }
+    });
+}
+
 // ---------------------------------------------------------------- router
 
 pub fn router(state: AppState) -> Router {
@@ -1039,6 +1115,7 @@ pub fn router(state: AppState) -> Router {
 
 pub async fn serve(state: AppState, addr: &str) -> Result<()> {
     spawn_compactor(state.clone());
+    spawn_collector(state.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if state.auth.disabled() {
         tracing::warn!(
@@ -2087,6 +2164,171 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+    }
+
+    #[tokio::test]
+    async fn background_collection_reclaims_what_compaction_orphans() {
+        let state = test_state();
+        let ns = "collect";
+        call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}"),
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0], "n": 1 },
+                { "id": 2, "vector": [0.0, 1.0], "n": 2 },
+            ]})),
+        )
+        .await;
+
+        let handle = state.resident("acme", ns);
+        // Two compactions: the second orphans everything the first wrote — the
+        // whole segment and every index object, not just the retired WAL.
+        handle.ns.compact(true).await.unwrap();
+        let after_first = handle.ns.count_objects("data").await.unwrap();
+        call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}"),
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 3, "vector": [0.5, 0.5], "n": 3 }] })),
+        )
+        .await;
+        handle.ns.compact(true).await.unwrap();
+        let after_second = handle.ns.count_objects("data").await.unwrap();
+        assert!(
+            after_second > after_first,
+            "expected the second compaction to leave the first's objects behind"
+        );
+
+        let (m, _) = handle.ns.load().await.unwrap();
+        let live = m.referenced().len();
+        assert!(after_second > live, "nothing was orphaned, so this test proves nothing");
+
+        // A sweep with no grace collects them.
+        let mut seen = HashMap::new();
+        let deleted = collect_once(&state, &mut seen, Duration::ZERO).await;
+        assert!(deleted > 0, "the sweep collected nothing");
+
+        // And the namespace still answers correctly afterwards.
+        let (_, res) = call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}/query"),
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 3 })),
+        )
+        .await;
+        assert_eq!(res["rows"].as_array().unwrap().len(), 3, "GC destroyed live data: {res}");
+
+        // A second sweep finds nothing new and skips the namespace entirely,
+        // because its compaction count has not moved.
+        assert_eq!(collect_once(&state, &mut seen, Duration::ZERO).await, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_returns_for_orphans_that_were_too_young() {
+        let state = test_state();
+        let ns = "collect-young";
+        call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}"),
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] })),
+        )
+        .await;
+        let handle = state.resident("acme", ns);
+        handle.ns.compact(true).await.unwrap();
+        call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}"),
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 2, "vector": [0.0, 1.0] }] })),
+        )
+        .await;
+        handle.ns.compact(true).await.unwrap();
+
+        // Everything is younger than an hour, so the sweep spares it all.
+        let mut seen = HashMap::new();
+        assert_eq!(collect_once(&state, &mut seen, Duration::from_secs(3600)).await, 0);
+
+        // The trap: marking the namespace done here would mean never returning
+        // for those orphans, which is exactly the leak this exists to close. So
+        // the next sweep must try again rather than skip.
+        assert!(
+            !seen.contains_key(&handle.ns.prefix),
+            "a namespace with spared orphans was marked collected"
+        );
+        let deleted = collect_once(&state, &mut seen, Duration::ZERO).await;
+        assert!(deleted > 0, "the retry collected nothing");
+        assert!(seen.contains_key(&handle.ns.prefix), "a fully collected namespace should be marked");
+    }
+
+    #[tokio::test]
+    async fn multi_query_results_keep_their_order() {
+        let state = test_state();
+        let ns = "ordering";
+        call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}"),
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "vector": [1.0, 0.0], "body": "alpha beta", "n": 1 },
+                    { "id": 2, "vector": [0.0, 1.0], "body": "gamma delta", "n": 2 },
+                    { "id": 3, "vector": [0.7, 0.7], "body": "alpha gamma", "n": 3 },
+                ],
+                "schema": { "body": { "type": "string", "full_text_search": true } }
+            })),
+        )
+        .await;
+        call(&state, "POST", &format!("/v1/namespaces/{ns}/compact"), Some(TOKEN_A), None).await;
+
+        // Running concurrently must not reorder the results: `results[i]` is the
+        // answer to `queries[i]`, and a client reads them positionally.
+        let (status, res) = call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}/query"),
+            Some(TOKEN_A),
+            Some(json!({ "queries": [
+                { "rank_by": ["vector", "ANN", [0.0, 1.0]], "top_k": 1 },
+                { "rank_by": ["body", "BM25", "delta"], "top_k": 1 },
+                { "rank_by": ["n", "desc"], "top_k": 1 },
+                { "aggregate_by": { "count": ["Count"] } },
+                { "rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 1 },
+            ]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let r = res["results"].as_array().unwrap();
+        assert_eq!(r.len(), 5);
+        assert_eq!(r[0]["rows"][0]["id"], 2, "sub-query 0 out of position");
+        assert_eq!(r[1]["rows"][0]["id"], 2, "sub-query 1 out of position");
+        assert_eq!(r[2]["rows"][0]["id"], 3, "sub-query 2 out of position");
+        assert_eq!(r[3]["aggregations"]["count"], 3, "sub-query 3 out of position");
+        assert_eq!(r[4]["rows"][0]["id"], 1, "sub-query 4 out of position");
+        // The ordered sub-query still reports no distance.
+        assert!(r[2]["rows"][0].get("$dist").is_none());
+
+        // One failing sub-query fails the request rather than returning a short
+        // list that a positional reader would misalign.
+        let (status, _) = call(
+            &state,
+            "POST",
+            &format!("/v2/namespaces/{ns}/query"),
+            Some(TOKEN_A),
+            Some(json!({ "queries": [
+                { "rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 1 },
+                { "rank_by": ["nosuch", "BM25", "x"], "top_k": 1 },
+            ]})),
+        )
+        .await;
+        assert!(status.is_client_error(), "a bad sub-query was tolerated: {status}");
     }
 
     #[tokio::test]

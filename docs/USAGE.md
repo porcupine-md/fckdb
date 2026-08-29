@@ -696,10 +696,14 @@ curl -s -X POST $U/v1/namespaces/articles/gc -H "$T"
 { "scanned": 13, "referenced": 12, "deleted": 0, "spared_recent": 1, "took_ms": 667 }
 ```
 
-**Compaction retires WAL objects without deleting them**, so GC is the second half
-of compaction, not an error-recovery path. A namespace that never runs it grows
-forever while its manifest stays small. Objects younger than one hour are spared,
-because an unreferenced object may be a write still in flight.
+**Compaction is the main producer of garbage** — it writes a fresh segment and
+fresh indexes, leaving the entire previous set unreferenced, on top of the WAL
+objects it retired. Measured: four compactions left 70% of stored objects
+orphaned, invisible to `metadata`, which counts only what is referenced.
+
+A background sweeper does this every 10 minutes, so you do not normally need to
+call it. Objects younger than one hour are spared, because an unreferenced object
+may be a write still in flight.
 
 ### Branching
 
