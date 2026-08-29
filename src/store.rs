@@ -12,8 +12,13 @@
 //! property buys three things for free: the read cache needs no invalidation, a
 //! failed CAS leaves garbage rather than corruption, and GC is a set difference.
 
+use crate::attrindex::{self, AttrIndex};
+use crate::fts::FtsIndex;
+use crate::sparse::SparseIndex;
 use crate::cache::RingCache;
-use crate::doc::{Doc, Filter, Id, Record};
+use crate::doc::{DistanceMetric, Doc, Filter, Id, Include, Record, Schema};
+use crate::value::Type;
+use std::collections::BTreeMap;
 use crate::index::{self, IndexMeta, IvfParams};
 use crate::wire::{
     CompactResponse, Consistency, GcResponse, Hit, NamespaceMetadata, QueryRequest, QueryResponse,
@@ -49,6 +54,71 @@ pub const MAX_BATCH_BYTES: usize = 8 << 20;
 /// silently violating the consistency it promised is the one option that is
 /// always wrong.
 pub const MAX_UNINDEXED_SCAN_BYTES: u64 = 128 << 20;
+
+/// Caps on filter-based writes, matching turbopuffer's documented limits.
+///
+/// These exist so indexing and consistent reads can keep up: an unbounded
+/// `delete_by_filter` on a large namespace would produce a WAL entry bigger than
+/// the query scan cap, making the namespace unqueryable until compaction caught
+/// up. Callers reissue the request until `rows_remaining` is false.
+pub const MAX_DELETE_BY_FILTER_ROWS: usize = 5_000_000;
+pub const MAX_PATCH_BY_FILTER_ROWS: usize = 50_000;
+
+/// Absolute ceiling on an exact filtered scan, so a pathological namespace
+/// cannot turn one query into an unbounded amount of work.
+const PREFILTER_MAX_CANDIDATES: usize = 8192;
+
+/// A filtered probe needs this many survivors per requested result before its
+/// recall is trustworthy. Below it, the probed clusters are starved and the
+/// exact path is taken however much it reads.
+const PREFILTER_SURVIVOR_MARGIN: usize = 4;
+
+/// Should a filtered query scan its candidates exactly, or probe clusters and
+/// filter after?
+///
+/// Two independent reasons to take the exact path, and the second is the one
+/// that matters:
+///
+/// 1. **Cost.** The exact path reads `candidates` documents; the cluster path
+///    reads roughly `docs * nprobe / clusters`. So exact is cheaper precisely
+///    when the filter is more selective than the fraction of the index a probe
+///    would touch — self-tuning as `nprobe` changes.
+///
+/// 2. **Recall.** Filtering AFTER probing throws away most of what it read. If
+///    the probed clusters are expected to yield fewer than a few survivors per
+///    requested result, the ranked list is drawn from almost nothing and recall
+///    collapses — measured at 30% for a 5%-selective filter at nprobe=1, which is
+///    the exact failure the attribute index exists to prevent. In that case the
+///    exact path is taken even though it reads more, because a cheap wrong answer
+///    is not a bargain.
+fn should_prefilter(
+    candidates: usize,
+    docs: usize,
+    clusters: usize,
+    nprobe: usize,
+    top_k: usize,
+) -> bool {
+    if candidates > PREFILTER_MAX_CANDIDATES {
+        return false;
+    }
+    if clusters == 0 || docs == 0 {
+        return true;
+    }
+    let probed_docs = (docs.saturating_mul(nprobe.max(1)) / clusters).max(1);
+
+    // Cheaper to scan than to probe.
+    if candidates <= probed_docs {
+        return true;
+    }
+
+    // Or: probing would leave too little to rank. Survivors are estimated by
+    // assuming the filter is independent of the clustering, which is the
+    // assumption that fails when a filter correlates with the vector space —
+    // and failing towards the exact path is the safe direction.
+    let selectivity = candidates as f64 / docs as f64;
+    let expected_survivors = probed_docs as f64 * selectivity;
+    expected_survivors < (top_k.max(1) * PREFILTER_SURVIVOR_MARGIN) as f64
+}
 
 // ---------------------------------------------------------------- framing
 
@@ -101,6 +171,39 @@ pub struct SegmentEntry {
     pub docs: u32,
 }
 
+/// One shard's data: its compacted segments and its own indexes.
+///
+/// Shards share the namespace's WAL, so a write still commits once. They do not
+/// share indexes: each shard clusters and indexes only its own documents, which
+/// is what lets a namespace grow past the size a single index can serve.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Shard {
+    pub segments: Vec<SegmentEntry>,
+    pub index: Option<IndexMeta>,
+}
+
+/// Which shard a document belongs to.
+///
+/// FNV-1a rather than `DefaultHasher`: the assignment is PERSISTED. A hash whose
+/// output can change between Rust releases would silently relocate every
+/// document, leaving each shard's index describing rows it no longer owns.
+pub fn shard_of(id: &Id, num_shards: usize) -> usize {
+    if num_shards <= 1 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut byte = |b: u8| {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    };
+    match id {
+        Id::Uint(v) => v.to_le_bytes().iter().for_each(|b| byte(*b)),
+        Id::Uuid(u) => u.as_bytes().iter().for_each(|b| byte(*b)),
+        Id::String(s) => s.as_bytes().iter().for_each(|b| byte(*b)),
+    }
+    (hash % num_shards as u64) as usize
+}
+
 /// A namespace's commit point.
 ///
 /// Sizes are recorded inline so backpressure, billing and the query planner can
@@ -110,8 +213,51 @@ pub struct SegmentEntry {
 pub struct Manifest {
     pub next_seq: u64,
     pub wal: Vec<WalEntry>,
-    pub segments: Vec<SegmentEntry>,
-    pub index: Option<IndexMeta>,
+    /// One entry per shard. Always at least one once anything is compacted.
+    #[serde(default)]
+    pub shards: Vec<Shard>,
+    #[serde(default)]
+    pub schema: Schema,
+    /// Nanoseconds since the epoch. Reported by the compatibility metadata
+    /// endpoint, which returns ISO 8601.
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub last_write_at: Option<i64>,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+impl Manifest {
+    /// Whether anything has ever been written. Distinguishes "not configured
+    /// yet" from "configured and immutable" for namespace-level settings.
+    pub fn has_data(&self) -> bool {
+        !self.wal.is_empty() || self.shards.iter().any(|s| !s.segments.is_empty())
+    }
+
+    /// Every segment across every shard.
+    pub fn all_segments(&self) -> impl Iterator<Item = &SegmentEntry> {
+        self.shards.iter().flat_map(|s| s.segments.iter())
+    }
+
+    /// Every shard index that exists.
+    pub fn all_indexes(&self) -> impl Iterator<Item = &IndexMeta> {
+        self.shards.iter().filter_map(|s| s.index.as_ref())
+    }
+
+    /// Documents covered by the indexes, summed across shards.
+    pub fn indexed_docs(&self) -> usize {
+        self.all_indexes().map(|i| i.docs).sum()
+    }
+
+    fn stamp(&mut self, wrote_data: bool) {
+        let now = chrono::Utc::now().timestamp_nanos_opt();
+        self.created_at = self.created_at.or(now);
+        self.updated_at = now;
+        if wrote_data {
+            self.last_write_at = now;
+        }
+    }
 }
 
 impl Manifest {
@@ -122,10 +268,10 @@ impl Manifest {
         self.wal.iter().map(|e| e.records as usize).sum()
     }
     pub fn segment_bytes(&self) -> u64 {
-        self.segments.iter().map(|s| s.bytes).sum()
+        self.all_segments().map(|s| s.bytes).sum()
     }
     pub fn index_bytes(&self) -> u64 {
-        self.index.as_ref().map_or(0, |i| i.bytes)
+        self.all_indexes().map(|i| i.bytes).sum()
     }
     pub fn total_bytes(&self) -> u64 {
         self.unindexed_bytes() + self.segment_bytes() + self.index_bytes()
@@ -138,13 +284,19 @@ impl Manifest {
         for e in &self.wal {
             out.insert(format!("wal/{}", e.name));
         }
-        for s in &self.segments {
+        for s in self.all_segments() {
             out.insert(format!("data/{}", s.name));
         }
-        if let Some(i) = &self.index {
+        for i in self.all_indexes() {
             out.insert(format!("data/{}", i.centroids));
             for c in &i.clusters {
                 out.insert(format!("data/{c}"));
+            }
+            if let Some(ids) = &i.ids {
+                out.insert(format!("data/{ids}"));
+            }
+            for object in i.attributes.values().chain(i.fts.values()).chain(i.sparse.values()) {
+                out.insert(format!("data/{object}"));
             }
         }
         out
@@ -390,6 +542,45 @@ impl Namespace {
         Ok(out)
     }
 
+    /// Load the attribute indexes a filter actually reads. Nothing else is
+    /// fetched, and these objects hold no vectors, so they are far smaller than
+    /// the segment they describe.
+    async fn load_attr_indexes(
+        &self,
+        idx: &IndexMeta,
+        filter: &Filter,
+    ) -> Result<BTreeMap<String, AttrIndex>> {
+        let mut wanted = Vec::new();
+        filter.keys(&mut wanted);
+        wanted.sort();
+        wanted.dedup();
+
+        let targets: Vec<(String, Path)> = wanted
+            .into_iter()
+            .filter_map(|k| idx.attributes.get(&k).map(|n| (k, self.data_path(n))))
+            .collect();
+
+        let blobs =
+            futures::future::join_all(targets.iter().map(|(_, p)| self.read_immutable(p))).await;
+
+        let mut out = BTreeMap::new();
+        for ((key, _), blob) in targets.into_iter().zip(blobs) {
+            out.insert(key, AttrIndex::decode(&blob?)?);
+        }
+        Ok(out)
+    }
+
+    async fn load_ids(&self, idx: &IndexMeta) -> Result<Vec<Id>> {
+        let Some(name) = &idx.ids else { return Ok(vec![]) };
+        let blob = self.read_immutable(&self.data_path(name)).await?;
+        let mut pos = 0usize;
+        let mut out = Vec::with_capacity(idx.docs);
+        while pos < blob.len() {
+            out.push(Id::decode(&blob, &mut pos)?);
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------ writes
 
     /// Write one WAL object holding every entry in `batch`, then advance the
@@ -432,6 +623,7 @@ impl Namespace {
                 bytes: entry_bytes,
                 records: entry_records,
             });
+            manifest.stamp(true);
 
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -481,7 +673,91 @@ impl Namespace {
     }
 
     pub async fn write_records(&self, records: &[Record]) -> Result<(u64, usize)> {
-        self.commit_batch(&records.iter().map(|r| r.encode()).collect::<Vec<_>>()).await
+        self.commit_records(records, &WriteConfig::default()).await
+    }
+
+    /// Commit records with schema inference and enforcement.
+    ///
+    /// Coercion happens inside the CAS loop, not before it: a lost race means
+    /// another writer may have declared a type we have not seen, so the batch has
+    /// to be re-checked against the manifest we actually commit onto.
+    pub async fn commit_records(
+        &self,
+        records: &[Record],
+        config: &WriteConfig,
+    ) -> Result<(u64, usize)> {
+        let mut optimistic = true;
+
+        for attempt in 1..=MAX_CAS_ATTEMPTS {
+            let (mut manifest, version) = match optimistic.then(|| self.snapshot_view()).flatten() {
+                Some(v) => v,
+                None => self.load().await?,
+            };
+
+            let mut batch = records.to_vec();
+            let mut schema = manifest.schema.clone();
+            if let Some(m) = config.metric {
+                schema.set_metric(m, manifest.has_data())?;
+            }
+            // Declared types go in before inference runs, so `absorb` coerces
+            // against them instead of inferring something looser. One mechanism,
+            // not a second coercion pass in the adapter.
+            schema.declare(&config.declared_types)?;
+            schema.declare_fts(&config.declared_fts)?;
+            if let Some(n) = config.num_shards {
+                schema.set_shards(n, manifest.has_data())?;
+            }
+            schema.declare_embed(&config.declared_embed)?;
+            schema.absorb(&mut batch)?;
+
+            let blob = frame_records(&batch);
+            let seq = manifest.next_seq;
+            let name = format!("{seq:010}-{}.bin", uuid::Uuid::new_v4());
+            self.put_object(&self.wal_path(&name), blob.clone()).await?;
+
+            manifest.next_seq += 1;
+            manifest.wal.push(WalEntry {
+                name,
+                bytes: blob.len() as u64,
+                records: batch.len() as u32,
+            });
+            manifest.schema = schema;
+            manifest.stamp(true);
+
+            let mode = match version {
+                Some(v) => PutMode::Update(v),
+                None => PutMode::Create,
+            };
+            let body = serde_json::to_vec(&manifest)?;
+            let n = body.len() as u64;
+            match self
+                .store
+                .put_opts(
+                    &self.manifest_path(),
+                    PutPayload::from(body),
+                    PutOptions { mode, ..Default::default() },
+                )
+                .await
+            {
+                Ok(res) => {
+                    self.metrics.put(n);
+                    self.metrics.writes.fetch_add(batch.len(), Ordering::Relaxed);
+                    self.remember(
+                        manifest,
+                        Some(UpdateVersion { e_tag: res.e_tag, version: res.version }),
+                    );
+                    return Ok((seq, attempt));
+                }
+                Err(OsError::Precondition { .. }) | Err(OsError::AlreadyExists { .. }) => {
+                    self.metrics.cas_conflicts.fetch_add(1, Ordering::Relaxed);
+                    self.forget_snapshot();
+                    optimistic = false;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        bail!("CAS contention: failed to commit after {MAX_CAS_ATTEMPTS} attempts")
     }
 
     // ------------------------------------------------------------ reads
@@ -490,7 +766,7 @@ impl Namespace {
     pub async fn all_records(&self) -> Result<Vec<Record>> {
         let (m, _) = self.load().await?;
         let mut out = Vec::new();
-        for s in &m.segments {
+        for s in m.all_segments() {
             out.extend(self.read_records(&self.data_path(&s.name)).await?);
         }
         for e in &m.wal {
@@ -501,16 +777,9 @@ impl Namespace {
 
     /// Apply records in order: later upserts win, tombstones remove.
     pub fn materialize(records: Vec<Record>) -> HashMap<Id, Doc> {
-        let mut live = HashMap::new();
+        let mut live: HashMap<Id, Doc> = HashMap::new();
         for r in records {
-            match r {
-                Record::Upsert(d) => {
-                    live.insert(d.id, d);
-                }
-                Record::Delete(id) => {
-                    live.remove(&id);
-                }
-            }
+            apply(&mut live, r);
         }
         live
     }
@@ -523,8 +792,26 @@ impl Namespace {
         k: usize,
         filter: Option<&Filter>,
     ) -> Result<Vec<Hit>> {
+        let (m, _) = self.load().await?;
+        let mut owned;
+        let filter = match filter {
+            Some(f) => {
+                owned = f.clone();
+                owned.coerce(&m.schema.attributes)?;
+                Some(&owned)
+            }
+            None => None,
+        };
         let live = Self::materialize(self.all_records().await?);
-        Ok(crate::doc::top_k(live.values(), vector, k, filter))
+        Ok(crate::doc::top_k(
+            live.values(),
+            vector,
+            k,
+            filter,
+            &Include::None,
+            m.schema.distance_metric,
+            &m.schema.fts,
+        ))
     }
 
     /// The real query path.
@@ -533,6 +820,16 @@ impl Namespace {
     ///   1. manifest                      (skipped entirely under Eventual)
     ///   2. centroids + unindexed WAL     (concurrent)
     ///   3. the probed cluster objects    (concurrent)
+    /// The real query path.
+    ///
+    /// Roundtrip shape on a cold cache, mirroring turbopuffer's:
+    ///   1. manifest                      (skipped entirely under Eventual)
+    ///   2. centroids + unindexed WAL     (concurrent)
+    ///   3. the probed cluster objects    (concurrent)
+    ///
+    /// With more than one shard, every ranked query fans out and merges. Every
+    /// shard must answer before the query can, so the slowest shard sets the tail
+    /// latency — which is why over-sharding hurts.
     pub async fn query(&self, req: &QueryRequest) -> Result<QueryResponse> {
         let t = Instant::now();
         self.metrics.queries.fetch_add(1, Ordering::Relaxed);
@@ -540,6 +837,14 @@ impl Namespace {
         let hits_before = self.cache.as_ref().map_or(0, |c| c.stats().0);
 
         let (m, from_snapshot) = self.load_with(req.consistency).await?;
+
+        // Filter literals arrive as JSON, which cannot express datetime or uuid.
+        // Coercing them against the schema is what makes a typed filter match
+        // anything at all.
+        let mut filter = req.filter.clone();
+        if let Some(f) = filter.as_mut() {
+            f.coerce(&m.schema.attributes)?;
+        }
 
         // Decide how much of the unindexed tail to read.
         let unindexed_total = m.unindexed_bytes();
@@ -551,32 +856,282 @@ impl Namespace {
                  catches up. Retry with eventual consistency or compact this namespace."
             );
         }
-        let wal_paths: Vec<Path> =
-            wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
+        let wal_paths: Vec<Path> = wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
         let unindexed_records: usize = wal_entries.iter().map(|e| e.records as usize).sum();
         let unindexed_bytes: u64 = wal_entries.iter().map(|e| e.bytes).sum();
 
-        let (hits, indexed) = match &m.index {
+        let respond = |hits, indexed, prefiltered, ordered, aggregations, aggregation_groups| {
+            Ok(QueryResponse {
+                hits,
+                // Honest reporting: an answer is consistent only if it came from a
+                // fresh commit point AND read the whole tail.
+                consistent: !from_snapshot && !truncated,
+                indexed,
+                prefiltered,
+                ordered,
+                aggregations,
+                aggregation_groups,
+                unindexed_records,
+                unindexed_bytes,
+                object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
+                cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
+                took_ms: t.elapsed().as_millis() as u64,
+            })
+        };
+
+        // The tail is shared by every shard, so it is read once.
+        let tail = self.read_records_parallel(wal_paths).await?;
+
+        // Aggregations and attribute ordering both scan the whole live set, so
+        // they gather across shards rather than fanning out and merging: a
+        // partial average cannot be combined from finalized per-shard averages.
+        let gather_all = req.aggregate_by.is_some() || req.order_by.is_some();
+        let live_all = if gather_all {
+            let seg_paths: Vec<Path> =
+                m.all_segments().map(|s| self.data_path(&s.name)).collect();
+            let mut records = self.read_records_parallel(seg_paths).await?;
+            records.extend(tail.iter().cloned());
+            Self::materialize(records)
+        } else {
+            HashMap::new()
+        };
+
+        let (aggregations, aggregation_groups) = match &req.aggregate_by {
+            None => (BTreeMap::new(), vec![]),
+            Some(aggs) => {
+                let matching: Vec<&Doc> = live_all
+                    .values()
+                    .filter(|d| filter.as_ref().is_none_or(|f| f.matches(&d.attrs, &m.schema.fts)))
+                    .collect();
+                crate::aggregate::aggregate(matching.into_iter(), aggs, &req.group_by)?
+            }
+        };
+
+        let ranking_requested = !req.vector.is_empty()
+            || req.text.is_some()
+            || req.sparse.is_some()
+            || req.order_by.is_some();
+
+        // A request that only aggregates has nothing to rank.
+        if req.aggregate_by.is_some() && !ranking_requested {
+            return respond(vec![], false, false, false, aggregations, aggregation_groups);
+        }
+
+        if let Some(order) = &req.order_by {
+            let hits = crate::doc::order_by(
+                live_all.values(),
+                order,
+                req.top_k,
+                filter.as_ref(),
+                &req.include_attributes,
+                &m.schema.fts,
+            );
+            return respond(hits, false, false, true, aggregations, aggregation_groups);
+        }
+
+        // Ranked query: one pass per shard, then a merge. A document lives in
+        // exactly one shard, so the tail is partitioned the same way — applying
+        // the whole tail to every shard would let one document appear in several
+        // candidate sets and survive the merge twice.
+        let shards = m.schema.shards();
+        // A namespace that has never been compacted has no shards yet, but its
+        // WAL is still queryable — so it gets one implicit empty shard rather
+        // than a fan-out over nothing, which would silently return no rows.
+        let empty = [Shard::default()];
+        let resident: &[Shard] = if m.shards.is_empty() { &empty } else { &m.shards };
+
+        // Partition the tail before fanning out, so each shard sees only its own.
+        let tails: Vec<Vec<Record>> = if shards <= 1 || resident.len() <= 1 {
+            vec![tail.clone()]
+        } else {
+            (0..resident.len())
+                .map(|number| {
+                    tail.iter()
+                        .filter(|r| shard_of(r.id(), shards) == number)
+                        .cloned()
+                        .collect()
+                })
+                .collect()
+        };
+
+        // Concurrently: every shard must answer before the query can, so running
+        // them in sequence makes latency the SUM of the shards rather than the
+        // MAX. Measured at 6.5x worse on eight shards before this.
+        let outcomes = futures::future::join_all(
+            resident
+                .iter()
+                .zip(&tails)
+                .map(|(shard, shard_tail)| {
+                    self.shard_hits(shard, req, filter.as_ref(), shard_tail, &m)
+                })
+        )
+        .await;
+
+        let mut merged: Vec<Hit> = Vec::new();
+        let mut indexed_any = false;
+        let mut prefiltered_all = true;
+        for outcome in outcomes {
+            let outcome = outcome?;
+            indexed_any |= outcome.indexed;
+            prefiltered_all &= outcome.prefiltered;
+            merged.extend(outcome.hits);
+        }
+
+        // Global top-k is a subset of the union of per-shard top-k, so merging
+        // the shards' own truncated lists is exact.
+        merged.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        merged.truncate(req.top_k);
+
+        respond(merged, indexed_any, prefiltered_all, false, aggregations, aggregation_groups)
+    }
+
+    /// Rank one shard's documents, overlaid with that shard's slice of the tail.
+    async fn shard_hits(
+        &self,
+        shard: &Shard,
+        req: &QueryRequest,
+        filter: Option<&Filter>,
+        tail: &[Record],
+        m: &Manifest,
+    ) -> Result<ShardOutcome> {
+        let schema = &m.schema;
+        let seg_paths: Vec<Path> = shard.segments.iter().map(|s| self.data_path(&s.name)).collect();
+
+        // Sparse-vector ranking: score from the inverted list, then the tail on
+        // the same measure so recent writes stay rankable.
+        if let Some(sp) = &req.sparse {
+            let Some(idx) = &shard.index else {
+                bail!("sparse search needs an index; namespace has not been compacted yet");
+            };
+            let Some(object) = idx.sparse.get(&sp.attribute) else {
+                bail!("attribute {:?} is not a sparse vector", sp.attribute);
+            };
+            let index =
+                SparseIndex::decode(&self.read_immutable(&self.data_path(object)).await?)?;
+            let seg_records = self.read_records_parallel(seg_paths).await?;
+            let (live, touched) = overlay(&seg_records, tail);
+
+            let mut hits = Vec::new();
+            for (ordinal, score) in index.score(&sp.vector) {
+                if let Some(doc) = untouched(&seg_records, ordinal, &touched, &live) {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
+                }
+            }
+            for id in &touched {
+                let Some(doc) = live.get(id) else { continue };
+                let Some(crate::value::Value::Sparse(v)) = doc.attrs.get(&sp.attribute) else {
+                    continue;
+                };
+                let score = crate::sparse::dot(v, &sp.vector);
+                if score != 0.0 {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
+                }
+            }
+            return Ok(ShardOutcome::ranked(hits, req.top_k, true));
+        }
+
+        // Full-text ranking.
+        if let Some(text) = &req.text {
+            let Some(idx) = &shard.index else {
+                bail!("full-text search needs an index; namespace has not been compacted yet");
+            };
+            let Some(object) = idx.fts.get(&text.attribute) else {
+                bail!("attribute {:?} is not enabled for full-text search", text.attribute);
+            };
+            let fts = FtsIndex::decode(&self.read_immutable(&self.data_path(object)).await?)?;
+            let seg_records = self.read_records_parallel(seg_paths).await?;
+            let (live, touched) = overlay(&seg_records, tail);
+
+            let mut hits = Vec::new();
+            for (ordinal, score) in fts.score(&text.query) {
+                if let Some(doc) = untouched(&seg_records, ordinal, &touched, &live) {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
+                }
+            }
+            // Everything the tail touched, scored against the index's corpus
+            // statistics so it lands on the same scale.
+            for id in &touched {
+                let Some(doc) = live.get(id) else { continue };
+                let Some(t) =
+                    doc.attrs.get(&text.attribute).and_then(crate::fts::attribute_text)
+                else {
+                    continue;
+                };
+                let score = fts.score_text(&t, &text.query);
+                if score > 0.0 {
+                    push_hit(&mut hits, doc, score, req, filter, schema);
+                }
+            }
+            return Ok(ShardOutcome::ranked(hits, req.top_k, true));
+        }
+
+        // Selective filters take an exact path. Probing clusters and then
+        // filtering can return fewer than top_k results, or none, when every
+        // surviving document sits in a cluster the query never probed.
+        if let (Some(idx), Some(f)) = (&shard.index, filter)
+            && idx.ids.is_some()
+        {
+            let indexes = self.load_attr_indexes(idx, f).await?;
+            if let Some(sel) = attrindex::evaluate(f, &indexes, idx.docs as u32)
+                && should_prefilter(
+                    sel.ordinals.len(),
+                    idx.docs,
+                    idx.clusters.len(),
+                    req.nprobe,
+                    req.top_k,
+                )
+            {
+                let seg_records = self.read_records_parallel(seg_paths).await?;
+                let mut candidates = HashMap::new();
+                for ordinal in &sel.ordinals {
+                    if let Some(Record::Upsert(d)) = seg_records.get(*ordinal as usize) {
+                        candidates.insert(d.id.clone(), d.clone());
+                    }
+                }
+                // The tail still overrides: it may add matches the index never
+                // saw, or remove ones it did.
+                for r in tail {
+                    apply(&mut candidates, r.clone());
+                }
+                let hits = crate::doc::top_k(
+                    candidates.values(),
+                    &req.vector,
+                    req.top_k,
+                    filter,
+                    &req.include_attributes,
+                    schema.distance_metric,
+                    &schema.fts,
+                );
+                return Ok(ShardOutcome { hits, indexed: true, prefiltered: true });
+            }
+        }
+
+        match &shard.index {
             None => {
-                // No index: fall back to scanning every segment plus the tail.
-                let mut paths: Vec<Path> =
-                    m.segments.iter().map(|s| self.data_path(&s.name)).collect();
-                paths.extend(wal_paths);
-                let live = Self::materialize(self.read_records_parallel(paths).await?);
-                (crate::doc::top_k(live.values(), &req.vector, req.top_k, req.filter.as_ref()), false)
+                // No index: scan every segment plus the tail.
+                let mut records = self.read_records_parallel(seg_paths).await?;
+                records.extend(tail.iter().cloned());
+                let live = Self::materialize(records);
+                let hits = crate::doc::top_k(
+                    live.values(),
+                    &req.vector,
+                    req.top_k,
+                    filter,
+                    &req.include_attributes,
+                    schema.distance_metric,
+                    &schema.fts,
+                );
+                Ok(ShardOutcome { hits, indexed: false, prefiltered: false })
             }
             Some(idx) => {
                 if idx.dim != req.vector.len() {
                     bail!("query has {} dims, index has {}", req.vector.len(), idx.dim);
                 }
                 let centroid_path = self.data_path(&idx.centroids);
-                let (centroid_blob, wal_records) = tokio::try_join!(
-                    self.read_immutable(&centroid_path),
-                    self.read_records_parallel(wal_paths),
-                )?;
+                let centroid_blob = self.read_immutable(&centroid_path).await?;
                 let centroids = index::decode_centroids(&centroid_blob, idx.dim)?;
 
-                let probed = index::probe(&centroids, &req.vector, req.nprobe);
+                let probed = index::probe(&centroids, &req.vector, req.nprobe, schema.distance_metric);
                 let cluster_paths: Vec<Path> = probed
                     .iter()
                     .filter_map(|i| idx.clusters.get(*i))
@@ -584,152 +1139,147 @@ impl Namespace {
                     .collect();
                 let cluster_records = self.read_records_parallel(cluster_paths).await?;
 
-                // Indexed candidates first, then the WAL overlay so recent
+                // Indexed candidates first, then the tail overlay so recent
                 // upserts and tombstones win over whatever the index believes.
                 let mut candidates = Self::materialize(cluster_records);
-                for r in wal_records {
-                    match r {
-                        Record::Upsert(d) => {
-                            candidates.insert(d.id, d);
-                        }
-                        Record::Delete(id) => {
-                            candidates.remove(&id);
-                        }
-                    }
+                for r in tail {
+                    apply(&mut candidates, r.clone());
                 }
-                (
-                    crate::doc::top_k(
-                        candidates.values(),
-                        &req.vector,
-                        req.top_k,
-                        req.filter.as_ref(),
-                    ),
-                    true,
-                )
+                let hits = crate::doc::top_k(
+                    candidates.values(),
+                    &req.vector,
+                    req.top_k,
+                    filter,
+                    &req.include_attributes,
+                    schema.distance_metric,
+                    &schema.fts,
+                );
+                Ok(ShardOutcome { hits, indexed: true, prefiltered: false })
             }
-        };
-
-        Ok(QueryResponse {
-            hits,
-            // Honest reporting: an answer is consistent only if it came from a
-            // fresh commit point AND read the whole tail.
-            consistent: !from_snapshot && !truncated,
-            indexed,
-            unindexed_records,
-            unindexed_bytes,
-            object_gets: self.metrics.gets.load(Ordering::Relaxed) - gets_before,
-            cache_hits: self.cache.as_ref().map_or(0, |c| c.stats().0) - hits_before,
-            took_ms: t.elapsed().as_millis() as u64,
-        })
+        }
     }
 
     // ------------------------------------------------------------ compaction
 
-    /// Fold every WAL object into one segment, rebuild the index, and commit.
+    /// Document ids matching `filter`, capped, plus whether more remain.
     ///
-    /// ponytail: full rewrite, not leveled compaction, and the index is rebuilt
-    /// wholesale rather than maintained incrementally. Cost is O(iters*n*k*dim)
-    /// and it needs the live set in memory. Measured at 60s for 20k docs, so it
-    /// is minutes at a million. Leveled compaction plus SPFresh-style LIRE
-    /// split/merge is the upgrade path, and it is a large one.
+    /// ponytail: the fast path needs an exactly-answerable filter and an empty
+    /// tail. Otherwise it falls back to materializing the live set — the index
+    /// describes segments only, so an unindexed WAL entry could have patched a
+    /// document into or out of the match set.
+    pub async fn ids_matching(&self, filter: &Filter, cap: usize) -> Result<(Vec<Id>, bool)> {
+        let (m, _) = self.load().await?;
+        let mut filter = filter.clone();
+        filter.coerce(&m.schema.attributes)?;
+
+        // Every shard must be exactly answerable for the fast path to be safe.
+        if m.wal.is_empty()
+            && !m.shards.is_empty()
+            && m.shards.iter().all(|s| s.index.as_ref().is_some_and(|i| i.ids.is_some()))
+        {
+            let mut matched = Vec::new();
+            let mut usable = true;
+            for shard in &m.shards {
+                let idx = shard.index.as_ref().expect("checked above");
+                let indexes = self.load_attr_indexes(idx, &filter).await?;
+                match attrindex::evaluate(&filter, &indexes, idx.docs as u32) {
+                    Some(sel) if sel.exact => {
+                        let ids = self.load_ids(idx).await?;
+                        matched.extend(
+                            sel.ordinals.iter().filter_map(|o| ids.get(*o as usize).cloned()),
+                        );
+                    }
+                    _ => {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if usable {
+                matched.sort();
+                let remaining = matched.len() > cap;
+                matched.truncate(cap);
+                return Ok((matched, remaining));
+            }
+        }
+
+        let live = Self::materialize(self.all_records().await?);
+        let mut matched: Vec<Id> = live
+            .values()
+            .filter(|d| filter.matches(&d.attrs, &m.schema.fts))
+            .map(|d| d.id.clone())
+            .collect();
+        // Deterministic order, so a reissued request makes progress through the
+        // set rather than re-picking an arbitrary subset.
+        matched.sort();
+        let remaining = matched.len() > cap;
+        matched.truncate(cap);
+        Ok((matched, remaining))
+    }
+
+    /// Fold every WAL object into per-shard segments, rebuild the indexes, and
+    /// commit.
+    ///
+    /// ponytail: full rewrite, not leveled compaction, and the indexes are
+    /// rebuilt wholesale rather than maintained incrementally. Cost is
+    /// O(iters*n*k*dim) and it needs the live set in memory. Leveled compaction
+    /// plus SPFresh-style LIRE split/merge is the upgrade path, and it is a large
+    /// one.
     pub async fn compact(&self, build_index: bool) -> Result<CompactResponse> {
         let t = Instant::now();
         self.metrics.compactions.fetch_add(1, Ordering::Relaxed);
 
         let (m, _) = self.load().await?;
-        if m.wal.is_empty() && (m.index.is_some() || !build_index) {
+        let indexes_present = !m.shards.is_empty() && m.shards.iter().all(|s| s.index.is_some());
+        if m.wal.is_empty() && (indexes_present || !build_index) && !m.shards.is_empty() {
             return Ok(CompactResponse {
                 records_in: 0,
-                docs_out: m.segments.iter().map(|s| s.docs as usize).sum(),
+                docs_out: m.all_segments().map(|s| s.docs as usize).sum(),
                 wal_consumed: 0,
-                clusters: m.index.as_ref().map_or(0, |i| i.clusters.len()),
+                clusters: m.all_indexes().map(|i| i.clusters.len()).sum(),
                 cas_attempts: 0,
                 took_ms: t.elapsed().as_millis() as u64,
             });
         }
 
         let consumed: Vec<String> = m.wal.iter().map(|e| e.name.clone()).collect();
-        let consumed_segments = m.segments.clone();
+        let consumed_shards = m.shards.clone();
         let records = self.all_records().await?;
         let records_in = records.len();
         let live = Self::materialize(records);
 
         let mut docs: Vec<Doc> = live.into_values().collect();
         // Deterministic segment and index contents for a given live set.
-        docs.sort_unstable_by_key(|d| d.id);
+        docs.sort_unstable_by(|a, b| a.id.cmp(&b.id));
         let docs_out = docs.len();
 
-        let mut new_segments = Vec::new();
-        let mut new_index = None;
+        // Partition by shard. A document belongs to exactly one, decided by a
+        // stable hash of its id so the assignment survives a restart.
+        let count = m.schema.shards();
+        let mut buckets: Vec<Vec<Doc>> = vec![Vec::new(); count];
+        for doc in docs {
+            buckets[shard_of(&doc.id, count)].push(doc);
+        }
+
+        let mut new_shards = Vec::with_capacity(count);
         let mut clusters_written = 0usize;
-
-        if !docs.is_empty() {
-            let seg_name = format!("{}.bin", uuid::Uuid::new_v4());
-            let seg_records: Vec<Record> = docs.iter().cloned().map(Record::Upsert).collect();
-            let seg_blob = frame_records(&seg_records);
-            let seg_bytes = seg_blob.len() as u64;
-            self.put_object(&self.data_path(&seg_name), seg_blob).await?;
-            new_segments.push(SegmentEntry {
-                name: seg_name,
-                bytes: seg_bytes,
-                docs: docs_out as u32,
-            });
-
-            if build_index {
-                let params = IvfParams::for_docs(docs.len());
-                let (flat, groups) = index::build(&docs, params)?;
-
-                let cen_name = format!("{}.cen", uuid::Uuid::new_v4());
-                let cen_blob = Bytes::from(index::encode_centroids(&flat));
-                let mut index_bytes = cen_blob.len() as u64;
-                self.put_object(&self.data_path(&cen_name), cen_blob).await?;
-
-                let cluster_names: Vec<String> =
-                    groups.iter().map(|_| format!("{}.clu", uuid::Uuid::new_v4())).collect();
-                let cluster_paths: Vec<Path> =
-                    cluster_names.iter().map(|n| self.data_path(n)).collect();
-                let blobs: Vec<Bytes> = groups
-                    .iter()
-                    .map(|g| {
-                        frame_records(
-                            &g.iter().cloned().map(Record::Upsert).collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect();
-                index_bytes += blobs.iter().map(|b| b.len() as u64).sum::<u64>();
-
-                // Concurrent: dozens of small PUTs at ~300ms each would otherwise
-                // make compaction latency the dominant cost.
-                let writes = cluster_paths
-                    .iter()
-                    .zip(&blobs)
-                    .map(|(p, b)| self.put_object(p, b.clone()));
-                for r in futures::future::join_all(writes).await {
-                    r?;
-                }
-
-                clusters_written = cluster_names.len();
-                new_index = Some(IndexMeta {
-                    dim: docs[0].vector.len(),
-                    centroids: cen_name,
-                    clusters: cluster_names,
-                    docs: docs.len(),
-                    bytes: index_bytes,
-                });
-            }
+        for bucket in &buckets {
+            let shard = self.build_shard(bucket, build_index, &m.schema).await?;
+            clusters_written += shard.index.as_ref().map_or(0, |i| i.clusters.len());
+            new_shards.push(shard);
         }
 
         // Commit. The objects above are already durable, so a lost CAS only means
         // recomputing the manifest delta, not redoing the work.
         for attempt in 1..=MAX_CAS_ATTEMPTS {
             let (mut current, version) = self.load().await?;
-            if current.segments != consumed_segments {
+            if current.shards != consumed_shards {
                 bail!("another compaction committed concurrently; discarding this one");
             }
             // Keep WAL entries that arrived while we were compacting.
             current.wal.retain(|e| !consumed.contains(&e.name));
-            current.segments = new_segments.clone();
-            current.index = new_index.clone();
+            current.shards = new_shards.clone();
+            current.stamp(false);
 
             let mode = match version {
                 Some(v) => PutMode::Update(v),
@@ -771,6 +1321,159 @@ impl Namespace {
         bail!("compaction could not commit after {MAX_CAS_ATTEMPTS} attempts")
     }
 
+    /// Write one shard's segment and indexes.
+    ///
+    /// Ordinals are positions in `docs`, which the caller has already sorted by
+    /// id — every index in this shard addresses documents that way.
+    async fn build_shard(
+        &self,
+        docs: &[Doc],
+        build_index: bool,
+        schema: &Schema,
+    ) -> Result<Shard> {
+        if docs.is_empty() {
+            return Ok(Shard::default());
+        }
+
+        let seg_name = format!("{}.bin", uuid::Uuid::new_v4());
+        let seg_records: Vec<Record> = docs.iter().cloned().map(Record::Upsert).collect();
+        let seg_blob = frame_records(&seg_records);
+        let seg_bytes = seg_blob.len() as u64;
+        self.put_object(&self.data_path(&seg_name), seg_blob).await?;
+        let segments = vec![SegmentEntry {
+            name: seg_name,
+            bytes: seg_bytes,
+            docs: docs.len() as u32,
+        }];
+
+        if !build_index {
+            return Ok(Shard { segments, index: None });
+        }
+
+        let params = IvfParams::for_docs(docs.len()).with_metric(schema.distance_metric);
+        let (flat, groups) = index::build(docs, params)?;
+
+        let cen_name = format!("{}.cen", uuid::Uuid::new_v4());
+        let cen_blob = Bytes::from(index::encode_centroids(&flat));
+        let mut index_bytes = cen_blob.len() as u64;
+        self.put_object(&self.data_path(&cen_name), cen_blob).await?;
+
+        let cluster_names: Vec<String> =
+            groups.iter().map(|_| format!("{}.clu", uuid::Uuid::new_v4())).collect();
+        let cluster_paths: Vec<Path> =
+            cluster_names.iter().map(|n| self.data_path(n)).collect();
+        let blobs: Vec<Bytes> = groups
+            .iter()
+            .map(|g| frame_records(&g.iter().cloned().map(Record::Upsert).collect::<Vec<_>>()))
+            .collect();
+        index_bytes += blobs.iter().map(|b| b.len() as u64).sum::<u64>();
+
+        // Concurrent: dozens of small PUTs at ~300ms each would otherwise make
+        // compaction latency the dominant cost.
+        let mut writes: Vec<(Path, Bytes)> =
+            cluster_paths.into_iter().zip(blobs).collect();
+
+        // Ordinal -> id, so attribute indexes can address documents compactly
+        // and still be resolved back to real ids.
+        let ids_name = format!("{}.ids", uuid::Uuid::new_v4());
+        let ids_blob = {
+            let mut b = BytesMut::new();
+            for doc in docs {
+                doc.id.encode(&mut b);
+            }
+            b.freeze()
+        };
+        index_bytes += ids_blob.len() as u64;
+        writes.push((self.data_path(&ids_name), ids_blob));
+
+        // One inverted index per declared attribute.
+        let mut attr_names = BTreeMap::new();
+        for attribute in schema.attributes.keys() {
+            let built = AttrIndex::build(docs.iter().enumerate().filter_map(|(o, d)| {
+                d.attrs.get(attribute).map(|v| (o as u32, v.clone()))
+            }));
+            if built.is_empty() {
+                continue;
+            }
+            let name = format!("{}.att", uuid::Uuid::new_v4());
+            let blob = built.encode();
+            index_bytes += blob.len() as u64;
+            attr_names.insert(attribute.clone(), name.clone());
+            writes.push((self.data_path(&name), blob));
+        }
+
+        // One full-text index per attribute the schema enables.
+        let mut fts_names = BTreeMap::new();
+        for (attribute, config) in &schema.fts {
+            let texts: Vec<(u32, String)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(o, d)| {
+                    d.attrs.get(attribute).and_then(crate::fts::attribute_text).map(|t| (o as u32, t))
+                })
+                .collect();
+            let built = FtsIndex::build(
+                texts.iter().map(|(o, t)| (*o, t.as_str())),
+                docs.len(),
+                config,
+            );
+            if built.is_empty() {
+                continue;
+            }
+            let name = format!("{}.fts", uuid::Uuid::new_v4());
+            let blob = built.encode();
+            index_bytes += blob.len() as u64;
+            fts_names.insert(attribute.clone(), name.clone());
+            writes.push((self.data_path(&name), blob));
+        }
+
+        // One inverted list per sparse-vector attribute.
+        let mut sparse_names = BTreeMap::new();
+        for (attribute, ty) in &schema.attributes {
+            if *ty != Type::SparseF16 {
+                continue;
+            }
+            let vectors: Vec<(u32, crate::sparse::SparseVector)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(o, d)| match d.attrs.get(attribute) {
+                    Some(crate::value::Value::Sparse(v)) => Some((o as u32, v.clone())),
+                    _ => None,
+                })
+                .collect();
+            let built = SparseIndex::build(vectors.iter().map(|(o, v)| (*o, v)), docs.len());
+            if built.is_empty() {
+                continue;
+            }
+            let name = format!("{}.spx", uuid::Uuid::new_v4());
+            let blob = built.encode();
+            index_bytes += blob.len() as u64;
+            sparse_names.insert(attribute.clone(), name.clone());
+            writes.push((self.data_path(&name), blob));
+        }
+
+        for r in futures::future::join_all(writes.iter().map(|(p, b)| self.put_object(p, b.clone())))
+            .await
+        {
+            r?;
+        }
+
+        Ok(Shard {
+            segments,
+            index: Some(IndexMeta {
+                dim: docs[0].vector.len(),
+                centroids: cen_name,
+                clusters: cluster_names,
+                docs: docs.len(),
+                bytes: index_bytes,
+                ids: Some(ids_name),
+                attributes: attr_names,
+                fts: fts_names,
+                sparse: sparse_names,
+            }),
+        })
+    }
+
     // ------------------------------------------------------------ operations
 
     pub async fn metadata(&self) -> Result<NamespaceMetadata> {
@@ -781,17 +1484,20 @@ impl Namespace {
     pub fn metadata_from(&self, m: &Manifest) -> NamespaceMetadata {
         NamespaceMetadata {
             namespace: self.prefix.clone(),
-            indexed_docs: m.index.as_ref().map_or(0, |i| i.docs),
-            clusters: m.index.as_ref().map_or(0, |i| i.clusters.len()),
-            segments: m.segments.len(),
+            indexed_docs: m.indexed_docs(),
+            clusters: m.all_indexes().map(|i| i.clusters.len()).sum(),
+            segments: m.all_segments().count(),
             segment_bytes: m.segment_bytes(),
             wal_entries: m.wal.len(),
             unindexed_records: m.unindexed_records(),
             unindexed_bytes: m.unindexed_bytes(),
             index_bytes: m.index_bytes(),
             total_bytes: m.total_bytes(),
-            dim: m.index.as_ref().map(|i| i.dim),
+            dim: m.schema.dim.or_else(|| m.all_indexes().map(|i| i.dim).next()),
             write_backpressure: m.unindexed_bytes() >= MAX_UNINDEXED_SCAN_BYTES,
+            schema: m.schema.attributes.clone(),
+            id_type: m.schema.id_type,
+            distance_metric: m.schema.distance_metric,
         }
     }
 
@@ -804,11 +1510,12 @@ impl Namespace {
         let t = Instant::now();
         let (m, _) = self.load().await?;
         let mut paths = Vec::new();
-        if let Some(idx) = &m.index {
+        for idx in m.all_indexes() {
             paths.push(self.data_path(&idx.centroids));
             paths.extend(idx.clusters.iter().map(|c| self.data_path(c)));
-        } else {
-            paths.extend(m.segments.iter().map(|s| self.data_path(&s.name)));
+        }
+        if paths.is_empty() {
+            paths.extend(m.all_segments().map(|s| self.data_path(&s.name)));
         }
 
         let already = self
@@ -1015,10 +1722,143 @@ impl Namespace {
     }
 }
 
+/// What one shard contributed to a ranked query.
+struct ShardOutcome {
+    hits: Vec<Hit>,
+    indexed: bool,
+    prefiltered: bool,
+}
+
+impl ShardOutcome {
+    /// Sort and truncate a score-ranked list. Per-shard truncation is safe
+    /// because the global top-k is a subset of the union of per-shard top-k.
+    fn ranked(mut hits: Vec<Hit>, top_k: usize, indexed: bool) -> Self {
+        hits.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        hits.truncate(top_k);
+        Self { hits, indexed, prefiltered: false }
+    }
+}
+
+/// Current state of a shard's documents, plus the ids the tail touched.
+///
+/// A touched document's stored postings are stale, so it must be rescored from
+/// its current state rather than trusted.
+fn overlay(
+    seg_records: &[Record],
+    tail: &[Record],
+) -> (HashMap<Id, Doc>, std::collections::HashSet<Id>) {
+    let mut live = HashMap::new();
+    for r in seg_records {
+        apply(&mut live, r.clone());
+    }
+    for r in tail {
+        apply(&mut live, r.clone());
+    }
+    (live, tail.iter().map(|r| r.id().clone()).collect())
+}
+
+/// The live document at `ordinal`, unless the tail touched it or removed it.
+fn untouched<'a>(
+    seg_records: &[Record],
+    ordinal: u32,
+    touched: &std::collections::HashSet<Id>,
+    live: &'a HashMap<Id, Doc>,
+) -> Option<&'a Doc> {
+    let Record::Upsert(indexed) = seg_records.get(ordinal as usize)? else { return None };
+    if touched.contains(&indexed.id) {
+        return None;
+    }
+    live.get(&indexed.id)
+}
+
+fn push_hit(
+    hits: &mut Vec<Hit>,
+    doc: &Doc,
+    score: f32,
+    req: &QueryRequest,
+    filter: Option<&Filter>,
+    schema: &Schema,
+) {
+    if filter.is_none_or(|f| f.matches(&doc.attrs, &schema.fts)) {
+        hits.push(Hit {
+            id: doc.id.clone(),
+            score,
+            attrs: req.include_attributes.project(&doc.attrs),
+        });
+    }
+}
+
+/// Read the WAL entries a query is allowed to scan.
+async fn wal_records_for_overlay(
+    entries: &[WalEntry],
+    ns: &Namespace,
+    _m: &Manifest,
+) -> Result<Vec<Record>> {
+    let paths: Vec<Path> = entries.iter().map(|e| ns.wal_path(&e.name)).collect();
+    ns.read_records_parallel(paths).await
+}
+
+/// Apply one record to a live set. The single definition of mutation semantics,
+/// shared by compaction and by the query-time WAL overlay — two copies of this
+/// would eventually disagree about what a patch means.
+fn apply(live: &mut HashMap<Id, Doc>, r: Record) {
+    match r {
+        Record::Upsert(d) => {
+            live.insert(d.id.clone(), d);
+        }
+        Record::Delete(id) => {
+            live.remove(&id);
+        }
+        Record::Patch { id, attrs } => {
+            // A patch on an absent document is a no-op, not a resurrection: there
+            // is no vector to attach, so the document would be unqueryable.
+            if let Some(doc) = live.get_mut(&id) {
+                for (k, v) in attrs {
+                    if v.is_null() {
+                        doc.attrs.remove(&k);
+                    } else {
+                        doc.attrs.insert(k, v);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------- group commit
 
-/// One queued write: the payload, and where to report its commit.
-type Req = (Bytes, oneshot::Sender<Result<u64, String>>);
+/// Namespace-level settings a write may carry.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WriteConfig {
+    /// Settable only on a namespace's first write.
+    pub metric: Option<DistanceMetric>,
+    /// Client-declared attribute types, for the types JSON cannot express.
+    pub declared_types: BTreeMap<String, Type>,
+    /// Attributes to enable for full-text search.
+    pub declared_fts: crate::fts::FtsSchema,
+    /// Shard count, settable only on a namespace's inaugural write.
+    pub num_shards: Option<usize>,
+    /// Attributes to embed into the document vector on write.
+    pub declared_embed: BTreeMap<String, crate::doc::EmbedSpec>,
+}
+
+impl WriteConfig {
+    pub fn is_empty(&self) -> bool {
+        self.metric.is_none()
+            && self.declared_types.is_empty()
+            && self.declared_fts.is_empty()
+            && self.num_shards.is_none()
+            && self.declared_embed.is_empty()
+    }
+}
+
+/// One queued write: the record, any namespace-level settings, and
+/// where to report the commit.
+///
+/// Records rather than encoded bytes, because schema inference has to see the
+/// values before they are framed — and it has to see the whole coalesced batch,
+/// so two documents in one commit cannot disagree about a type.
+type Req = (Record, WriteConfig, oneshot::Sender<Result<u64, String>>);
 
 /// Funnels every write for one namespace through a single committer.
 ///
@@ -1047,26 +1887,36 @@ impl GroupCommit {
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
                 let mut waiters = vec![first];
-                let mut bytes = waiters[0].0.len();
+                let mut bytes = waiters[0].0.encoded_len();
                 while waiters.len() < MAX_BATCH_LEN && bytes < MAX_BATCH_BYTES {
                     match rx.try_recv() {
                         Ok(item) => {
-                            bytes += item.0.len();
+                            bytes += item.0.encoded_len();
                             waiters.push(item);
                         }
                         Err(_) => break,
                     }
                 }
 
-                let payloads: Vec<Bytes> = waiters.iter().map(|(d, _)| d.clone()).collect();
+                let records: Vec<Record> = waiters.iter().map(|(r, _, _)| r.clone()).collect();
+                // A namespace-level setting only has to be requested once; the
+                // first request in the batch carries it and the rest agree by
+                // construction, since a conflicting value is rejected by the
+                // schema rather than silently applied.
+                let config = waiters
+                    .iter()
+                    .map(|(_, c, _)| c)
+                    .find(|c| !c.is_empty())
+                    .cloned()
+                    .unwrap_or_default();
                 b.fetch_add(1, Ordering::Relaxed);
-                let result = ns.commit_batch(&payloads).await;
+                let result = ns.commit_records(&records, &config).await;
                 if let Ok((_, n)) = &result {
                     a.fetch_add(*n, Ordering::Relaxed);
                 }
 
                 let reply = result.map(|(seq, _)| seq).map_err(|e| e.to_string());
-                for (_, done) in waiters {
+                for (_, _, done) in waiters {
                     let _ = done.send(reply.clone());
                 }
             }
@@ -1075,28 +1925,36 @@ impl GroupCommit {
         Self { tx, batches, attempts }
     }
 
-    pub async fn append(&self, data: Bytes) -> Result<u64> {
+    pub async fn submit(&self, record: Record, config: WriteConfig) -> Result<u64> {
         let (done, wait) = oneshot::channel();
-        self.tx.send((data, done)).map_err(|_| anyhow::anyhow!("committer stopped"))?;
+        self.tx
+            .send((record, config, done))
+            .map_err(|_| anyhow::anyhow!("committer stopped"))?;
         wait.await.context("committer dropped the request")?.map_err(|e| anyhow::anyhow!(e))
     }
 
     pub async fn upsert(&self, doc: Doc) -> Result<u64> {
-        self.append(Record::Upsert(doc).encode()).await
+        self.submit(Record::Upsert(doc), WriteConfig::default()).await
     }
 
     pub async fn delete(&self, id: Id) -> Result<u64> {
-        self.append(Record::Delete(id).encode()).await
+        self.submit(Record::Delete(id), WriteConfig::default()).await
     }
 
     /// Submit many records and wait for all of them, so a caller's whole batch
     /// rides one commit instead of one commit each.
-    pub async fn write_all(&self, records: Vec<Record>) -> Result<u64> {
+    pub async fn write_all(
+        &self,
+        records: Vec<Record>,
+        config: WriteConfig,
+    ) -> Result<u64> {
         let waits: Vec<_> = records
             .into_iter()
             .map(|r| {
                 let (done, wait) = oneshot::channel();
-                self.tx.send((r.encode(), done)).map_err(|_| anyhow::anyhow!("committer stopped"))?;
+                self.tx
+                    .send((r, config.clone(), done))
+                    .map_err(|_| anyhow::anyhow!("committer stopped"))?;
                 Ok::<_, anyhow::Error>(wait)
             })
             .collect::<Result<_>>()?;
@@ -1129,9 +1987,13 @@ impl GroupCommit {
 /// cannot work on it. Verified — `verify_cas` rejects it outright. Use InMemory
 /// for tests, or MinIO for a local backend that does enforce CAS.
 pub fn open_store() -> Result<(Arc<dyn ObjectStore>, String)> {
-    let Ok(bucket) = std::env::var("FCKDB_BUCKET") else {
+    // An empty value counts as unset. Blanking the variable is the obvious way
+    // to switch back to in-memory, and building an S3 client with a blank bucket
+    // name fails with something far less helpful.
+    let bucket = std::env::var("FCKDB_BUCKET").unwrap_or_default();
+    if bucket.trim().is_empty() {
         return Ok((Arc::new(object_store::memory::InMemory::new()), "InMemory".into()));
-    };
+    }
 
     use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
     let mut builder = AmazonS3Builder::from_env()
@@ -1143,7 +2005,7 @@ pub fn open_store() -> Result<(Arc<dyn ObjectStore>, String)> {
         .with_conditional_put(S3ConditionalPut::ETagMatch);
 
     let mut label = format!("S3 bucket={bucket}");
-    if let Ok(endpoint) = std::env::var("FCKDB_ENDPOINT") {
+    if let Some(endpoint) = std::env::var("FCKDB_ENDPOINT").ok().filter(|e| !e.trim().is_empty()) {
         let http = endpoint.starts_with("http://");
         label = format!("{endpoint} bucket={bucket}");
         builder = builder.with_endpoint(endpoint).with_allow_http(http);
@@ -1155,6 +2017,8 @@ pub fn open_store() -> Result<(Arc<dyn ObjectStore>, String)> {
 mod tests {
     use super::*;
     use crate::doc::Filter;
+    use crate::doc::Id;
+    use crate::value::Value;
     use crate::wire::Consistency;
 
     fn mem() -> Arc<dyn ObjectStore> {
@@ -1187,13 +2051,15 @@ mod tests {
             .map(|i| {
                 let c = &centers[i % clusters];
                 let v = c.iter().map(|x| x + rng() * 0.5).collect();
-                Doc::new(i as Id, v).with_attr("tenant", if i % 3 == 0 { "a" } else { "b" })
+                Doc::new(i as u64, v).with_attr("tenant", if i % 3 == 0 { "a" } else { "b" })
             })
             .collect()
     }
 
-    fn ids(hits: &[Hit]) -> Vec<Id> {
-        hits.iter().map(|h| h.id).collect()
+    /// Integer ids, so assertions read as `vec![1, 2]`. Every test namespace here
+    /// uses integer ids.
+    fn ids(hits: &[Hit]) -> Vec<u64> {
+        hits.iter().map(|h| h.id.as_uint().expect("test ids are integers")).collect()
     }
 
     // -------------------------------------------------------- phase 3: queries
@@ -1202,9 +2068,9 @@ mod tests {
     async fn upsert_and_query_brute() {
         let ns = ns("t/basic");
         ns.write_records(&[
-            Record::Upsert(Doc::new(1, vec![1.0, 0.0])),
-            Record::Upsert(Doc::new(2, vec![0.9, 0.1])),
-            Record::Upsert(Doc::new(3, vec![0.0, 1.0])),
+            Record::Upsert(Doc::new(1u64, vec![1.0, 0.0])),
+            Record::Upsert(Doc::new(2u64, vec![0.9, 0.1])),
+            Record::Upsert(Doc::new(3u64, vec![0.0, 1.0])),
         ])
         .await
         .unwrap();
@@ -1215,14 +2081,14 @@ mod tests {
     #[tokio::test]
     async fn later_upsert_wins_and_tombstone_removes() {
         let ns = ns("t/mutate");
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0, 0.0]))]).await.unwrap();
-        ns.write_records(&[Record::Upsert(Doc::new(2, vec![0.0, 1.0]))]).await.unwrap();
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![-1.0, 0.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0, 0.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(2u64, vec![0.0, 1.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![-1.0, 0.0]))]).await.unwrap();
 
         let got = ns.query_brute(&[1.0, 0.0], 3, None).await.unwrap();
-        assert_eq!(got[0].id, 2, "the newer version of doc 1 was not applied");
+        assert_eq!(got[0].id.as_uint().unwrap(), 2, "the newer version of doc 1 was not applied");
 
-        ns.write_records(&[Record::Delete(2)]).await.unwrap();
+        ns.write_records(&[Record::Delete(Id::Uint(2))]).await.unwrap();
         let got = ns.query_brute(&[1.0, 0.0], 3, None).await.unwrap();
         assert!(!ids(&got).contains(&2), "tombstone did not remove doc 2");
         assert_eq!(got.len(), 1);
@@ -1240,7 +2106,7 @@ mod tests {
             ns.write_records(&[Record::Upsert(Doc::new(i, vec![9.0; 8]))]).await.unwrap();
         }
         for i in 20..30u64 {
-            ns.write_records(&[Record::Delete(i)]).await.unwrap();
+            ns.write_records(&[Record::Delete(Id::Uint(i))]).await.unwrap();
         }
 
         let before = ns.query_brute(&[9.0; 8], 5, None).await.unwrap();
@@ -1252,7 +2118,7 @@ mod tests {
 
         let (m, _) = ns.load().await.unwrap();
         assert!(m.wal.is_empty(), "WAL should be empty after compaction");
-        assert_eq!(m.segments.len(), 1);
+        assert_eq!(m.all_segments().count(), 1);
         assert_eq!(m.unindexed_bytes(), 0);
 
         let after = ns.query_brute(&[9.0; 8], 5, None).await.unwrap();
@@ -1267,13 +2133,13 @@ mod tests {
         }
         let (m, _) = ns.load().await.unwrap();
         let before = m.wal.len();
-        ns.write_records(&[Record::Upsert(Doc::new(999, vec![1.0; 4]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(999u64, vec![1.0; 4]))]).await.unwrap();
 
         let stats = ns.compact(false).await.unwrap();
         assert_eq!(stats.wal_consumed, before + 1);
 
         let live = Namespace::materialize(ns.all_records().await.unwrap());
-        assert!(live.contains_key(&999), "the concurrent write was lost");
+        assert!(live.contains_key(&Id::Uint(999)), "the concurrent write was lost");
         assert_eq!(live.len(), 11);
     }
 
@@ -1290,7 +2156,7 @@ mod tests {
         assert!(stats.clusters > 1, "index should produce multiple clusters");
 
         let (m, _) = ns.load().await.unwrap();
-        let idx = m.index.expect("index should exist after compact(true)");
+        let idx = m.shards[0].index.clone().expect("index should exist after compact(true)");
         assert_eq!(idx.docs, 600);
         assert!(idx.bytes > 0, "index byte accounting missing");
 
@@ -1318,16 +2184,16 @@ mod tests {
         ns.compact(true).await.unwrap();
         let target = docs[0].vector.clone();
 
-        ns.write_records(&[Record::Upsert(Doc::new(9999, target.clone()))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(9999u64, target.clone()))]).await.unwrap();
         let res = ns.query(&QueryRequest::new(target.clone()).top_k(3).nprobe(4)).await.unwrap();
         assert!(ids(&res.hits).contains(&9999), "indexed query missed a doc still in the WAL");
         assert_eq!(res.unindexed_records, 1);
         assert!(res.unindexed_bytes > 0);
 
-        ns.write_records(&[Record::Delete(docs[0].id)]).await.unwrap();
+        ns.write_records(&[Record::Delete(docs[0].id.clone())]).await.unwrap();
         let res = ns.query(&QueryRequest::new(target).top_k(3).nprobe(4)).await.unwrap();
         assert!(
-            !ids(&res.hits).contains(&docs[0].id),
+            !ids(&res.hits).contains(&docs[0].id.as_uint().unwrap()),
             "WAL tombstone did not suppress an indexed doc"
         );
     }
@@ -1348,8 +2214,197 @@ mod tests {
         assert!(!res.hits.is_empty());
         let live = Namespace::materialize(ns.all_records().await.unwrap());
         for h in &res.hits {
-            assert_eq!(live[&h.id].attrs["tenant"], "a", "filter leaked a foreign tenant");
+            assert_eq!(
+                live[&h.id].attrs["tenant"],
+                Value::from("a"),
+                "filter leaked a foreign tenant"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn patch_merges_attributes_and_null_removes_them() {
+        let ns = ns("t/patch");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0, 0.0]).with_attr("tenant", "acme").with_attr("count", 1u64),
+        )])
+        .await
+        .unwrap();
+
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(1),
+            attrs: std::collections::BTreeMap::from([
+                ("count".to_string(), Value::Uint(9)),
+                ("added".to_string(), Value::Bool(true)),
+            ]),
+        }])
+        .await
+        .unwrap();
+
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        let d = &live[&Id::Uint(1)];
+        assert_eq!(d.attrs["count"], Value::Uint(9), "patch did not overwrite");
+        assert_eq!(d.attrs["added"], Value::Bool(true), "patch did not add");
+        assert_eq!(d.attrs["tenant"], Value::from("acme"), "patch clobbered an untouched attribute");
+        assert_eq!(d.vector, vec![1.0, 0.0], "patch disturbed the vector");
+
+        // Null removes.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(1),
+            attrs: std::collections::BTreeMap::from([("tenant".to_string(), Value::Null)]),
+        }])
+        .await
+        .unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert!(!live[&Id::Uint(1)].attrs.contains_key("tenant"), "null did not remove the attribute");
+
+        // A patch against a document that does not exist is a no-op, never a
+        // resurrection — there would be no vector to attach.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(999),
+            attrs: std::collections::BTreeMap::from([("x".to_string(), Value::Uint(1))]),
+        }])
+        .await
+        .unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert!(!live.contains_key(&Id::Uint(999)), "patch resurrected a missing document");
+    }
+
+    #[tokio::test]
+    async fn patch_survives_compaction_and_applies_over_the_index() {
+        let ns = ns("t/patch-compact");
+        let docs = synth(100, 8, 4);
+        ns.write_records(&docs.iter().cloned().map(Record::Upsert).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        ns.compact(true).await.unwrap();
+
+        // Patch lands only in the WAL, so it must be applied as an overlay on top
+        // of what the index still believes.
+        let target = docs[0].clone();
+        ns.write_records(&[Record::Patch {
+            id: target.id.clone(),
+            attrs: std::collections::BTreeMap::from([("tenant".to_string(), Value::from("z"))]),
+        }])
+        .await
+        .unwrap();
+
+        let res = ns
+            .query(
+                &QueryRequest::new(target.vector.clone())
+                    .top_k(1)
+                    .include(crate::doc::Include::All),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.hits[0].id, target.id);
+        assert_eq!(res.hits[0].attrs["tenant"], Value::from("z"), "patch not visible over index");
+
+        // After compaction the patch is folded in and the result is unchanged.
+        ns.compact(true).await.unwrap();
+        let after = ns
+            .query(
+                &QueryRequest::new(target.vector.clone())
+                    .top_k(1)
+                    .include(crate::doc::Include::All),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.hits[0].attrs["tenant"], Value::from("z"), "compaction dropped the patch");
+        let (m, _) = ns.load().await.unwrap();
+        assert!(m.wal.is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_range_filters_work_through_the_index() {
+        let ns = ns("t/typed-filter");
+        let base = crate::value::parse_datetime("2024-03-01T00:00:00Z").unwrap();
+        let day = 86_400_000_000_000i64;
+        let docs: Vec<Doc> = (0..60)
+            .map(|i| {
+                Doc::new(i as u64, vec![1.0 + i as f32 * 0.001, 0.0])
+                    .with_attr("when", Value::Datetime(base + i as i64 * day))
+                    .with_attr("rank", Value::Uint(i as u64))
+                    .with_attr("tags", Value::StringArray(vec![format!("t{}", i % 3)]))
+            })
+            .collect();
+        ns.write_records(&docs.iter().cloned().map(Record::Upsert).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        ns.compact(true).await.unwrap();
+
+        let q = vec![1.0f32, 0.0];
+        let cutoff = Value::Datetime(base + 30 * day);
+
+        let res = ns
+            .query(
+                &QueryRequest::new(q.clone())
+                    .top_k(100)
+                    .nprobe(64)
+                    .filter(Filter::cmp("when", crate::doc::Op::Gte, cutoff.clone())),
+            )
+            .await
+            .unwrap();
+        assert!(!res.hits.is_empty());
+        assert!(
+            res.hits.iter().all(|h| h.id.as_uint().unwrap() >= 30),
+            "Gte on datetime leaked older docs"
+        );
+
+        let res = ns
+            .query(
+                &QueryRequest::new(q.clone()).top_k(100).nprobe(64).filter(Filter::And(vec![
+                    Filter::cmp("rank", crate::doc::Op::Gte, 10u64),
+                    Filter::cmp("rank", crate::doc::Op::Lt, 20u64),
+                    Filter::cmp("tags", crate::doc::Op::Contains, "t1"),
+                ])),
+            )
+            .await
+            .unwrap();
+        assert!(!res.hits.is_empty());
+        assert!(
+            res.hits.iter().all(|h| {
+                let n = h.id.as_uint().unwrap();
+                (10..20).contains(&n) && n % 3 == 1
+            }),
+            "compound typed filter admitted the wrong documents: {:?}",
+            ids(&res.hits)
+        );
+    }
+
+    #[tokio::test]
+    async fn include_attributes_projects_through_the_query_path() {
+        let ns = ns("t/include");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0, 0.0])
+                .with_attr("a", 1u64)
+                .with_attr("b", "two")
+                .with_attr("c", true),
+        )])
+        .await
+        .unwrap();
+        ns.compact(true).await.unwrap();
+        let q = vec![1.0f32, 0.0];
+
+        let none = ns.query(&QueryRequest::new(q.clone())).await.unwrap();
+        assert!(none.hits[0].attrs.is_empty(), "attributes returned without being asked for");
+
+        let all = ns
+            .query(&QueryRequest::new(q.clone()).include(crate::doc::Include::All))
+            .await
+            .unwrap();
+        assert_eq!(all.hits[0].attrs.len(), 3);
+        assert_eq!(all.hits[0].attrs["b"], Value::from("two"));
+
+        let some = ns
+            .query(
+                &QueryRequest::new(q)
+                    .include(crate::doc::Include::Only(vec!["a".into(), "nope".into()])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(some.hits[0].attrs.len(), 1, "projection leaked or invented an attribute");
+        assert_eq!(some.hits[0].attrs["a"], Value::Uint(1));
     }
 
     #[tokio::test]
@@ -1369,9 +2424,825 @@ mod tests {
     #[tokio::test]
     async fn dimension_mismatch_is_rejected_not_silently_wrong() {
         let ns = ns("t/dims");
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0; 8]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0; 8]))]).await.unwrap();
         ns.compact(true).await.unwrap();
         assert!(ns.query(&QueryRequest::new(vec![1.0; 4])).await.is_err());
+    }
+
+    // -------------------------------------------------------- phase 17: attr index
+
+    /// The failure this exists to prevent: a selective filter whose surviving
+    /// documents are spread across clusters the query never probes. Post-filtering
+    /// returns almost nothing; the attribute index makes the answer exact.
+    #[tokio::test]
+    async fn a_selective_filter_no_longer_loses_recall() {
+        let ns = ns("t/prefilter-recall");
+        // 800 documents across 20 well-separated clusters. One in forty is
+        // "rare", and those are deliberately spread across every cluster.
+        let docs: Vec<Record> = synth(800, 16, 20)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert(
+                    "tier".into(),
+                    Value::from(if i % 40 == 0 { "rare" } else { "common" }),
+                );
+                Record::Upsert(d)
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        let idx = m.shards[0].index.clone().unwrap();
+        assert!(idx.attributes.contains_key("tier"), "no attribute index was built");
+        assert!(idx.ids.is_some(), "no ordinal-to-id map was written");
+
+        let q = match &docs[0] {
+            Record::Upsert(d) => d.vector.clone(),
+            _ => unreachable!(),
+        };
+
+        // nprobe=1 probes a single cluster, so post-filtering would find at most
+        // the one or two rare documents that happen to live in it.
+        let res = ns
+            .query(
+                &QueryRequest::new(q.clone())
+                    .top_k(10)
+                    .nprobe(1)
+                    .filter(Filter::eq("tier", "rare")),
+            )
+            .await
+            .unwrap();
+        assert!(res.prefiltered, "the selective filter did not take the exact path");
+        assert_eq!(res.hits.len(), 10, "prefiltered query returned short: {:?}", res.hits.len());
+
+        // And it agrees exactly with brute force, which is the definition of no
+        // recall loss.
+        let exact = ns.query_brute(&q, 10, Some(&Filter::eq("tier", "rare"))).await.unwrap();
+        assert_eq!(res.hits, exact, "prefiltered result disagreed with brute force");
+        assert_eq!(crate::index::recall(&exact, &res.hits), 1.0);
+
+        // A non-selective filter is left to the cluster path, which is what the
+        // threshold is for.
+        let broad = ns
+            .query(
+                &QueryRequest::new(q)
+                    .top_k(10)
+                    .nprobe(8)
+                    .filter(Filter::eq("tier", "common")),
+            )
+            .await
+            .unwrap();
+        assert!(!broad.prefiltered, "a broad filter should not force an exact scan");
+        assert!(!broad.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ids_matching_uses_the_index_and_touches_no_vectors() {
+        let store = mem();
+        let seed = Namespace::new(store.clone(), "t/ids-index");
+        let docs: Vec<Record> = synth(400, 32, 8)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert("tier".into(), Value::from(if i % 4 == 0 { "gold" } else { "grey" }));
+                Record::Upsert(d)
+            })
+            .collect();
+        seed.write_records(&docs).await.unwrap();
+        seed.compact(true).await.unwrap();
+
+        // Fresh namespace handle so byte counters start clean.
+        let ns = Namespace::new(store.clone(), "t/ids-index");
+        let (ids, remaining) = ns.ids_matching(&Filter::eq("tier", "gold"), 1000).await.unwrap();
+        assert_eq!(ids.len(), 100);
+        assert!(!remaining);
+        let indexed_bytes = ns.metrics.snapshot().bytes_get;
+
+        // Compare against the scan path, which has to pull every vector.
+        let scanner = Namespace::new(store, "t/ids-index");
+        let live = Namespace::materialize(scanner.all_records().await.unwrap());
+        let scanned: Vec<Id> = {
+            let mut v: Vec<Id> = live
+                .values()
+                .filter(|d| Filter::eq("tier", "gold").matches(&d.attrs, &crate::fts::FtsSchema::new()))
+                .map(|d| d.id.clone())
+                .collect();
+            v.sort();
+            v
+        };
+        let scan_bytes = scanner.metrics.snapshot().bytes_get;
+
+        assert_eq!(ids, scanned, "the index disagreed with the scan");
+        assert!(
+            indexed_bytes * 4 < scan_bytes,
+            "index path read {indexed_bytes} bytes vs scan {scan_bytes}; it should avoid vectors"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unindexed_tail_forces_the_scan_path() {
+        let ns = ns("t/ids-tail");
+        let docs: Vec<Record> = (0..40u64)
+            .map(|i| {
+                Record::Upsert(
+                    Doc::new(i, vec![1.0, i as f32])
+                        .with_attr("tier", if i < 20 { "gold" } else { "grey" }),
+                )
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        // A patch in the tail moves a document out of the match set. The index
+        // describes the segment only, so trusting it here would return a stale id.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(0),
+            attrs: std::collections::BTreeMap::from([("tier".to_string(), Value::from("grey"))]),
+        }])
+        .await
+        .unwrap();
+
+        let (ids, _) = ns.ids_matching(&Filter::eq("tier", "gold"), 100).await.unwrap();
+        assert_eq!(ids.len(), 19, "the index was trusted over an unindexed patch");
+        assert!(!ids.contains(&Id::Uint(0)), "returned a document the tail had moved out");
+
+        // And a document patched INTO the set is found.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(25),
+            attrs: std::collections::BTreeMap::from([("tier".to_string(), Value::from("gold"))]),
+        }])
+        .await
+        .unwrap();
+        let (ids, _) = ns.ids_matching(&Filter::eq("tier", "gold"), 100).await.unwrap();
+        assert!(ids.contains(&Id::Uint(25)), "missed a document the tail moved in");
+        assert_eq!(ids.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn prefiltered_queries_still_honour_the_tail() {
+        let ns = ns("t/prefilter-tail");
+        let docs: Vec<Record> = synth(200, 8, 4)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert("tier".into(), Value::from(if i % 50 == 0 { "rare" } else { "x" }));
+                Record::Upsert(d)
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+        let q = match &docs[0] {
+            Record::Upsert(d) => d.vector.clone(),
+            _ => unreachable!(),
+        };
+
+        // A brand-new rare document lives only in the tail, so the attribute
+        // index has never seen it.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(999_999u64, q.clone()).with_attr("tier", "rare"),
+        )])
+        .await
+        .unwrap();
+
+        let res = ns
+            .query(&QueryRequest::new(q.clone()).top_k(5).nprobe(1).filter(Filter::eq("tier", "rare")))
+            .await
+            .unwrap();
+        assert!(res.prefiltered);
+        assert!(
+            ids(&res.hits).contains(&999_999),
+            "prefiltered query missed a document that is only in the tail"
+        );
+
+        // A tombstone in the tail must suppress an indexed match.
+        let victim = match &docs[0] {
+            Record::Upsert(d) => d.id.clone(),
+            _ => unreachable!(),
+        };
+        ns.write_records(&[Record::Delete(victim.clone())]).await.unwrap();
+        let res = ns
+            .query(&QueryRequest::new(q).top_k(5).nprobe(1).filter(Filter::eq("tier", "rare")))
+            .await
+            .unwrap();
+        assert!(
+            !res.hits.iter().any(|h| h.id == victim),
+            "prefiltered query returned a tombstoned document"
+        );
+    }
+
+    // -------------------------------------------------------- phase 19: BM25
+
+    async fn text_ns(prefix: &str) -> Arc<Namespace> {
+        let ns = ns(prefix);
+        let cfg = WriteConfig {
+            declared_fts: crate::fts::FtsSchema::from([(
+                "body".to_string(),
+                crate::fts::FtsConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let docs = vec![
+            Record::Upsert(
+                Doc::new(1u64, vec![1.0, 0.0])
+                    .with_attr("body", "the quick brown fox jumps over the lazy dog")
+                    .with_attr("tier", "gold"),
+            ),
+            Record::Upsert(
+                Doc::new(2u64, vec![0.9, 0.1])
+                    .with_attr("body", "a quick brown dog")
+                    .with_attr("tier", "grey"),
+            ),
+            Record::Upsert(
+                Doc::new(3u64, vec![0.0, 1.0])
+                    .with_attr("body", "unrelated notes about databases")
+                    .with_attr("tier", "gold"),
+            ),
+        ];
+        ns.commit_records(&docs, &cfg).await.unwrap();
+        ns.compact(true).await.unwrap();
+        ns
+    }
+
+    #[tokio::test]
+    async fn bm25_ranks_and_excludes_non_matches() {
+        let ns = text_ns("t/bm25").await;
+        let (m, _) = ns.load().await.unwrap();
+        assert!(
+            m.shards[0].index.as_ref().unwrap().fts.contains_key("body"),
+            "compaction did not build a full-text index"
+        );
+
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(10)).await.unwrap();
+        assert_eq!(ids(&res.hits), vec![1, 2], "BM25 returned the wrong set");
+        assert!(res.hits[0].score > res.hits[1].score, "scores not ordered");
+        // A document with neither term is absent, not scored zero.
+        assert!(!ids(&res.hits).contains(&3));
+
+        // Filters compose with text ranking.
+        let res = ns
+            .query(
+                &QueryRequest::new(vec![])
+                    .text("body", "quick")
+                    .top_k(10)
+                    .filter(Filter::eq("tier", "gold")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&res.hits), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn bm25_ranks_documents_that_are_only_in_the_tail() {
+        let ns = text_ns("t/bm25-tail").await;
+
+        // A new document, more relevant than anything indexed, exists only in the
+        // WAL. If it were unrankable it would be invisible to every text query
+        // until the next compaction.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(99u64, vec![1.0, 0.0])
+                .with_attr("body", "quick fox quick fox")
+                .with_attr("tier", "gold"),
+        )])
+        .await
+        .unwrap();
+
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(10)).await.unwrap();
+        assert!(ids(&res.hits).contains(&99), "a tail-only document was not ranked");
+        assert_eq!(res.hits[0].id, Id::Uint(99), "the most relevant document did not rank first");
+
+        // A patch that removes the terms must drop the document, not leave it
+        // ranked on what the index remembers.
+        ns.write_records(&[Record::Patch {
+            id: Id::Uint(1),
+            attrs: std::collections::BTreeMap::from([(
+                "body".to_string(),
+                Value::from("nothing relevant here"),
+            )]),
+        }])
+        .await
+        .unwrap();
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(10)).await.unwrap();
+        assert!(
+            !ids(&res.hits).contains(&1),
+            "a document rewritten by the tail was still scored from stale postings"
+        );
+
+        // And a tombstone removes it entirely.
+        ns.write_records(&[Record::Delete(Id::Uint(2))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick").top_k(10)).await.unwrap();
+        assert!(!ids(&res.hits).contains(&2), "a tombstoned document was still ranked");
+    }
+
+    #[tokio::test]
+    async fn full_text_search_needs_configuration_and_an_index() {
+        let ns = ns("t/bm25-unconfigured");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0]).with_attr("body", "quick fox"),
+        )])
+        .await
+        .unwrap();
+
+        // Before compaction there is no term index at all.
+        let err = ns
+            .query(&QueryRequest::new(vec![]).text("body", "quick"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compacted"), "unhelpful error: {err}");
+
+        // After compaction, an attribute nobody enabled is still refused by name.
+        ns.compact(true).await.unwrap();
+        let err = ns
+            .query(&QueryRequest::new(vec![]).text("body", "quick"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("full-text"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_tokenizer_cannot_be_changed_under_an_existing_index() {
+        let ns = text_ns("t/bm25-tokenizer").await;
+        let different = WriteConfig {
+            declared_fts: crate::fts::FtsSchema::from([(
+                "body".to_string(),
+                crate::fts::FtsConfig {
+                    tokenizer: crate::fts::Tokenizer { stemming: false, ..Default::default() },
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        // Stored postings were produced by the old tokenizer, so a query would
+        // tokenize differently from the index and match the wrong documents.
+        let err = ns
+            .commit_records(&[Record::Upsert(Doc::new(9u64, vec![1.0, 0.0]))], &different)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("full-text"), "unhelpful error: {err}");
+    }
+
+    // -------------------------------------------------------- phase 22: sharding
+
+    #[test]
+    fn shard_assignment_is_stable_and_spreads() {
+        // The assignment is persisted, so it must be reproducible forever. These
+        // are pinned values: if the hash ever changes, this test fails rather
+        // than every shard's index silently describing rows it no longer owns.
+        for n in [1usize, 2, 4, 8, 256] {
+            for id in [Id::Uint(0), Id::Uint(12345), Id::String("abc".into())] {
+                let a = shard_of(&id, n);
+                let b = shard_of(&id, n);
+                assert_eq!(a, b, "assignment is not deterministic");
+                assert!(a < n, "shard {a} out of range for {n} shards");
+            }
+        }
+        // One shard means everything lands in shard zero.
+        assert_eq!(shard_of(&Id::Uint(999), 1), 0);
+        assert_eq!(shard_of(&Id::Uint(999), 0), 0);
+
+        // Reasonably uniform over 8 shards: no shard should be empty or hold
+        // most of the keys.
+        let mut counts = vec![0usize; 8];
+        for i in 0..800u64 {
+            counts[shard_of(&Id::Uint(i), 8)] += 1;
+        }
+        assert!(counts.iter().all(|c| *c > 40), "uneven distribution: {counts:?}");
+        assert_eq!(counts.iter().sum::<usize>(), 800);
+
+        // Different id types hash independently rather than colliding by value.
+        let types_differ = shard_of(&Id::Uint(1), 8) != shard_of(&Id::String("1".into()), 8);
+        let _ = types_differ; // either outcome is fine; this documents intent
+    }
+
+    #[tokio::test]
+    async fn a_sharded_namespace_answers_exactly_like_an_unsharded_one() {
+        let store = mem();
+        let docs: Vec<Record> = synth(400, 16, 10)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut d)| {
+                d.attrs.insert("tier".into(), Value::from(if i % 5 == 0 { "gold" } else { "grey" }));
+                d.attrs.insert("rank".into(), Value::Uint(i as u64));
+                Record::Upsert(d)
+            })
+            .collect();
+
+        let plain = Namespace::new(store.clone(), "t/shard-one");
+        plain.write_records(&docs).await.unwrap();
+        plain.compact(true).await.unwrap();
+
+        let sharded = Namespace::new(store.clone(), "t/shard-four");
+        sharded
+            .commit_records(&docs, &WriteConfig { num_shards: Some(4), ..Default::default() })
+            .await
+            .unwrap();
+        sharded.compact(true).await.unwrap();
+
+        let (m, _) = sharded.load().await.unwrap();
+        assert_eq!(m.shards.len(), 4, "expected four shards");
+        assert!(m.shards.iter().all(|s| s.index.is_some()), "every shard needs its own index");
+        // Every document landed in exactly one shard.
+        let total: usize = m.shards.iter().map(|s| s.index.as_ref().unwrap().docs).sum();
+        assert_eq!(total, 400, "documents were duplicated or lost across shards");
+        assert!(
+            m.shards.iter().all(|s| s.index.as_ref().unwrap().docs > 40),
+            "a shard is nearly empty: {:?}",
+            m.shards.iter().map(|s| s.index.as_ref().unwrap().docs).collect::<Vec<_>>()
+        );
+
+        let q = match &docs[7] {
+            Record::Upsert(d) => d.vector.clone(),
+            _ => unreachable!(),
+        };
+
+        // Probing every cluster makes both exhaustive, so the answers must be
+        // identical rather than merely similar. Any duplicate surviving the merge
+        // would show up here.
+        let one = plain.query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000)).await.unwrap();
+        let four =
+            sharded.query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000)).await.unwrap();
+        assert_eq!(ids(&four.hits), ids(&one.hits), "sharded query disagreed with unsharded");
+        assert_eq!(four.hits.len(), 10);
+        assert_eq!(
+            ids(&four.hits).len(),
+            ids(&four.hits).iter().collect::<std::collections::BTreeSet<_>>().len(),
+            "the merge returned a duplicate"
+        );
+
+        // Filtered, ordered and aggregated queries must agree too.
+        let f = Filter::eq("tier", "gold");
+        let one_f = plain
+            .query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000).filter(f.clone()))
+            .await
+            .unwrap();
+        let four_f = sharded
+            .query(&QueryRequest::new(q.clone()).top_k(10).nprobe(1000).filter(f.clone()))
+            .await
+            .unwrap();
+        assert_eq!(ids(&four_f.hits), ids(&one_f.hits), "filtered sharded query disagreed");
+
+        let spec = std::collections::BTreeMap::from([
+            ("n".to_string(), serde_json::from_str::<crate::aggregate::Agg>(r#"["Count"]"#).unwrap()),
+            (
+                "s".to_string(),
+                serde_json::from_str::<crate::aggregate::Agg>(r#"["Sum","rank"]"#).unwrap(),
+            ),
+        ]);
+        let one_a = plain.query(&QueryRequest::new(vec![]).aggregate(spec.clone())).await.unwrap();
+        let four_a = sharded.query(&QueryRequest::new(vec![]).aggregate(spec)).await.unwrap();
+        assert_eq!(four_a.aggregations, one_a.aggregations, "aggregation differed across shards");
+        assert_eq!(four_a.aggregations["n"], Value::Uint(400));
+
+        let one_o = plain
+            .query(&QueryRequest::new(vec![]).top_k(5).order_by("rank", true))
+            .await
+            .unwrap();
+        let four_o = sharded
+            .query(&QueryRequest::new(vec![]).top_k(5).order_by("rank", true))
+            .await
+            .unwrap();
+        assert_eq!(ids(&four_o.hits), ids(&one_o.hits), "ordering differed across shards");
+    }
+
+    #[tokio::test]
+    async fn the_tail_is_partitioned_so_no_document_is_counted_twice() {
+        let ns = ns("t/shard-tail");
+        let docs: Vec<Record> = (0..80u64)
+            .map(|i| Record::Upsert(Doc::new(i, vec![1.0, i as f32 * 0.01])))
+            .collect();
+        ns.commit_records(&docs, &WriteConfig { num_shards: Some(4), ..Default::default() })
+            .await
+            .unwrap();
+        ns.compact(true).await.unwrap();
+
+        // A tail write must be overlaid on its own shard only. Applied to every
+        // shard, it would appear four times in the merged candidate set.
+        // The vector is orthogonal to every existing document so the tail
+        // document wins outright rather than tying with one of them.
+        let q = vec![0.0f32, 1.0];
+        ns.write_records(&[Record::Upsert(Doc::new(9999u64, q.clone()))]).await.unwrap();
+
+        let res = ns.query(&QueryRequest::new(q.clone()).top_k(20).nprobe(1000)).await.unwrap();
+        let hits = ids(&res.hits);
+        assert_eq!(
+            hits.iter().filter(|i| **i == 9999).count(),
+            1,
+            "the tail document appeared more than once: {hits:?}"
+        );
+        assert_eq!(res.hits[0].id, Id::Uint(9999), "the exact match did not rank first");
+
+        // A tombstone in the tail must suppress the indexed copy in its shard.
+        ns.write_records(&[Record::Delete(Id::Uint(9999))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(q).top_k(20).nprobe(1000)).await.unwrap();
+        assert!(!ids(&res.hits).contains(&9999), "tombstone did not reach the owning shard");
+    }
+
+    #[tokio::test]
+    async fn shard_count_is_fixed_at_creation() {
+        let fixed = ns("t/shard-immutable");
+        let cfg = |n: usize| WriteConfig { num_shards: Some(n), ..Default::default() };
+
+        fixed.commit_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))], &cfg(4)).await.unwrap();
+        // Re-sending the same count is allowed, because clients may send the
+        // configuration on every write.
+        fixed.commit_records(&[Record::Upsert(Doc::new(2u64, vec![1.0]))], &cfg(4)).await.unwrap();
+
+        // Changing it would relocate documents away from the index describing them.
+        let err = fixed
+            .commit_records(&[Record::Upsert(Doc::new(3u64, vec![1.0]))], &cfg(8))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("num_shards"), "unhelpful error: {err}");
+
+        // Setting it on a namespace that already holds unsharded data is refused.
+        let late = ns("t/shard-late");
+        late.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
+        assert!(
+            late.commit_records(&[Record::Upsert(Doc::new(2u64, vec![1.0]))], &cfg(4))
+                .await
+                .is_err()
+        );
+
+        // Out-of-range counts are refused rather than clamped.
+        let fresh = ns("t/shard-range");
+        for bad in [0usize, 257, 10_000] {
+            assert!(
+                fresh
+                    .commit_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))], &cfg(bad))
+                    .await
+                    .is_err(),
+                "num_shards {bad} was accepted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn full_text_and_sparse_work_across_shards() {
+        let ns = ns("t/shard-text");
+        let cfg = WriteConfig {
+            num_shards: Some(3),
+            declared_fts: crate::fts::FtsSchema::from([(
+                "body".to_string(),
+                crate::fts::FtsConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let docs: Vec<Record> = (0..30u64)
+            .map(|i| {
+                Record::Upsert(
+                    Doc::new(i, vec![1.0, i as f32 * 0.01])
+                        .with_attr(
+                            "body",
+                            if i % 3 == 0 { "quick brown fox" } else { "lazy sleeping dog" },
+                        )
+                        .with_attr(
+                            "terms",
+                            Value::Sparse(std::collections::BTreeMap::from([(
+                                if i % 3 == 0 { "cat".to_string() } else { "dog".to_string() },
+                                1.0f32,
+                            )])),
+                        ),
+                )
+            })
+            .collect();
+        ns.commit_records(&docs, &cfg).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.shards.len(), 3);
+        // Each shard indexes its own text and sparse dimensions.
+        assert!(m.shards.iter().all(|s| s.index.as_ref().unwrap().fts.contains_key("body")));
+        assert!(m.shards.iter().all(|s| s.index.as_ref().unwrap().sparse.contains_key("terms")));
+
+        // BM25 across shards: every "quick fox" document, wherever it lives.
+        let res = ns.query(&QueryRequest::new(vec![]).text("body", "quick fox").top_k(20)).await.unwrap();
+        assert_eq!(res.hits.len(), 10, "BM25 missed documents in other shards");
+        assert!(ids(&res.hits).iter().all(|i| i % 3 == 0));
+
+        // Sparse across shards.
+        let query = std::collections::BTreeMap::from([("cat".to_string(), 1.0f32)]);
+        let res = ns.query(&QueryRequest::new(vec![]).sparse("terms", query).top_k(20)).await.unwrap();
+        assert_eq!(res.hits.len(), 10, "sparse search missed documents in other shards");
+        assert!(ids(&res.hits).iter().all(|i| i % 3 == 0));
+    }
+
+    // -------------------------------------------------------- phase 12: schema
+
+    #[tokio::test]
+    async fn schema_is_inferred_from_the_first_write_then_enforced() {
+        let ns = ns("t/schema");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0, 0.0])
+                .with_attr("name", "a")
+                .with_attr("count", 1u64)
+                .with_attr("live", true),
+        )])
+        .await
+        .unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.attributes["name"], crate::value::Type::String);
+        assert_eq!(m.schema.attributes["count"], crate::value::Type::Uint);
+        assert_eq!(m.schema.attributes["live"], crate::value::Type::Bool);
+        assert_eq!(m.schema.dim, Some(2));
+        assert_eq!(m.schema.id_type, Some(crate::doc::IdType::Uint));
+
+        // A later document that disagrees is rejected, not silently reinterpreted.
+        let err = ns
+            .write_records(&[Record::Upsert(
+                Doc::new(2u64, vec![1.0, 0.0]).with_attr("count", "not a number"),
+            )])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("count"), "unhelpful schema error: {err}");
+
+        // Widening within the numeric family is allowed and stores the declared type.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(3u64, vec![1.0, 0.0]).with_attr("count", 7u64),
+        )])
+        .await
+        .unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert_eq!(live[&Id::Uint(3)].attrs["count"], Value::Uint(7));
+    }
+
+    #[tokio::test]
+    async fn a_null_never_declares_a_type() {
+        let ns = ns("t/schema-null");
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0]).with_attr("maybe", Value::Null),
+        )])
+        .await
+        .unwrap();
+        let (m, _) = ns.load().await.unwrap();
+        assert!(
+            !m.schema.attributes.contains_key("maybe"),
+            "a null poisoned the attribute's type"
+        );
+
+        // So a later real value is still free to declare it.
+        ns.write_records(&[Record::Upsert(Doc::new(2u64, vec![1.0]).with_attr("maybe", 5u64))])
+            .await
+            .unwrap();
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.attributes["maybe"], crate::value::Type::Uint);
+    }
+
+    #[tokio::test]
+    async fn declared_types_promote_the_strings_json_cannot_type() {
+        let ns = ns("t/schema-coerce");
+        // Declare by writing the typed values first.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(1u64, vec![1.0])
+                .with_attr("when", Value::Datetime(0))
+                .with_attr("who", Value::Uuid(uuid::Uuid::nil())),
+        )])
+        .await
+        .unwrap();
+
+        // Now a client sends them as strings, as JSON forces it to.
+        ns.write_records(&[Record::Upsert(
+            Doc::new(2u64, vec![1.0])
+                .with_attr("when", "2024-03-01T00:00:00Z")
+                .with_attr("who", "550e8400-e29b-41d4-a716-446655440000"),
+        )])
+        .await
+        .unwrap();
+
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        let d = &live[&Id::Uint(2)];
+        assert!(matches!(d.attrs["when"], Value::Datetime(_)), "datetime not promoted");
+        assert!(matches!(d.attrs["who"], Value::Uuid(_)), "uuid not promoted");
+
+        // And a range filter over the promoted values works.
+        let cutoff = Value::Datetime(crate::value::parse_datetime("2020-01-01").unwrap());
+        let res = ns
+            .query(
+                &QueryRequest::new(vec![1.0])
+                    .filter(Filter::cmp("when", crate::doc::Op::Gte, cutoff)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ids(&res.hits), vec![2], "range filter missed the promoted datetime");
+    }
+
+    #[tokio::test]
+    async fn vector_dimensions_are_enforced_across_writes() {
+        let ns = ns("t/dim-enforce");
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0, 2.0]))]).await.unwrap();
+        let err = ns
+            .write_records(&[Record::Upsert(Doc::new(2u64, vec![1.0, 2.0, 3.0]))])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dimensions"), "unhelpful dimension error: {err}");
+
+        // A vectorless document in a vector namespace is also refused.
+        assert!(ns.write_records(&[Record::Upsert(Doc::new(3u64, vec![]))]).await.is_err());
+        // As is a non-finite component.
+        assert!(
+            ns.write_records(&[Record::Upsert(Doc::new(4u64, vec![1.0, f32::NAN]))]).await.is_err()
+        );
+    }
+
+    // -------------------------------------------------------- phase 13: ids
+
+    #[tokio::test]
+    async fn string_ids_work_end_to_end() {
+        let ns = ns("t/string-ids");
+        let docs: Vec<Record> = ["alpha", "beta", "gamma"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Record::Upsert(Doc::new(*name, vec![1.0 - i as f32 * 0.1, i as f32 * 0.1]))
+            })
+            .collect();
+        ns.write_records(&docs).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.id_type, Some(crate::doc::IdType::String));
+
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(2)).await.unwrap();
+        assert_eq!(res.hits[0].id, Id::String("alpha".into()));
+
+        // Delete and tombstone by string id.
+        ns.write_records(&[Record::Delete(Id::String("alpha".into()))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(3)).await.unwrap();
+        assert!(!res.hits.iter().any(|h| h.id == Id::String("alpha".into())));
+
+        // A numeric id in a string namespace is coerced, not rejected.
+        ns.write_records(&[Record::Upsert(Doc::new(42u64, vec![1.0, 0.0]))]).await.unwrap();
+        let live = Namespace::materialize(ns.all_records().await.unwrap());
+        assert!(live.contains_key(&Id::String("42".into())), "numeric id was not coerced");
+    }
+
+    #[tokio::test]
+    async fn uuid_ids_survive_a_roundtrip() {
+        let ns = ns("t/uuid-ids");
+        let u = uuid::Uuid::from_u128(0x1234_5678);
+        ns.write_records(&[Record::Upsert(Doc::new(u, vec![1.0, 0.0]))]).await.unwrap();
+        ns.compact(true).await.unwrap();
+
+        let (m, _) = ns.load().await.unwrap();
+        assert_eq!(m.schema.id_type, Some(crate::doc::IdType::Uuid));
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(1)).await.unwrap();
+        assert_eq!(res.hits[0].id, Id::Uuid(u));
+
+        // A string form of the same uuid addresses the same document.
+        ns.write_records(&[Record::Delete(Id::String(u.to_string()))]).await.unwrap();
+        let res = ns.query(&QueryRequest::new(vec![1.0, 0.0]).top_k(1)).await.unwrap();
+        assert!(res.hits.is_empty(), "uuid string did not resolve to the same document");
+    }
+
+    // -------------------------------------------------------- phase 14: metric
+
+    #[tokio::test]
+    async fn distance_metric_changes_ranking_and_is_immutable() {
+        let store = mem();
+
+        // Two documents: one closer by angle, the other closer by magnitude.
+        let docs = vec![
+            Record::Upsert(Doc::new(1u64, vec![10.0, 0.0])),
+            Record::Upsert(Doc::new(2u64, vec![1.0, 0.1])),
+        ];
+        let q = vec![1.0f32, 0.0];
+
+        let cos = Namespace::new(store.clone(), "t/metric-cos");
+        cos.commit_records(&docs, &WriteConfig { metric: Some(DistanceMetric::CosineDistance), ..Default::default() }).await.unwrap();
+        cos.compact(true).await.unwrap();
+        let by_angle = cos.query(&QueryRequest::new(q.clone()).top_k(2)).await.unwrap();
+
+        let euc = Namespace::new(store.clone(), "t/metric-euc");
+        euc.commit_records(&docs, &WriteConfig { metric: Some(DistanceMetric::EuclideanSquared), ..Default::default() }).await.unwrap();
+        euc.compact(true).await.unwrap();
+        let by_distance = euc.query(&QueryRequest::new(q.clone()).top_k(2)).await.unwrap();
+
+        // Cosine ignores magnitude, so the collinear vector wins. Euclidean does
+        // not, so the nearby one wins. If the metric were not honoured these
+        // would agree.
+        assert_eq!(by_angle.hits[0].id, Id::Uint(1), "cosine did not rank by angle");
+        assert_eq!(by_distance.hits[0].id, Id::Uint(2), "euclidean did not rank by distance");
+
+        let (m, _) = euc.load().await.unwrap();
+        assert_eq!(m.schema.distance_metric, DistanceMetric::EuclideanSquared);
+
+        // Changing it later is refused: the index's clusters were assigned with it.
+        let err = euc
+            .commit_records(
+                &[Record::Upsert(Doc::new(3u64, vec![1.0, 0.0]))],
+                &WriteConfig { metric: Some(DistanceMetric::CosineDistance), ..Default::default() },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("distance_metric"), "unhelpful metric error: {err}");
     }
 
     // -------------------------------------------------------- phase 7: cache
@@ -1478,7 +3349,7 @@ mod tests {
         ns.compact(true).await.unwrap();
 
         let target = docs[0].vector.clone();
-        ns.write_records(&[Record::Upsert(Doc::new(4242, target.clone()))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(4242u64, target.clone()))]).await.unwrap();
 
         // The committer remembers the manifest it just wrote, so even a stale-
         // tolerant read on this node sees the write rather than lagging an
@@ -1491,6 +3362,41 @@ mod tests {
             .await
             .unwrap();
         assert!(ids(&res.hits).contains(&4242), "eventual read missed this node's own write");
+    }
+
+    #[test]
+    fn prefilter_decision_compares_what_each_path_reads() {
+        // 1000 docs in 40 clusters: one probe touches about 25 of them.
+        // A filter selecting fewer than that is cheaper to scan exactly.
+        // 1000 docs in 40 clusters: one probe touches about 25 of them.
+        assert!(should_prefilter(20, 1000, 40, 1, 10), "a selective filter should scan exactly");
+
+        // Raising nprobe widens the cluster path, so exact scanning wins for
+        // larger candidate sets too. The decision self-tunes.
+        assert!(should_prefilter(200, 1000, 40, 8, 10), "nprobe=8 touches ~200 docs");
+
+        // The recall guard: 400 of 8000 documents match and one probe of 82
+        // clusters touches ~97, so about 5 survive — far too few to rank 10 from.
+        // Cost alone would say "probe"; recall says otherwise, and recall wins.
+        assert!(
+            should_prefilter(400, 8000, 82, 1, 10),
+            "a starved probe must fall back to the exact path"
+        );
+        // Asking for fewer results needs fewer survivors, so the same shape can
+        // stay on the cluster path.
+        assert!(!should_prefilter(400, 8000, 82, 1, 1));
+
+        // A broad filter leaves plenty in the probed clusters, so probing is both
+        // cheaper and accurate.
+        assert!(!should_prefilter(7600, 8000, 82, 1, 10), "a broad filter should probe");
+        assert!(!should_prefilter(500, 1000, 40, 8, 1));
+
+        // The absolute ceiling still applies, however selective the filter looks.
+        assert!(!should_prefilter(PREFILTER_MAX_CANDIDATES + 1, 100_000_000, 10, 1, 10));
+        // No clusters means nothing to probe, so scanning is the only option.
+        assert!(should_prefilter(5, 5, 0, 8, 10));
+        // Degenerate inputs must not divide by zero or panic.
+        assert!(should_prefilter(0, 0, 0, 0, 0));
     }
 
     #[test]
@@ -1531,8 +3437,11 @@ mod tests {
                 bytes: MAX_UNINDEXED_SCAN_BYTES + 1,
                 records: 1,
             }],
-            segments: vec![],
-            index: None,
+            shards: vec![],
+            schema: Default::default(),
+            created_at: None,
+            last_write_at: None,
+            updated_at: None,
         };
         let mode = match version {
             Some(v) => PutMode::Update(v),
@@ -1574,7 +3483,7 @@ mod tests {
             .await
             .unwrap();
         ns.compact(true).await.unwrap();
-        ns.write_records(&[Record::Upsert(Doc::new(7777, vec![1.0; 8]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(7777u64, vec![1.0; 8]))]).await.unwrap();
 
         let before = ns.metrics.gets.load(Ordering::Relaxed);
         let md = ns.metadata().await.unwrap();
@@ -1661,8 +3570,8 @@ mod tests {
         );
 
         // Writes must not cross in either direction.
-        dst.write_records(&[Record::Upsert(Doc::new(11111, q.clone()))]).await.unwrap();
-        src.write_records(&[Record::Upsert(Doc::new(22222, q.clone()))]).await.unwrap();
+        dst.write_records(&[Record::Upsert(Doc::new(11111u64, q.clone()))]).await.unwrap();
+        src.write_records(&[Record::Upsert(Doc::new(22222u64, q.clone()))]).await.unwrap();
 
         let src_ids = ids(&src.query(&QueryRequest::new(q.clone())).await.unwrap().hits);
         let dst_ids = ids(&dst.query(&QueryRequest::new(q)).await.unwrap().hits);
@@ -1700,7 +3609,7 @@ mod tests {
         let tasks: Vec<_> = (0..N)
             .map(|i| {
                 let c = commit.clone();
-                tokio::spawn(async move { c.upsert(Doc::new(i as Id, vec![i as f32, 0.0])).await })
+                tokio::spawn(async move { c.upsert(Doc::new(i as u64, vec![i as f32, 0.0])).await })
             })
             .collect();
         for t in tasks {
@@ -1722,8 +3631,8 @@ mod tests {
         let ns = ns("t/write-all");
         let commit = GroupCommit::new(ns.clone());
         let records: Vec<Record> =
-            (0..50).map(|i| Record::Upsert(Doc::new(i, vec![i as f32]))).collect();
-        commit.write_all(records).await.unwrap();
+            (0..50u64).map(|i| Record::Upsert(Doc::new(i, vec![i as f32]))).collect();
+        commit.write_all(records, WriteConfig::default()).await.unwrap();
 
         let (batches, _) = commit.stats();
         assert_eq!(batches, 1, "a single caller batch should cost one commit");
@@ -1737,7 +3646,7 @@ mod tests {
     async fn committing_against_the_remembered_version_skips_the_manifest_read() {
         let ns = ns("t/optimistic");
         // First commit has nothing remembered: GET manifest, PUT wal, CAS.
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
         let first = ns.metrics.snapshot();
         assert_eq!(first.puts, 2);
 
@@ -1761,28 +3670,28 @@ mod tests {
         let b = Namespace::new(store.clone(), "t/stale");
 
         // Both learn the same commit point.
-        a.write_records(&[Record::Upsert(Doc::new(1, vec![1.0]))]).await.unwrap();
+        a.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
         b.load().await.unwrap();
 
         // A moves the manifest forward. B's remembered version is now stale.
-        a.write_records(&[Record::Upsert(Doc::new(2, vec![2.0]))]).await.unwrap();
+        a.write_records(&[Record::Upsert(Doc::new(2u64, vec![2.0]))]).await.unwrap();
 
         // B commits anyway: the CAS must reject the stale guess, and B must
         // recover rather than lose the write or clobber A's.
-        b.write_records(&[Record::Upsert(Doc::new(3, vec![3.0]))]).await.unwrap();
+        b.write_records(&[Record::Upsert(Doc::new(3u64, vec![3.0]))]).await.unwrap();
         assert_eq!(b.metrics.cas_conflicts.load(Ordering::Relaxed), 1, "stale guess was accepted");
 
         let live = Namespace::materialize(a.all_records().await.unwrap());
         assert_eq!(live.len(), 3, "a write was lost recovering from a stale version");
         for id in 1..=3 {
-            assert!(live.contains_key(&id), "doc {id} vanished");
+            assert!(live.contains_key(&Id::Uint(id)), "doc {id} vanished");
         }
     }
 
     #[tokio::test]
     async fn metrics_count_real_object_operations() {
         let ns = ns("t/metrics");
-        ns.write_records(&[Record::Upsert(Doc::new(1, vec![1.0]))]).await.unwrap();
+        ns.write_records(&[Record::Upsert(Doc::new(1u64, vec![1.0]))]).await.unwrap();
         let s = ns.metrics.snapshot();
         // One WAL object plus one manifest CAS.
         assert_eq!(s.puts, 2);

@@ -4,7 +4,11 @@
 //! server cannot drift, and the e2e driver exercises the same shapes real
 //! clients send.
 
-use crate::doc::{Doc, Filter, Id};
+use crate::aggregate::{Agg, AggregationGroup, GroupKey};
+use crate::doc::{Attrs, DistanceMetric, Doc, Filter, Id, IdType, Include, OrderBy};
+use anyhow::{Result, bail};
+use std::collections::BTreeMap;
+use crate::value::{Type, Value};
 pub use crate::doc::Hit;
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +45,38 @@ pub struct QueryRequest {
     pub nprobe: usize,
     #[serde(default)]
     pub consistency: Consistency,
+    /// Which attributes to return: `true`, `false`, or a list of names.
+    #[serde(default)]
+    pub include_attributes: Include,
+    /// Rank by an attribute instead of by vector similarity. When set, `vector`
+    /// is ignored.
+    #[serde(default)]
+    pub order_by: Option<OrderBy>,
+    /// Rank by BM25 over a full-text attribute. When set, `vector` is ignored.
+    #[serde(default)]
+    pub text: Option<TextSearch>,
+    /// Rank by sparse-vector similarity. When set, `vector` is ignored.
+    #[serde(default)]
+    pub sparse: Option<SparseSearch>,
+    /// Compute aggregates over the documents matching `filter`. When set, no
+    /// rows are returned unless a ranking is also requested.
+    #[serde(default)]
+    pub aggregate_by: Option<BTreeMap<String, Agg>>,
+    /// Compute the aggregates separately per group.
+    #[serde(default)]
+    pub group_by: Vec<GroupKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextSearch {
+    pub attribute: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparseSearch {
+    pub attribute: String,
+    pub vector: crate::sparse::SparseVector,
 }
 
 impl QueryRequest {
@@ -51,6 +87,12 @@ impl QueryRequest {
             filter: None,
             nprobe: default_nprobe(),
             consistency: Consistency::Strong,
+            include_attributes: Include::None,
+            order_by: None,
+            text: None,
+            sparse: None,
+            aggregate_by: None,
+            group_by: vec![],
         }
     }
     pub fn top_k(mut self, k: usize) -> Self {
@@ -69,6 +111,30 @@ impl QueryRequest {
         self.consistency = c;
         self
     }
+    pub fn include(mut self, i: Include) -> Self {
+        self.include_attributes = i;
+        self
+    }
+    pub fn order_by(mut self, attribute: &str, descending: bool) -> Self {
+        self.order_by = Some(OrderBy { attribute: attribute.into(), descending });
+        self
+    }
+    pub fn text(mut self, attribute: &str, query: &str) -> Self {
+        self.text = Some(TextSearch { attribute: attribute.into(), query: query.into() });
+        self
+    }
+    pub fn sparse(mut self, attribute: &str, vector: crate::sparse::SparseVector) -> Self {
+        self.sparse = Some(SparseSearch { attribute: attribute.into(), vector });
+        self
+    }
+    pub fn aggregate(mut self, spec: BTreeMap<String, Agg>) -> Self {
+        self.aggregate_by = Some(spec);
+        self
+    }
+    pub fn group_by(mut self, keys: Vec<GroupKey>) -> Self {
+        self.group_by = keys;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +145,20 @@ pub struct QueryResponse {
     pub consistent: bool,
     /// False means the vector index was not used and this was an exhaustive scan.
     pub indexed: bool,
+    /// True when a selective filter was answered from the attribute index and
+    /// scored exactly, rather than by probing clusters and filtering after.
+    #[serde(default)]
+    pub prefiltered: bool,
+    /// True when results were ranked by an attribute rather than by similarity,
+    /// so `score` carries no meaning.
+    #[serde(default)]
+    pub ordered: bool,
+    /// Ungrouped aggregates. Empty when `group_by` was used.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aggregations: BTreeMap<String, crate::value::Value>,
+    /// Grouped aggregates. Empty when `group_by` was not used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregation_groups: Vec<AggregationGroup>,
     /// Records read from the unindexed WAL tail for this query.
     pub unindexed_records: usize,
     pub unindexed_bytes: u64,
@@ -92,14 +172,128 @@ pub struct QueryResponse {
 pub struct WriteRequest {
     #[serde(default)]
     pub upsert: Vec<Doc>,
+    /// Merge attributes into existing documents. A null value removes one.
+    #[serde(default)]
+    pub patch: Vec<PatchRow>,
     #[serde(default)]
     pub delete: Vec<Id>,
+    /// Column-oriented form of `upsert`. Each key is a column, each value the
+    /// per-document values in the same order.
+    #[serde(default)]
+    pub upsert_columns: Option<Columns>,
+    #[serde(default)]
+    pub patch_columns: Option<Columns>,
+    /// Delete or patch every document matching a filter, up to a cap.
+    #[serde(default)]
+    pub delete_by_filter: Option<Filter>,
+    #[serde(default)]
+    pub patch_by_filter: Option<FilterPatch>,
+    /// Settable on a namespace's first write only; a later change is rejected
+    /// because the index's cluster assignment depends on it.
+    #[serde(default)]
+    pub distance_metric: Option<DistanceMetric>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct PatchRow {
+    pub id: Id,
+    #[serde(flatten)]
+    pub attrs: Attrs,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterPatch {
+    pub filters: Filter,
+    pub patch: Attrs,
+}
+
+impl WriteRequest {
+    pub fn is_empty(&self) -> bool {
+        self.upsert.is_empty()
+            && self.patch.is_empty()
+            && self.delete.is_empty()
+            && self.upsert_columns.is_none()
+            && self.patch_columns.is_none()
+            && self.delete_by_filter.is_none()
+            && self.patch_by_filter.is_none()
+    }
+}
+
+/// Column-oriented documents: `{"id":[1,2], "vector":[[…],[…]], "name":["a","b"]}`
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(transparent)]
+pub struct Columns(pub BTreeMap<String, Vec<serde_json::Value>>);
+
+/// One document pulled out of a column layout.
+pub struct Row {
+    pub id: Id,
+    pub vector: Option<Vec<f32>>,
+    pub attrs: Attrs,
+}
+
+impl Columns {
+    /// Transpose columns into rows.
+    ///
+    /// Every column must be the same length, because the Nth entry of each is by
+    /// definition the same document. A ragged batch is a client bug that would
+    /// otherwise silently attach one document's attribute to another.
+    pub fn transpose(&self) -> Result<Vec<Row>> {
+        let Some(ids) = self.0.get("id") else {
+            bail!("column writes require an `id` column");
+        };
+        let n = ids.len();
+        for (name, col) in &self.0 {
+            if col.len() != n {
+                bail!(
+                    "column {name:?} has {} values but `id` has {n}; every column must be \
+                     the same length",
+                    col.len()
+                );
+            }
+        }
+
+        let mut rows = Vec::with_capacity(n);
+        for i in 0..n {
+            let id: Id = serde_json::from_value(ids[i].clone())
+                .map_err(|e| anyhow::anyhow!("row {i}: {e}"))?;
+
+            let vector = match self.0.get("vector").map(|c| &c[i]) {
+                None | Some(serde_json::Value::Null) => None,
+                Some(raw) => Some(
+                    serde_json::from_value::<Vec<f32>>(raw.clone())
+                        .map_err(|e| anyhow::anyhow!("row {i} vector: {e}"))?,
+                ),
+            };
+
+            let mut attrs = Attrs::new();
+            for (name, col) in &self.0 {
+                if name == "id" || name == "vector" {
+                    continue;
+                }
+                // A null in a column means this document has no value for it,
+                // which is different from the attribute not existing at all.
+                let value = crate::value::from_json(col[i].clone())
+                    .map_err(|e| anyhow::anyhow!("row {i}, column {name:?}: {e}"))?;
+                if !matches!(value, Value::Null) {
+                    attrs.insert(name.clone(), value);
+                }
+            }
+            rows.push(Row { id, vector, attrs });
+        }
+        Ok(rows)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WriteResponse {
     pub seq: u64,
     pub records: usize,
+    pub rows_upserted: usize,
+    pub rows_patched: usize,
+    pub rows_deleted: usize,
+    /// True when a filter-based write hit its cap and more documents still
+    /// match. Reissue the same request to continue.
+    pub rows_remaining: bool,
     pub took_ms: u64,
 }
 
@@ -122,6 +316,13 @@ pub struct NamespaceMetadata {
     /// True when the unindexed tail is large enough that writes are being
     /// refused until compaction catches up.
     pub write_backpressure: bool,
+    /// Declared attribute types, inferred from the first write carrying each.
+    #[serde(default)]
+    pub schema: std::collections::BTreeMap<String, Type>,
+    #[serde(default)]
+    pub id_type: Option<IdType>,
+    #[serde(default)]
+    pub distance_metric: DistanceMetric,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

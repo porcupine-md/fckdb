@@ -1,7 +1,15 @@
+pub mod aggregate;
+pub mod attrindex;
+pub mod bench;
 pub mod cache;
+pub mod compat;
 pub mod doc;
+pub mod embed;
+pub mod fts;
 pub mod index;
 pub mod ops;
 pub mod server;
+pub mod sparse;
 pub mod store;
+pub mod value;
 pub mod wire;

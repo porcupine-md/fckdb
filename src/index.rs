@@ -13,7 +13,7 @@
 //! This module does no IO. It takes documents and returns bytes and groupings;
 //! the storage layer decides where they land.
 
-use crate::doc::{Doc, Hit, l2sq};
+use crate::doc::{DistanceMetric, Doc, Hit};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -33,19 +33,45 @@ pub struct IndexMeta {
     /// answerable from the manifest without a LIST.
     #[serde(default)]
     pub bytes: u64,
+    /// Object holding the segment's document ids in ordinal order. Attribute
+    /// indexes address documents by ordinal, and this resolves them back.
+    #[serde(default)]
+    pub ids: Option<String>,
+    /// Attribute name to its inverted-index object.
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, String>,
+    /// Attribute name to its full-text index object.
+    #[serde(default)]
+    pub fts: std::collections::BTreeMap<String, String>,
+    /// Attribute name to its sparse-vector index object.
+    #[serde(default)]
+    pub sparse: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct IvfParams {
     pub k: usize,
     pub iters: usize,
+    /// Cluster assignment must use the namespace's own geometry. Building with
+    /// Euclidean and querying with cosine puts a document's nearest neighbours
+    /// in a cluster the query never probes.
+    pub metric: DistanceMetric,
 }
 
 impl IvfParams {
     /// sqrt(n) clusters is the standard IVF rule of thumb: it balances centroid
     /// scan cost against posting list size.
     pub fn for_docs(n: usize) -> Self {
-        Self { k: (n as f64).sqrt().ceil().max(1.0) as usize, iters: 10 }
+        Self {
+            k: (n as f64).sqrt().ceil().max(1.0) as usize,
+            iters: 10,
+            metric: DistanceMetric::default(),
+        }
+    }
+
+    pub fn with_metric(mut self, metric: DistanceMetric) -> Self {
+        self.metric = metric;
+        self
     }
 }
 
@@ -66,11 +92,11 @@ pub fn build(docs: &[Doc], params: IvfParams) -> Result<(Vec<f32>, Vec<Vec<Doc>>
     }
 
     let vectors: Vec<&[f32]> = docs.iter().map(|d| d.vector.as_slice()).collect();
-    let centroids = kmeans(&vectors, params.k.min(docs.len()), params.iters);
+    let centroids = kmeans(&vectors, params.k.min(docs.len()), params.iters, params.metric);
 
     let mut groups: Vec<Vec<Doc>> = vec![Vec::new(); centroids.len()];
     for doc in docs {
-        groups[nearest(&centroids, &doc.vector)].push(doc.clone());
+        groups[nearest(&centroids, &doc.vector, params.metric)].push(doc.clone());
     }
 
     // Empty clusters would cost a centroid comparison forever and never return a
@@ -90,7 +116,12 @@ pub fn build(docs: &[Doc], params: IvfParams) -> Result<(Vec<f32>, Vec<Vec<Doc>>
 /// Lloyd's algorithm. Deterministic init by strided sampling: no RNG dependency,
 /// and identical input gives an identical index, which makes tests and the recall
 /// harness reproducible.
-pub fn kmeans(vectors: &[&[f32]], k: usize, iters: usize) -> Vec<Vec<f32>> {
+pub fn kmeans(
+    vectors: &[&[f32]],
+    k: usize,
+    iters: usize,
+    metric: DistanceMetric,
+) -> Vec<Vec<f32>> {
     let n = vectors.len();
     let k = k.clamp(1, n);
     let dim = vectors[0].len();
@@ -102,7 +133,7 @@ pub fn kmeans(vectors: &[&[f32]], k: usize, iters: usize) -> Vec<Vec<f32>> {
         let mut sums = vec![vec![0.0f32; dim]; k];
         let mut counts = vec![0usize; k];
         for v in vectors {
-            let c = nearest(&centroids, v);
+            let c = nearest(&centroids, v, metric);
             counts[c] += 1;
             for (s, x) in sums[c].iter_mut().zip(v.iter()) {
                 *s += x;
@@ -120,11 +151,11 @@ pub fn kmeans(vectors: &[&[f32]], k: usize, iters: usize) -> Vec<Vec<f32>> {
     centroids
 }
 
-fn nearest(centroids: &[Vec<f32>], v: &[f32]) -> usize {
+fn nearest(centroids: &[Vec<f32>], v: &[f32], metric: DistanceMetric) -> usize {
     let mut best = 0;
     let mut best_d = f32::INFINITY;
     for (i, c) in centroids.iter().enumerate() {
-        let d = l2sq(c, v);
+        let d = metric.distance(c, v);
         if d < best_d {
             best_d = d;
             best = i;
@@ -134,9 +165,14 @@ fn nearest(centroids: &[Vec<f32>], v: &[f32]) -> usize {
 }
 
 /// Indices of the `nprobe` centroids closest to `q`, nearest first.
-pub fn probe(centroids: &[Vec<f32>], q: &[f32], nprobe: usize) -> Vec<usize> {
+pub fn probe(
+    centroids: &[Vec<f32>],
+    q: &[f32],
+    nprobe: usize,
+    metric: DistanceMetric,
+) -> Vec<usize> {
     let mut scored: Vec<(f32, usize)> =
-        centroids.iter().enumerate().map(|(i, c)| (l2sq(c, q), i)).collect();
+        centroids.iter().enumerate().map(|(i, c)| (metric.distance(c, q), i)).collect();
     scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     scored.truncate(nprobe.max(1));
     scored.into_iter().map(|(_, i)| i).collect()
@@ -164,7 +200,7 @@ pub fn recall(exact: &[Hit], approx: &[Hit]) -> f32 {
     if exact.is_empty() {
         return 1.0;
     }
-    let found: std::collections::HashSet<crate::doc::Id> = approx.iter().map(|h| h.id).collect();
+    let found: std::collections::HashSet<&crate::doc::Id> = approx.iter().map(|h| &h.id).collect();
     exact.iter().filter(|h| found.contains(&h.id)).count() as f32 / exact.len() as f32
 }
 
@@ -190,26 +226,26 @@ mod tests {
     #[test]
     fn build_recovers_separated_clusters() {
         let docs = blobs();
-        let (flat, groups) = build(&docs, IvfParams { k: 3, iters: 20 }).unwrap();
+        let (flat, groups) = build(&docs, IvfParams { k: 3, iters: 20, metric: DistanceMetric::default() }).unwrap();
         assert_eq!(groups.len(), 3, "expected 3 non-empty clusters");
         assert_eq!(flat.len(), 3 * 2);
         for g in &groups {
             assert_eq!(g.len(), 10, "blobs should split evenly");
             // Every member of a cluster came from the same original blob.
-            let band = g[0].id / 100;
-            assert!(g.iter().all(|d| d.id / 100 == band), "cluster mixed blobs");
+            let band = g[0].id.as_uint().unwrap() / 100;
+            assert!(g.iter().all(|d| d.id.as_uint().unwrap() / 100 == band), "cluster mixed blobs");
         }
     }
 
     #[test]
     fn probe_finds_the_owning_cluster() {
         let docs = blobs();
-        let (flat, groups) = build(&docs, IvfParams { k: 3, iters: 20 }).unwrap();
+        let (flat, groups) = build(&docs, IvfParams { k: 3, iters: 20, metric: DistanceMetric::default() }).unwrap();
         let centroids = decode_centroids(&encode_centroids(&flat), 2).unwrap();
 
         // A query sitting on top of one blob must probe that blob's cluster first.
-        let hit = probe(&centroids, &[10.0, 0.0], 1)[0];
-        assert_eq!(groups[hit][0].id / 100, 0);
+        let hit = probe(&centroids, &[10.0, 0.0], 1, DistanceMetric::default())[0];
+        assert_eq!(groups[hit][0].id.as_uint().unwrap() / 100, 0);
     }
 
     #[test]
@@ -223,14 +259,14 @@ mod tests {
 
     #[test]
     fn build_rejects_ragged_dimensions() {
-        let docs = vec![Doc::new(1, vec![1.0, 2.0]), Doc::new(2, vec![1.0])];
+        let docs = vec![Doc::new(1u64, vec![1.0, 2.0]), Doc::new(2u64, vec![1.0])];
         assert!(build(&docs, IvfParams::for_docs(2)).is_err());
         assert!(build(&[], IvfParams::for_docs(0)).is_err());
     }
 
     #[test]
     fn recall_counts_overlap() {
-        let h = |id, score| Hit { id, score };
+        let h = |id: u64, score| Hit::new(id, score);
         let exact = vec![h(1, 1.0), h(2, 0.9), h(3, 0.8), h(4, 0.7)];
         assert_eq!(recall(&exact, &exact), 1.0);
         assert_eq!(recall(&exact, &exact[..2]), 0.5);
@@ -240,8 +276,8 @@ mod tests {
 
     #[test]
     fn k_larger_than_docs_is_clamped() {
-        let docs = vec![Doc::new(1, vec![1.0]), Doc::new(2, vec![2.0])];
-        let (_, groups) = build(&docs, IvfParams { k: 100, iters: 5 }).unwrap();
+        let docs = vec![Doc::new(1u64, vec![1.0]), Doc::new(2u64, vec![2.0])];
+        let (_, groups) = build(&docs, IvfParams { k: 100, iters: 5, metric: DistanceMetric::default() }).unwrap();
         assert!(groups.len() <= 2);
         assert_eq!(groups.iter().map(|g| g.len()).sum::<usize>(), 2, "lost a doc");
     }

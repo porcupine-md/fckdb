@@ -77,6 +77,12 @@ manifest         │ centroid index       │ probed clusters
  eventual)       │ (concurrent)         │
 ```
 
+A filtered query takes one of two paths, chosen by comparing what each would
+read. The exact path reads `candidates` documents; the cluster path reads roughly
+`docs × nprobe / clusters`. So the exact path wins precisely when the filter is
+more selective than the fraction of the index a probe would touch — self-tuning
+as `nprobe` changes, rather than a constant that fits one dataset size.
+
 Indexed candidates are overlaid with the WAL tail, so recent upserts and
 tombstones always win over what the index still believes.
 
@@ -162,6 +168,8 @@ backpressure with an error the caller can act on.
 
 ## HTTP API
 
+Two surfaces over one engine. `/v1` is native; `/v2` is turbopuffer-compatible.
+
 ```
 GET    /healthz
 GET    /metrics                                  Prometheus, no auth
@@ -174,6 +182,10 @@ POST   /v1/namespaces/{ns}/compact
 POST   /v1/namespaces/{ns}/warm                  pull the index into cache
 POST   /v1/namespaces/{ns}/gc
 POST   /v1/namespaces/{ns}/branch/{dest}         point-in-time copy
+
+POST   /v2/namespaces/{ns}                       turbopuffer-compatible write
+POST   /v2/namespaces/{ns}/query                 turbopuffer-compatible query
+GET    /v1/namespaces/{ns}/metadata              turbopuffer-compatible metadata
 ```
 
 Bearer token per tenant, compared in constant time against every configured
@@ -186,7 +198,8 @@ another's data.
 curl -s -X POST localhost:8080/v1/namespaces/docs/query \
   -H 'authorization: Bearer $TOKEN' -H 'content-type: application/json' \
   -d '{"vector":[1,0],"top_k":2,
-       "filter":{"eq":["lang","id"]},
+       "filter":["And",[["lang","Eq","id"],["rank","Gte",20]]],
+       "include_attributes":["lang","rank"],
        "consistency":{"mode":"eventual","max_age_ms":60000}}'
 ```
 
@@ -194,9 +207,12 @@ curl -s -X POST localhost:8080/v1/namespaces/docs/query \
 
 ```bash
 cargo run --release -- serve     # HTTP service
-cargo run --release -- e2e       # 15-stage end-to-end exercise
-cargo test                       # 62 tests
+cargo run --release -- e2e       # 17-stage end-to-end exercise
+cargo run --release -- bench     # benchmark, emits markdown
+cargo test                       # 227 tests
 ```
+
+Measured numbers, and what they mean, live in [BENCHMARK.md](BENCHMARK.md).
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
 no credentials and no network.
@@ -210,6 +226,7 @@ no credentials and no network.
 | `FCKDB_ADDR` | listen address, default `127.0.0.1:8080` |
 | `FCKDB_CACHE_PATH` / `FCKDB_CACHE_BYTES` | NVMe ring buffer; unset means no cache |
 | `FCKDB_PRICE_*` | override the R2 list prices in the cost model |
+| `FCKDB_EMBED_URL` / `_MODEL` / `_KEY` | OpenAI-compatible embeddings endpoint; unset means `Embed` returns 501 |
 | `FCKDB_DOCS` / `FCKDB_DIM` / `FCKDB_NPROBE` | e2e dataset shape |
 | `FCKDB_KEEP` | keep e2e objects instead of deleting them |
 
@@ -244,17 +261,100 @@ architecture*, not a drop-in replacement.
 | Write body | `upsert_rows`, `upsert_columns`, `patch_rows`, `patch_by_filter`, `deletes`, `delete_by_filter` | `upsert`, `delete` |
 | Query rank | `rank_by: ["vector","ANN",[…]]`; also kNN, BM25, SparseKNN, order-by-attr, `Embed` | `vector: […]`, cosine ANN only |
 | Result limit | `limit` | `top_k` |
-| Filters | `("And", (("ts","Gte",…),("public","Eq",true)))`; Gt/Lt/In/Glob/Regex | `{"eq":["k","v"]}`; Eq/Ne/And/Or, strings only |
-| Score | `$dist` — a **distance**, lower is better | `score` — a **similarity**, higher is better |
-| Attributes | typed (uint, bool, array, uuid, datetime) + schema, `include_attributes` | `string → string`, and **never returned** |
-| Aggregations | `aggregate_by`, group-by | none |
-| Multi-vector, sharding, CMEK | yes | no |
+| Filters | `("And", (("ts","Gte",…),("public","Eq",true)))`; Gt/Lt/In/Glob/Regex | ✅ **same tuple grammar**: Eq/NotEq/Gt/Gte/Lt/Lte/In/NotIn/Glob/IGlob/Contains/Regex + And/Or/Not |
+| Score | `$dist` — a **distance**, lower is better | ✅ `$dist` on `/v2` (native `/v1` keeps `score`, a similarity) |
+| Attributes | typed + schema, `include_attributes` | ✅ **typed** (bool, uint, int, f64, string, datetime, uuid, []string, []uint), inferred schema, `include_attributes` |
+| Document ids | uint / string / uuid | ✅ all three |
+| `distance_metric` | cosine, euclidean, … | ✅ cosine, euclidean-squared, dot product |
+| Partial update | `patch_rows`, `patch_columns` | ✅ `Record::Patch` — merge, with null removing an attribute |
+| Order by attribute | `rank_by: ["attr","desc"]` | ✅ same shape, `$dist` omitted |
+| Attribute index | inverted, per attribute | ✅ built by compaction; drives exact filtered search |
+| BM25 full-text | `rank_by: ["body","BM25","query"]`, `ContainsAllTokens`, `ContainsTokenSequence`, `Fuzzy` | ✅ all four, with stemming and phrase positions |
+| Sparse vectors | `{}f16` attributes, `SparseKNN` | ✅ inverted list per dimension |
+| Multi-query, hybrid | `queries` (≤16), `rerank_by: ["RRF"]` | ✅ both, separate results or fused |
+| Aggregations | `aggregate_by`, `group_by`, `ForEachUnique` | ✅ Count/Sum/Min/Max/Avg, grouped or not, composing with ranking |
+| Sharding | `sharding: {num_shards}`, ≤256 | ✅ fan-out and merge |
+| Native embedding | `["Embed", "text", {model}]`, schema `embed` | ✅ via an OpenAI-compatible endpoint |
+| CMEK, `compute_attributes`, `Highlight`, diversification | yes | no — unsupported features return **501** |
 
-Reaching the *common subset* (row upserts, deletes, ANN rank_by, simple filters,
-`limit`, `include_attributes`, the `$dist` sign flip) is a translation layer plus
-two real engine gaps: returning attributes at all, and typed attribute values for
-range filters. Everything past that — BM25, sparse vectors, aggregations,
-patches, filter-based writes — is new engine work, not adapter work.
+BM25 is in. The common subset now works: a client doing row or column upserts, deletes,
+patches, filter-based writes, ANN or kNN queries with typed filters and
+`include_attributes` can point at `/v2` unchanged. What remains is BM25, sparse
+vectors, aggregations, multi-query and sharding — each new engine work rather
+than adapter work, and each returning **501 Not Implemented** today rather than a
+plausible wrong answer.
+
+### Parity progress
+
+Work toward turbopuffer API parity lives on `feat/turbopuffer-parity`.
+
+**Done**
+
+- Typed attribute values (`value.rs`): bool, uint, int, f64, string, datetime,
+  uuid, `[]string`, `[]uint` — with a binary codec, JSON inference, and ordering
+  that returns *incomparable* rather than equal across mismatched types
+- turbopuffer's tuple filter grammar, all operators, `And`/`Or`/`Not` nesting
+- `include_attributes`: `true`, `false`, or a list
+- `Record::Patch` — partial update, applied identically by compaction and by the
+  query-time WAL overlay
+
+- **Namespace schema** in the manifest: attribute types inferred from the first
+  write that carries each value, then enforced. A null never declares a type.
+  Vector dimension and id type fixed the same way
+- **Document ids** as uint, string, or UUID, with coercion to the declared type
+- **`distance_metric`** per namespace (cosine, euclidean-squared, dot product),
+  honoured by centroid assignment as well as ranking — building with one geometry
+  and querying with another puts a document's neighbours in a cluster the query
+  never probes
+
+- **Column-oriented and filter-based writes**: `upsert_columns`,
+  `patch_columns`, `delete_by_filter`, `patch_by_filter`, with the documented
+  caps (5M / 50k) and `rows_remaining`
+- **The `/v2` compatibility surface** (`src/compat.rs`): `upsert_rows`,
+  `rank_by` ANN/kNN, `filters`, `limit.total`/`top_k`, object-shaped
+  `consistency`, flattened result rows with `$dist`, `rows_affected` counters,
+  client-declared `schema`, and `GET /v1/namespaces/{ns}/metadata`
+
+- **Inverted attribute indexes**, one object per attribute, built by compaction.
+  The prize is not speed: probing clusters and *then* filtering can return fewer
+  than `top_k` results — or none — when every surviving document lives in a
+  cluster the query never probed. A filter the index can bound is now scanned
+  exactly instead, so **filtered vector search stops losing recall**
+- **Order by attribute** (`rank_by: ["created_at","desc"]`), with missing values
+  last in both directions and ties broken by id so pages are stable
+
+- **BM25 full-text search** (`src/fts.rs`): tokenizer with stemming, stopwords,
+  ASCII folding and token-length limits; a **positional** inverted index per
+  attribute; textbook BM25 scoring; and the `ContainsAllTokens`,
+  `ContainsTokenSequence` (phrase) and `Fuzzy` filter operators
+
+- **Aggregations** (`src/aggregate.rs`): `Count`, `Sum`, `Min`, `Max`, `Avg`,
+  with `group_by` over several attributes and `ForEachUnique` to explode array
+  attributes into one group per element. Ranking and aggregating compose, so a
+  faceted result page is one round trip
+
+- **Sparse vectors** (`src/sparse.rs`): the `{}f16` attribute type, an inverted
+  list per dimension, and `SparseKNN` ranking by dot product over shared
+  dimensions
+- **Multi-query and RRF**: up to 16 sub-queries per request, reported separately
+  or fused by reciprocal rank fusion — which is what makes hybrid search work,
+  since a BM25 relevance score and a cosine distance live on incomparable scales
+  and only their *ranks* can be combined
+
+- **Sharding**: `num_shards` up to 256, fixed at the namespace's inaugural
+  write. Shards share the WAL so a write still commits once, but each indexes
+  only its own documents. Ranked queries fan out and merge; aggregations and
+  ordering gather instead, because a partial average cannot be combined from
+  finalized per-shard averages
+- **Native embedding** (`src/embed.rs`): `rank_by: [..., "ANN", ["Embed", "text"]]`
+  and schema-declared auto-embedding on write, through any OpenAI-compatible
+  `/v1/embeddings` endpoint
+
+Two traps to keep in mind while doing this. `$dist` is a distance and `score` is
+a similarity, so the conversion inverts ordering — that needs a test asserting
+the inversion, not just the field name. And a string that happens to look like a
+UUID stays a string until a schema says otherwise; inferring from content would
+make an attribute's type depend on which document you looked at first.
 
 ### Verify your backend first
 
@@ -276,8 +376,18 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Index rebuilt wholesale, O(iters·n·k·dim) | `index::build` | SPFresh LIRE incremental split/merge |
 | Full-rewrite compaction, needs live set in RAM | `Namespace::compact` | leveled/tiered compaction |
 | Write throughput = `MAX_BATCH_LEN` ÷ commit latency | `store` | raise the cap; ~257 docs/s observed |
-| Filters evaluated per candidate during the scan | `doc::Filter` | inverted attribute index |
-| Attribute values are strings only | `doc::Doc` | typed values for range filters |
+| Order-by scans candidates instead of walking the sorted index | `doc::order_by` | answer from `ids` + one index object, reading no vectors |
+| `ids_matching` falls back to a full scan whenever the WAL is non-empty | `Namespace::ids_matching` | index the tail, or resolve only WAL-touched ids |
+| Negations (`NotEq`, `NotIn`, …) are not answerable from the index | `attrindex::AttrIndex::select` | store the document universe per attribute |
+| A full-text query fetches the whole term index object | `fts::FtsIndex` | term dictionary with offsets at the tail, then range-request only the query's terms |
+| Stopword lists exist for English only | `fts::EN_STOPWORDS` | a data change, not a code change — the stemmer already switches by language |
+| BM25 scores the unindexed tail one document at a time | `Namespace::query` | index the tail incrementally |
+| Aggregations scan every matching document | `Namespace::query` | answer Count from the attribute index's posting lengths, Min/Max from its sorted ends |
+| Sparse weights are stored f32, not f16 | `value::Value::Sparse` | half-precision, when sparse namespaces get large enough for the size to matter |
+| Sub-queries in a multi-query run sequentially | `server::v2_query` | they are independent; run them concurrently |
+| Shard count cannot change after creation | `doc::Schema::set_shards` | copy into a new namespace, as turbopuffer does |
+| HTTP status is chosen by matching engine error text | `server::classify` | a typed error enum carrying its own kind |
+| Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |
 | Blocking `pread` on the async runtime | `cache::RingCache` | `spawn_blocking` or io_uring |
 | Static tokens, no rotation or scopes | `server::Auth` | real key management |
