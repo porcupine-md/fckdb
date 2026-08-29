@@ -599,6 +599,48 @@ Unconfigured, these return 501 naming the variable to set:
 { "error": "native embedding is not configured; set FCKDB_EMBED_URL to an OpenAI-compatible /v1/embeddings endpoint, or send a vector instead" }
 ```
 
+### A warning about cross-lingual search
+
+Measured against `text-embedding-3-small` on a corpus of six English and six
+Indonesian documents: **the model clusters by language more strongly than by
+topic** for short queries. The same question gets different answers depending on
+which language you ask it in.
+
+```
+"coral reefs turning white because the sea is too warm"
+  -> #11 How coral reefs bleach            ✅
+
+"terumbu karang yang memutih karena air laut menghangat"   (same question)
+  -> #5 Membuat sambal terasi              ❌ a sambal recipe
+     #4 Rahasia rendang yang empuk
+     #8 Menjaga pola tidur                 ← all three Indonesian, all unrelated
+     #11 How coral reefs bleach            ← the right answer, fourth
+```
+
+Across five Indonesian queries, 11 of 15 results were Indonesian documents against
+a chance baseline of about half.
+
+This is the model, not the engine: ranking and distances were verified against
+OpenAI's own embeddings computed independently, and agreed to 3.3e-4 — f32
+rounding on a 1536-dimension dot product.
+
+**Hybrid search does not fix it.** RRF combines ranks, so it can only help when at
+least one input has the answer somewhere. Here both are wrong:
+
+| approach | result |
+|---|---|
+| vector only, Indonesian query | ✗ not in top 3 |
+| BM25 only, Indonesian query | ✗ not in top 3 |
+| hybrid RRF | ✗ **still not in top 3** |
+| query with a few terms in the corpus language | ✅ first |
+| query translated | ✅ first |
+
+So if your corpus and your queries are in different languages, **translate the
+query** before embedding, or append a handful of corpus-language terms to it. A
+model with stronger cross-lingual alignment (`text-embedding-3-large`, or a
+multilingual-specific model) is the other option, and worth measuring on your own
+data rather than assuming.
+
 ---
 
 ## Operations

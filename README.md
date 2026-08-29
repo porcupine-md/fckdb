@@ -197,7 +197,7 @@ architecture*, not a drop-in replacement.
 | Multi-query, hybrid | `queries` (≤16), `rerank_by: ["RRF"]` | ✅ both, separate results or fused |
 | Aggregations | `aggregate_by`, `group_by`, `ForEachUnique` | ✅ Count/Sum/Min/Max/Avg, grouped or not, composing with ranking |
 | Sharding | `sharding: {num_shards}`, ≤256 | ✅ fan-out and merge |
-| Native embedding | `["Embed", "text", {model}]`, schema `embed` | ✅ via an OpenAI-compatible endpoint |
+| Native embedding | `["Embed", "text", {model}]`, schema `embed` | ✅ via an OpenAI-compatible endpoint, verified against OpenAI |
 | CMEK, `compute_attributes`, `Highlight`, diversification | yes | no — unsupported features return **501** |
 
 BM25 is in. The common subset now works: a client doing row or column upserts, deletes,
