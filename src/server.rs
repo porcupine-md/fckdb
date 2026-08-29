@@ -1804,6 +1804,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v2_indonesian_full_text() {
+        let state = test_state();
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpid",
+            Some(TOKEN_A),
+            Some(json!({
+                "upsert_rows": [
+                    { "id": 1, "vector": [1.0, 0.0], "isi": "buku yang ada di rak itu" },
+                    { "id": 2, "vector": [0.0, 1.0], "isi": "tulisan puisi untuk sekolah" },
+                    { "id": 3, "vector": [0.5, 0.5], "isi": "makanan pedas dari warung" },
+                ],
+                "schema": { "isi": { "type": "string", "full_text_search": {
+                    "tokenizer": { "language": "indonesian" }
+                }}}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let (status, _) =
+            call(&state, "POST", "/v1/namespaces/tpid/compact", Some(TOKEN_A), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The tokenizer choice round-trips through the schema.
+        let (_, md) = call(&state, "GET", "/v1/namespaces/tpid/metadata", Some(TOKEN_A), None).await;
+        assert_eq!(md["schema"]["isi"]["full_text_search"]["tokenizer"]["language"], "indonesian");
+
+        // Suffix stemming: "makanan" in the document is found by "makan".
+        let (status, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpid/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["isi", "BM25", "makan"], "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["rows"].as_array().unwrap().len(), 1, "{res}");
+        assert_eq!(res["rows"][0]["id"], 3);
+
+        // "tulis" finds "tulisan".
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpid/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["isi", "BM25", "tulis"], "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(res["rows"][0]["id"], 2, "{res}");
+
+        // Stopwords carry no signal, so a query of nothing but them matches
+        // nothing rather than everything.
+        let (_, res) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/tpid/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["isi", "BM25", "yang di untuk dari"], "top_k": 5 })),
+        )
+        .await;
+        assert!(res["rows"].as_array().unwrap().is_empty(), "stopwords matched documents: {res}");
+    }
+
+    #[tokio::test]
     async fn v2_full_text_filters() {
         let state = test_state();
         call(

@@ -17,13 +17,39 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// English stopwords.
-///
-/// ponytail: one language. `Tokenizer::language` already selects the stemmer, so
-/// adding lists for the others is a data change rather than a code change.
 const EN_STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is", "it",
     "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there", "these",
     "they", "this", "to", "was", "will", "with",
+];
+
+/// Indonesian stopwords.
+///
+/// Sorted, so the list stays readable and duplicates are obvious. Kept to the
+/// high-frequency core rather than the ~758-word Tala list: every stopword
+/// removed is a word that can never be searched for, and an aggressive list
+/// quietly makes phrases like "hak asasi" unfindable.
+///
+/// ponytail: two languages have lists. The dispatch is by `Language`, so adding
+/// a third is a data change rather than a code change.
+const ID_STOPWORDS: &[&str] = &[
+    "acap", "ada", "adalah", "adapun", "agar", "akan", "akibat", "aku", "amat", "anda",
+    "antara", "apa", "apabila", "apakah", "atas", "atau", "bagaimana", "bagi", "bahkan",
+    "bahwa", "banyak", "bawah", "beberapa", "begitu", "belum", "berapa", "berupa", "biasa",
+    "bila", "bisa", "boleh", "buat", "bukan", "cukup", "dahulu", "dalam", "dan", "dapat",
+    "dari", "daripada", "demi", "demikian", "dengan", "depan", "di", "dia", "dini", "dll",
+    "dsb", "dulu", "empat", "guna", "hal", "hampir", "hanya", "harus", "hingga", "ia", "ialah",
+    "ini", "itu", "jadi", "jika", "juga", "kalau", "kali", "kami", "kamu", "kan", "karena",
+    "kata", "ke", "kecuali", "kemudian", "kepada", "ketika", "kini", "kita", "lagi", "lain",
+    "lalu", "lama", "lebih", "maka", "makin", "mana", "masih", "maupun", "melalui", "memang",
+    "mengapa", "mereka", "merupakan", "meski", "mungkin", "namun", "nanti", "nya", "oleh",
+    "pada", "padahal", "paling", "para", "pula", "pun", "saat", "saja", "sama", "sambil",
+    "sampai", "sangat", "saya", "sebab", "sebagai", "sebelum", "sedang", "segera", "sehingga",
+    "sejak", "sekali", "sekarang", "selain", "selalu", "selama", "seluruh", "sementara",
+    "semua", "sendiri", "seorang", "sepanjang", "seperti", "serta", "setelah", "setiap",
+    "siapa", "sini", "situ", "suatu", "sudah", "supaya", "tanpa", "tapi", "telah", "tentang",
+    "terhadap", "termasuk", "tersebut", "tetapi", "tidak", "tuju", "untuk", "usai", "walau",
+    "walaupun", "yaitu", "yakni", "yang",
 ];
 
 fn default_max_token_length() -> usize {
@@ -92,9 +118,16 @@ pub enum Language {
 }
 
 impl Language {
-    fn algorithm(self) -> rust_stemmers::Algorithm {
+    /// The Snowball algorithm for this language, if one exists.
+    ///
+    /// `None` for Indonesian: Snowball has no Indonesian stemmer, and this used
+    /// to fall back to English — which does not merely fail to help, it actively
+    /// corrupts. English rules strip a trailing "s", so "kelas" becomes "kela"
+    /// and stops matching itself. Indonesian is stemmed by `stem_indonesian`
+    /// instead.
+    fn algorithm(self) -> Option<rust_stemmers::Algorithm> {
         use rust_stemmers::Algorithm as A;
-        match self {
+        Some(match self {
             Language::English => A::English,
             Language::French => A::French,
             Language::German => A::German,
@@ -106,11 +139,85 @@ impl Language {
             Language::Norwegian => A::Norwegian,
             Language::Danish => A::Danish,
             Language::Russian => A::Russian,
-            // Snowball has no Indonesian stemmer; English is a poor but harmless
-            // stand-in, and `stemming: false` is the honest setting for it.
-            Language::Indonesian => A::English,
+            Language::Indonesian => return None,
+        })
+    }
+
+    /// Words dropped before indexing. Empty for languages with no list, which is
+    /// the safe default: dropping nothing costs index size, dropping the wrong
+    /// words costs recall permanently.
+    pub fn stopwords(self) -> &'static [&'static str] {
+        match self {
+            Language::English => EN_STOPWORDS,
+            Language::Indonesian => ID_STOPWORDS,
+            _ => &[],
         }
     }
+}
+
+/// Minimum length a root may be reduced to by a derivational suffix.
+///
+/// Without it, "makan" loses its "-an" and becomes "mak", and "jalan" becomes
+/// "jal" — real roots destroyed by a rule meant for "makanan" and "berjalan".
+/// Four characters is the shortest common Indonesian root.
+const ID_MIN_ROOT: usize = 4;
+
+/// A conservative Indonesian stemmer: SUFFIXES ONLY.
+///
+/// Indonesian is heavily affixal, so "makanan", "rumahnya" and "pergilah" should
+/// all reduce to their roots, and this does that.
+///
+/// It deliberately does NOT strip prefixes, which is where rule-only Indonesian
+/// stemmers go wrong. The me-/pe- families assimilate the root's first letter,
+/// and undoing that is ambiguous without knowing the roots: "menulis" is
+/// "men"+"tulis" but "menari" is "me"+"nari", and both leave a vowel behind.
+/// Guessing produced "pbaca" from "membaca" here. The plain prefixes are no safer
+/// — "kepala" is not "ke"+"pala", and "sepatu" is not "se"+"patu" — so stripping
+/// them invents matches between unrelated words.
+///
+/// Under-stemming costs recall on some queries. Over-stemming returns documents
+/// that have nothing to do with the query, and the user cannot tell. Given a
+/// choice without a dictionary, this takes the first.
+///
+/// ponytail: full Nazief-Adriani, as Sastrawi implements it, resolves every case
+/// above by checking each candidate root against a ~30k word list. That
+/// dictionary is the upgrade, and it is the whole difference.
+fn stem_indonesian(token: &str) -> String {
+    let mut word = token.to_string();
+
+    // Particles and possessives are inflectional: removing them never changes
+    // which word this is.
+    for suffix in ["lah", "kah", "tah", "pun"] {
+        if let Some(stripped) = word.strip_suffix(suffix)
+            && stripped.chars().count() >= 3
+        {
+            word = stripped.to_string();
+            break;
+        }
+    }
+    for suffix in ["nya", "ku", "mu"] {
+        if let Some(stripped) = word.strip_suffix(suffix)
+            && stripped.chars().count() >= 3
+        {
+            word = stripped.to_string();
+            break;
+        }
+    }
+
+    // One derivational suffix, length-guarded.
+    //
+    // "-i" is deliberately absent. It is a real derivational suffix
+    // ("mendatangi"), but a great many Indonesian ROOTS end in i — pergi, hati,
+    // kali, bagi, isi, api, jari — so stripping it breaks far more words than it
+    // joins. "pergilah" became "perg" and stopped matching "pergi" at all.
+    for suffix in ["kan", "an"] {
+        if let Some(stripped) = word.strip_suffix(suffix)
+            && stripped.chars().count() >= ID_MIN_ROOT
+        {
+            return stripped.to_string();
+        }
+    }
+    word
 }
 
 impl Tokenizer {
@@ -122,7 +229,11 @@ impl Tokenizer {
     /// adjacent for phrase purposes, which is what a user searching "king of
     /// spain" expects when "of" is a stopword.
     pub fn tokenize(&self, text: &str) -> Vec<String> {
-        let stemmer = self.stemming.then(|| rust_stemmers::Stemmer::create(self.language.algorithm()));
+        let snowball = self
+            .stemming
+            .then(|| self.language.algorithm().map(rust_stemmers::Stemmer::create))
+            .flatten();
+        let stopwords = self.language.stopwords();
 
         text.split(|c: char| !c.is_alphanumeric())
             .filter(|s| !s.is_empty())
@@ -130,14 +241,18 @@ impl Tokenizer {
                 let mut token =
                     if self.case_sensitive { raw.to_string() } else { raw.to_lowercase() };
 
-                if self.remove_stopwords
-                    && matches!(self.language, Language::English)
-                    && EN_STOPWORDS.contains(&token.as_str())
-                {
+                // Stopwords are matched BEFORE stemming, against the word as
+                // written: the lists are written that way, and stemming "adalah"
+                // first would produce something no list contains.
+                if self.remove_stopwords && stopwords.contains(&token.as_str()) {
                     return None;
                 }
-                if let Some(s) = &stemmer {
-                    token = s.stem(&token).to_string();
+                if self.stemming {
+                    token = match &snowball {
+                        Some(s) => s.stem(&token).to_string(),
+                        None if self.language == Language::Indonesian => stem_indonesian(&token),
+                        None => token,
+                    };
                 }
                 if self.ascii_folding {
                     token = fold_ascii(&token);
@@ -564,6 +679,122 @@ mod tests {
         assert_eq!(t.tokenize("!!! ??? ..."), Vec::<String>::new());
         // Digits are tokens.
         assert_eq!(t.tokenize("version 2 beta"), vec!["version", "2", "beta"]);
+    }
+
+    fn indo() -> Tokenizer {
+        Tokenizer { language: Language::Indonesian, ..Default::default() }
+    }
+
+    #[test]
+    fn indonesian_stopwords_are_removed() {
+        let t = indo();
+        // "yang", "di", "dan", "ini" are stopwords; the content words survive.
+        assert_eq!(
+            t.tokenize("Buku yang ada di rak ini dan itu"),
+            vec!["buku", "rak"]
+        );
+        assert_eq!(t.tokenize("adalah yang untuk dengan"), Vec::<String>::new());
+
+        // English stopwords must NOT apply to Indonesian: "at" is a stopword in
+        // English but a fragment worth keeping here, and "an" is neither.
+        let en = Tokenizer::default();
+        assert!(en.tokenize("the fox").len() == 1);
+        assert_eq!(t.tokenize("the fox"), vec!["the", "fox"]);
+    }
+
+    #[test]
+    fn indonesian_stopword_list_is_sorted_and_unique() {
+        // Sorted so the list stays readable and a duplicate is obvious.
+        let mut sorted = ID_STOPWORDS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ID_STOPWORDS, "the list is not in sorted order");
+        let unique: BTreeSet<&&str> = ID_STOPWORDS.iter().collect();
+        assert_eq!(unique.len(), ID_STOPWORDS.len(), "the list has duplicates");
+        // Words a search must still be able to find.
+        for keep in ["hak", "asasi", "negara", "orang", "kerja"] {
+            assert!(!ID_STOPWORDS.contains(&keep), "{keep} would become unsearchable");
+        }
+    }
+
+    #[test]
+    fn indonesian_suffixes_reduce_to_the_root() {
+        for (word, root) in [
+            ("bacaan", "baca"),
+            ("makanan", "makan"),
+            ("tulisan", "tulis"),
+            ("kerjakan", "kerja"),
+            ("rumahnya", "rumah"),
+            ("bukumu", "buku"),
+            ("bukuku", "buku"),
+            ("pergilah", "pergi"),
+            ("apakah", "apa"),
+            ("kepalanya", "kepala"),
+            ("bacalah", "baca"),
+            ("mobilnya", "mobil"),
+        ] {
+            assert_eq!(stem_indonesian(word), root, "stemming {word}");
+        }
+    }
+
+    #[test]
+    fn indonesian_stemming_does_not_destroy_roots() {
+        // The failure mode of rule-only stemming. "makan" is a root, not
+        // "mak"+"an"; "jalan" is not "jal"+"an". The length guard stops a rule
+        // meant for "makanan" from eating the root itself.
+        for word in ["makan", "jalan", "bulan", "tahun", "ikan", "hujan"] {
+            assert_eq!(stem_indonesian(word), word, "{word} was over-stemmed");
+        }
+        // Roots ending in "i" are why the "-i" suffix rule does not exist.
+        for word in ["pergi", "hati", "kali", "bagi", "isi", "api", "jari", "budi"] {
+            assert_eq!(stem_indonesian(word), word, "{word} lost a letter it needs");
+        }
+        // Prefixes are left alone on purpose: "kepala" is not "ke"+"pala" and
+        // "sepatu" is not "se"+"patu". Stripping them would invent matches
+        // between unrelated words, which is worse than missing some.
+        for word in ["kepala", "sepatu", "dinding", "menari", "membaca", "berlari"] {
+            assert_eq!(stem_indonesian(word), word, "{word} lost a prefix it should keep");
+        }
+    }
+
+    #[test]
+    fn indonesian_is_not_stemmed_with_english_rules() {
+        // The bug this replaced: Snowball has no Indonesian stemmer, and falling
+        // back to English strips a trailing "s", so "kelas" stopped matching
+        // itself.
+        let t = indo();
+        assert_eq!(t.tokenize("kelas"), vec!["kelas"]);
+        assert_eq!(t.tokenize("bus"), vec!["bus"]);
+        // While English still stems as English.
+        assert_eq!(Tokenizer::default().tokenize("classes"), vec!["class"]);
+    }
+
+    #[test]
+    fn indonesian_search_finds_inflections() {
+        let docs = vec![
+            (0u32, "saya sedang baca buku itu"),
+            (1, "tulisan puisi di sekolah"),
+            (2, "dia kirim suratku yang panjang"),
+        ];
+        let index = FtsIndex::build(
+            docs.into_iter(),
+            3,
+            &FtsConfig { tokenizer: indo(), ..Default::default() },
+        );
+        // A suffixed query matches the bare root, which is what suffix
+        // stemming buys.
+        assert_eq!(index.all_tokens("bukunya"), BTreeSet::from([0]), "bukunya did not match buku");
+        assert_eq!(index.all_tokens("suratku"), BTreeSet::from([2]));
+        // And the root matches the suffixed form in the document.
+        assert_eq!(index.all_tokens("tulis"), BTreeSet::from([1]), "tulis did not match tulisan");
+    }
+
+    #[test]
+    fn a_language_without_a_list_drops_nothing() {
+        // Dropping nothing costs index size; dropping the wrong words costs
+        // recall permanently, so no list means no removal.
+        assert!(Language::French.stopwords().is_empty());
+        let t = Tokenizer { language: Language::French, stemming: false, ..Default::default() };
+        assert_eq!(t.tokenize("le chat et la souris").len(), 5);
     }
 
     #[test]

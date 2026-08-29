@@ -1,11 +1,23 @@
 # fckdb
 
 A vector + attribute search engine with **object storage as the only source of
-truth**. No consensus layer, no replication, no stateful nodes. Built to test
-whether turbopuffer's architecture holds up when you build it yourself — with
-every claim measured on real Cloudflare R2 rather than taken from a blog post.
+truth**. No consensus layer, and nothing durable outside the bucket — durability
+is the object store's own replication, not a layer of ours. Built to test whether
+turbopuffer's architecture holds up when you build it yourself, with **every
+performance number here measured on real Cloudflare R2** rather than taken from a
+blog post. (Figures attributed to turbopuffer are quoted from their
+documentation; the architectural arguments are reasoned, not benchmarked.)
 
-Nodes hold nothing but cache. Losing one costs latency, never data.
+Nodes hold nothing but cache and in-flight requests. **Losing one costs latency,
+never acknowledged data** — a write is acknowledged only after its commit
+returns, so a crash mid-flight fails the request rather than losing a write the
+caller believes succeeded. Cached bytes are checksummed, so a failing cache disk
+costs a refetch rather than a wrong answer.
+
+One caveat worth stating plainly: the single-committer-per-namespace invariant is
+**process-local**. Two server processes writing the same namespace stay correct —
+CAS is what enforces that — but they contend on the manifest and lose the batching
+that makes writes cheap. See [ARCHITECTURE.md](ARCHITECTURE.md#running-more-than-one-node).
 
 ## The one idea
 
@@ -25,66 +37,6 @@ property buys three things for free:
 - the read cache needs **no invalidation logic**
 - a failed CAS leaves **garbage, never corruption**
 - garbage collection is a **set difference**
-
-## Layout
-
-```
-{prefix}/manifest              commit point. CAS here. The ONLY mutable object.
-{prefix}/wal/{seq}-{uuid}.bin  framed Records, uncompacted
-{prefix}/data/{uuid}.bin       framed Records, compacted segment
-{prefix}/data/{uuid}.cen       centroid blob
-{prefix}/data/{uuid}.clu       framed Records, one IVF cluster
-```
-
-WAL entries, segments and cluster objects are all just framed `Record`s. One
-codec, one place for bugs.
-
-The manifest records the **size and record count of every object inline**, so
-backpressure, billing, and the query planner are all answerable from one small
-GET — no LIST, no data fetch.
-
-## Write path
-
-```
-mem buffer ──group commit (no timer)──▶ PUT wal/xxx.bin ──▶ CAS manifest
-                                        └─ orphan if the CAS loses
-```
-
-Two pointers, not one:
-
-- **CAS commit point** — advances via compare-and-swap. Defines durability.
-- **index cursor** — advances asynchronously. Defines speed.
-
-Data between them is durable but unindexed, and still searchable by exhaustive
-scan. That is how strong consistency is delivered without waiting for indexing.
-
-Group commit has **no timer**. The committer blocks for one request, drains
-whatever else is queued, and commits the lot. While a commit is in flight,
-arrivals pile up and ride the next one — so batch size self-tunes to the
-backend's latency with nothing to configure.
-
-The first CAS attempt uses the *remembered* manifest version, skipping the read
-entirely. With one committer that guess is right essentially always, so a commit
-costs **two requests, not three**. A wrong guess is caught by the CAS.
-
-## Query path
-
-```
-Roundtrip 1      │ Roundtrip 2          │ Roundtrip 3
-─────────────────┼──────────────────────┼──────────────
-manifest         │ centroid index       │ probed clusters
-(skipped under   │ unindexed WAL tail   │
- eventual)       │ (concurrent)         │
-```
-
-A filtered query takes one of two paths, chosen by comparing what each would
-read. The exact path reads `candidates` documents; the cluster path reads roughly
-`docs × nprobe / clusters`. So the exact path wins precisely when the filter is
-more selective than the fraction of the index a probe would touch — self-tuning
-as `nprobe` changes, rather than a constant that fits one dataset size.
-
-Indexed candidates are overlaid with the WAL tail, so recent upserts and
-tombstones always win over what the index still believes.
 
 ## Measured on Cloudflare R2
 
@@ -121,50 +73,17 @@ is far away.
 **4. Compaction is O(n) and rebuilds the index wholesale.** 60 s at 20k docs, so
 minutes at a million. This is the honest boundary of the index work below.
 
-## What the index is, precisely
+## How it works
 
-**IVF-Flat, not SPFresh.** It has SPFresh's *shape* — centroid-based, so a cold
-query is one small centroid fetch plus one parallel burst of posting-list
-fetches, which is why it beats HNSW and DiskANN on object storage (HNSW needs
-the whole graph resident, defeating the point, and its write amplification
-multiplies request cost).
+The short version: a compare-and-swap on one manifest object replaces the
+consensus layer, which works because a namespace has a single writer. Everything
+except that manifest is immutable and uniquely named, so the cache needs no
+invalidation, a failed CAS leaves garbage rather than corruption, and GC is a set
+difference.
 
-What it lacks is SPFresh's **LIRE protocol**: incremental cluster split/merge
-that holds recall under continuous updates. Here the index is rebuilt by
-compaction. That is result 4 above, and it is the largest single gap between this
-and turbopuffer.
-
-**Recall of 100% is on synthetic clustered data**, which is the easy case. Real
-embeddings are messier. The harness is `index::recall` — point it at your own
-vectors before believing that number.
-
-## Consistency
-
-| Mode | Cost | Guarantee |
-|---|---|---|
-| `strong` (default) | one manifest GET per query | sees every committed write, or **errors** |
-| `eventual` | zero GETs while the snapshot is fresh | may lag; reports `consistent: false` |
-
-Strong consistency **refuses rather than lies**. If the unindexed tail exceeds
-the 128 MiB scan cap, a strong query returns 503 instead of silently answering
-from part of the data. Eventual truncates the tail — always keeping a *prefix*,
-never a subset, since WAL entries are ordered mutations and dropping from the
-middle would resurrect deleted documents.
-
-A committed write is immediately visible to eventual reads on the same node,
-because the committer remembers the manifest it just wrote.
-
-## Backpressure
-
-Writes are refused with **429 + Retry-After** at 64 MiB of unindexed tail —
-half the query scan cap — so the point where consistent queries become
-impossible is never reached in normal operation. Compaction is triggered
-automatically on rejection, and a background sweeper compacts at 8 MiB or 32 WAL
-entries, whichever comes first.
-
-turbopuffer's documented behaviour past its cliff is that writes stop being
-visible while the API keeps returning success. Refusing loudly is the same
-backpressure with an error the caller can act on.
+**[ARCHITECTURE.md](ARCHITECTURE.md)** covers the write path and its two pointers,
+the query planner's two filtered paths, consistency modes, sharding, durability,
+garbage collection, backpressure, and every known ceiling.
 
 ## HTTP API
 
@@ -212,7 +131,8 @@ cargo run --release -- bench     # benchmark, emits markdown
 cargo test                       # 227 tests
 ```
 
-Measured numbers, and what they mean, live in [BENCHMARK.md](BENCHMARK.md).
+How it works, in depth: [ARCHITECTURE.md](ARCHITECTURE.md).
+Measured numbers, and what they mean: [BENCHMARK.md](BENCHMARK.md).
 
 With no `FCKDB_BUCKET`, everything runs against an in-memory store — tests need
 no credentials and no network.
@@ -390,6 +310,7 @@ Each is marked with a `ponytail:` comment at the code that owns it.
 | Glob is `*`/`?` only, not full globset (`**`, `{a,b}`, ranges) | `doc::glob_to_regex` | the `globset` crate |
 | Branch copies every object, O(bytes) | `Namespace::branch` | refcounting, at the cost of cross-namespace GC |
 | Blocking `pread` on the async runtime | `cache::RingCache` | `spawn_blocking` or io_uring |
+| Indonesian stemming is suffix-only; prefixes need a root dictionary | `fts::stem_indonesian` | the Sastrawi/Nazief-Adriani word list |
 | Static tokens, no rotation or scopes | `server::Auth` | real key management |
 | Single region, no replication beyond the bucket's own | — | — |
 
