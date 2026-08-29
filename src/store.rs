@@ -1788,16 +1788,6 @@ fn push_hit(
     }
 }
 
-/// Read the WAL entries a query is allowed to scan.
-async fn wal_records_for_overlay(
-    entries: &[WalEntry],
-    ns: &Namespace,
-    _m: &Manifest,
-) -> Result<Vec<Record>> {
-    let paths: Vec<Path> = entries.iter().map(|e| ns.wal_path(&e.name)).collect();
-    ns.read_records_parallel(paths).await
-}
-
 /// Apply one record to a live set. The single definition of mutation semantics,
 /// shared by compaction and by the query-time WAL overlay — two copies of this
 /// would eventually disagree about what a patch means.
