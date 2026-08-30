@@ -474,7 +474,10 @@ impl V2Query {
         if let Some(enc) = &self.vector_encoding
             && enc != "float"
         {
-            bail!("vector_encoding {enc:?} is not implemented; only \"float\" is supported");
+            return Err(crate::error::kinded(
+                crate::error::Kind::Unimplemented,
+                format!("vector_encoding {enc:?} is not implemented; only \"float\" is supported"),
+            ));
         }
 
         if !self.group_by.is_empty() && self.aggregate_by.is_none() {
@@ -535,7 +538,12 @@ impl V2Query {
                 sparse = Some(crate::wire::SparseSearch { attribute, vector });
                 (vec![], false, None, None)
             }
-            RankBy::Unsupported(f) => bail!("rank_by function {f:?} is not implemented"),
+            RankBy::Unsupported(f) => {
+                return Err(crate::error::kinded(
+                    crate::error::Kind::Unimplemented,
+                    format!("rank_by function {f:?} is not implemented"),
+                ));
+            }
         };
 
         // top_k is documented as an alias for limit.total; if both arrive, they

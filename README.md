@@ -151,6 +151,7 @@ no credentials and no network.
 | `FCKDB_PRICE_*` | override the R2 list prices in the cost model |
 | `FCKDB_EMBED_URL` / `_MODEL` / `_KEY` | OpenAI-compatible embeddings endpoint; unset means `Embed` returns 501 |
 | `FCKDB_DOCS` / `FCKDB_DIM` / `FCKDB_NPROBE` | e2e dataset shape |
+| `FCKDB_RESIDENT_TTL_SECS` | drop a namespace handle after this many idle seconds, default 600. `0` never drops one |
 | `FCKDB_KEEP` | keep e2e objects instead of deleting them |
 
 ## Backend compatibility

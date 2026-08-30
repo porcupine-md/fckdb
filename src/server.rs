@@ -41,6 +41,7 @@ use axum::{Extension, Json, Router};
 use object_store::ObjectStore;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -70,6 +71,40 @@ const GC_SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 /// destroys a write that is about to succeed. Commits take about a second on a
 /// distant bucket, so an hour is a wide margin on purpose.
 const GC_GRACE: Duration = Duration::from_secs(3600);
+
+/// How long a namespace may sit untouched before its handle is dropped.
+///
+/// Nothing durable lives in a resident handle: a cached manifest, a channel, and
+/// an idle committer task. But nothing evicted them either, so a process that
+/// served one request each for a hundred thousand namespaces held all hundred
+/// thousand until it restarted. Ten minutes is long enough that an active
+/// namespace is never evicted between requests, and short enough that a sweep
+/// through a tenant list does not accumulate.
+///
+/// How many namespaces a process sees is a property of the deployment and not
+/// of this code, so `FCKDB_RESIDENT_TTL_SECS` overrides it. Zero disables
+/// eviction, which is what the behaviour was before this existed.
+const RESIDENT_IDLE_TTL: Duration = Duration::from_secs(600);
+
+fn resident_idle_ttl() -> Option<Duration> {
+    match std::env::var("FCKDB_RESIDENT_TTL_SECS").ok().filter(|v| !v.is_empty()) {
+        None => Some(RESIDENT_IDLE_TTL),
+        Some(v) => match v.parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "FCKDB_RESIDENT_TTL_SECS is not a number of seconds; using the default"
+                );
+                Some(RESIDENT_IDLE_TTL)
+            }
+        },
+    }
+}
+
+/// How often to look for them. Eviction is cheap and never urgent.
+const EVICT_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------- auth
 
@@ -162,6 +197,11 @@ fn valid_namespace(name: &str) -> bool {
 struct Resident {
     ns: Arc<Namespace>,
     commit: Arc<GroupCommit>,
+    /// Milliseconds since process start, at the last request that wanted it.
+    ///
+    /// A coarse clock is enough for a ten-minute idle threshold, and an atomic
+    /// keeps the read path off the eviction bookkeeping.
+    last_used: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -217,8 +257,10 @@ impl AppState {
     /// concurrent first-requests cannot produce two committers.
     fn resident(&self, org: &str, name: &str) -> Arc<Resident> {
         let key = Self::key(org, name);
+        let now = self.uptime_ms();
         let mut map = self.resident.lock().unwrap();
         if let Some(found) = map.get(&key) {
+            found.last_used.store(now, Ordering::Relaxed);
             return found.clone();
         }
         let mut ns = Namespace::new(self.store.clone(), key.clone())
@@ -227,7 +269,11 @@ impl AppState {
             ns = ns.with_cache(cache.clone());
         }
         let ns = Arc::new(ns);
-        let handle = Arc::new(Resident { commit: Arc::new(GroupCommit::new(ns.clone())), ns });
+        let handle = Arc::new(Resident {
+            commit: Arc::new(GroupCommit::new(ns.clone())),
+            ns,
+            last_used: AtomicU64::new(now),
+        });
         map.insert(key, handle.clone());
         handle
     }
@@ -238,6 +284,34 @@ impl AppState {
 
     fn forget(&self, org: &str, name: &str) {
         self.resident.lock().unwrap().remove(&Self::key(org, name));
+    }
+
+    fn uptime_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Drop handles nobody has wanted for a while. Returns how many went.
+    ///
+    /// Dropping the handle drops its `GroupCommit`, which holds the only sender
+    /// into the committer; the committer's `recv()` then returns `None` and the
+    /// task ends. Shutdown needs no signal of its own.
+    ///
+    /// The `strong_count` test is what keeps the one-committer-per-namespace
+    /// invariant. A handle still held by an in-flight request must not leave the
+    /// map: the next request would build a second committer for a namespace that
+    /// already has one, and both would write. Since every way to obtain a handle
+    /// goes through this same lock, a count of one under it means nobody else has
+    /// one and nobody can get one until we are done.
+    fn evict_idle(&self, ttl: Duration) -> usize {
+        let now = self.uptime_ms();
+        let ttl_ms = ttl.as_millis() as u64;
+        let mut map = self.resident.lock().unwrap();
+        let before = map.len();
+        map.retain(|_, h| {
+            let idle = now.saturating_sub(h.last_used.load(Ordering::Relaxed));
+            idle < ttl_ms || Arc::strong_count(h) > 1
+        });
+        before - map.len()
     }
 }
 
@@ -271,6 +345,15 @@ impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
         AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
     }
+}
+
+/// Whether a 5xx is something an operator should be woken for.
+///
+/// 501 means this build does not do that and 503 means not right now — both are
+/// answers to the caller, and neither becomes true or false because of anything
+/// happening inside the process. Only the rest are incidents.
+fn is_incident(status: StatusCode) -> bool {
+    !matches!(status, StatusCode::NOT_IMPLEMENTED | StatusCode::SERVICE_UNAVAILABLE)
 }
 
 fn bad(msg: impl Into<String>) -> AppError {
@@ -356,18 +439,7 @@ async fn write(
         .await
         // A schema conflict is the caller's mistake, not a server fault: they
         // sent a type that disagrees with what the namespace already holds.
-        .map_err(|e| {
-            let msg = format!("{e:#}");
-            if msg.contains("declared")
-                || msg.contains("dimensions")
-                || msg.contains("distance_metric")
-                || msg.contains("cannot interpret")
-            {
-                AppError(StatusCode::BAD_REQUEST, msg)
-            } else {
-                AppError(StatusCode::INTERNAL_SERVER_ERROR, msg)
-            }
-        })?;
+        .map_err(classify)?;
 
     Ok(Json(WriteResponse {
         seq,
@@ -516,16 +588,7 @@ async fn query(
     let handle = state.resident(&org, &name);
     match handle.ns.query(&req).await {
         Ok(res) => Ok(Json(res).into_response()),
-        Err(e) => {
-            // The one expected failure: a strongly consistent answer is
-            // temporarily impossible. That is 503 with a retry, not 500.
-            let msg = format!("{e:#}");
-            if msg.contains("scan cap") {
-                Err(AppError(StatusCode::SERVICE_UNAVAILABLE, msg))
-            } else {
-                Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, msg))
-            }
-        }
+        Err(e) => Err(classify(e)),
     }
 }
 
@@ -592,16 +655,7 @@ async fn branch(
     // Branching stays inside the caller's org. A destination is a namespace name,
     // never a path.
     let dest_prefix = AppState::key(&org, &dest);
-    let objects = state.resident(&org, &name).ns.branch(&dest_prefix).await.map_err(|e| {
-        let msg = format!("{e:#}");
-        // "Destination exists" is the caller's problem to resolve, and they need
-        // to tell it apart from a server fault.
-        if msg.contains("already exists") {
-            AppError(StatusCode::CONFLICT, msg)
-        } else {
-            AppError(StatusCode::INTERNAL_SERVER_ERROR, msg)
-        }
-    })?;
+    let objects = state.resident(&org, &name).ns.branch(&dest_prefix).await.map_err(classify)?;
 
     #[derive(Serialize)]
     struct Body {
@@ -657,56 +711,25 @@ async fn list_namespaces(
 
 // ---------------------------------------------------------------- /v2 compat
 
-/// Map a request-translation failure to a status.
+/// Map an engine error to the right status.
 ///
-/// Every error from `into_native` describes something wrong with the request, so
-/// none of them can be a 500. Keyword-matching those against a list of phrases —
-/// as `classify` must do for engine errors — would silently turn each new
-/// validation message into an internal server error until someone noticed.
-fn classify_request(e: anyhow::Error) -> AppError {
-    let msg = format!("{e:#}");
-    if msg.contains("not implemented") {
-        AppError(StatusCode::NOT_IMPLEMENTED, msg)
-    } else {
-        AppError(StatusCode::BAD_REQUEST, msg)
-    }
-}
-
-/// Map an engine error to the right status. Shared by both surfaces so a client
-/// mistake never reads as a server fault on one and not the other.
+/// This used to match on message text: sixteen phrases, and a new validation
+/// message defaulted to 500 until somebody added its wording to the list. The
+/// kind now travels with the error — see [`crate::error`] — so the mapping is
+/// total and rewording a `bail!` cannot change a status.
 fn classify(e: anyhow::Error) -> AppError {
-    let msg = format!("{e:#}");
-    // ponytail: matching on message text. Fragile in exactly the way it looks —
-    // a new engine error defaults to 500 until someone adds its phrase here, and
-    // this list has already had to grow twice. The fix is a typed error enum in
-    // the engine that carries its own kind; worth doing when the list next grows.
-    let client = [
-        "declared",
-        "needs a numeric",
-        "not enabled for full-text",
-        "is not a sparse vector",
-        "num_shards",
-        "has not been compacted",
-        "dimensions",
-        "distance_metric",
-        "cannot interpret",
-        "cannot be changed",
-        "is not a",
-        "no vector",
-        "not implemented",
-        "disagree",
-        "must be",
-        "requires",
-    ];
-    if msg.contains("scan cap") {
-        AppError(StatusCode::SERVICE_UNAVAILABLE, msg)
-    } else if msg.contains("not implemented") {
-        AppError(StatusCode::NOT_IMPLEMENTED, msg)
-    } else if client.iter().any(|c| msg.contains(c)) {
-        AppError(StatusCode::BAD_REQUEST, msg)
-    } else {
-        AppError(StatusCode::INTERNAL_SERVER_ERROR, msg)
-    }
+    let status = match crate::error::kind_of(&e) {
+        Some(crate::error::Kind::Unimplemented) => StatusCode::NOT_IMPLEMENTED,
+        Some(crate::error::Kind::Unavailable) => StatusCode::SERVICE_UNAVAILABLE,
+        Some(crate::error::Kind::Conflict) => StatusCode::CONFLICT,
+        Some(crate::error::Kind::Upstream) => StatusCode::BAD_GATEWAY,
+        Some(crate::error::Kind::Internal) => StatusCode::INTERNAL_SERVER_ERROR,
+        // Untagged: a fault carries the type that produced it, anything else is
+        // the caller describing a request this namespace cannot answer.
+        None if crate::error::is_fault(&e) => StatusCode::INTERNAL_SERVER_ERROR,
+        None => StatusCode::BAD_REQUEST,
+    };
+    AppError(status, format!("{e:#}"))
 }
 
 async fn v2_write(
@@ -751,7 +774,7 @@ async fn v2_write(
         let texts: Vec<String> = pending.iter().map(|(_, t)| t.clone()).collect();
         let vectors = crate::embed::embed_many(state.embedder.as_ref(), &texts, model.as_deref())
             .await
-            .map_err(classify_embed)?;
+            .map_err(classify)?;
         body.attach_vectors(
             pending.iter().map(|(i, _)| *i).zip(vectors).collect(),
         );
@@ -765,7 +788,7 @@ async fn v2_write(
     let asked_delete = !body.deletes.is_empty() || body.delete_by_filter.is_some();
     let asked_filter = body.delete_by_filter.is_some() || body.patch_by_filter.is_some();
 
-    let native = body.into_native().map_err(classify_request)?;
+    let native = body.into_native().map_err(classify)?;
     let plan = assemble(&handle.ns, native).await?;
     let affected = plan.upserted + plan.patched + plan.deleted;
 
@@ -795,7 +818,7 @@ async fn v2_query(
     // reports them separately or fuses them into one list.
     let consistency = body.consistency;
     if let Some((subqueries, rerank, limit)) =
-        body.clone().split_multi().map_err(classify_request)?
+        body.clone().split_multi().map_err(classify)?
     {
         // Every sub-query that embeds is resolved in ONE call to the endpoint.
         // A hybrid query typically embeds the same text it also searches for
@@ -815,7 +838,7 @@ async fn v2_query(
             let vectors =
                 crate::embed::embed_many(state.embedder.as_ref(), &texts, model.as_deref())
                     .await
-                    .map_err(classify_embed)?;
+                    .map_err(classify)?;
             for ((index, _, _), vector) in pending.into_iter().zip(vectors) {
                 subqueries[index].resolve_embed(vector);
             }
@@ -855,7 +878,7 @@ async fn v2_query(
     if let Some((text, model)) = body.pending_embed() {
         let vector = crate::embed::embed_one(state.embedder.as_ref(), &text, model.as_deref())
             .await
-            .map_err(classify_embed)?;
+            .map_err(classify)?;
         body.resolve_embed(vector);
     }
 
@@ -866,17 +889,7 @@ async fn v2_query(
     Ok(Json(response).into_response())
 }
 
-/// An embedding failure is somebody else's service failing, which is neither the
-/// caller's fault nor this server's: 501 when unconfigured, 502 when the
-/// endpoint itself refused.
-fn classify_embed(e: anyhow::Error) -> AppError {
-    let msg = format!("{e:#}");
-    if msg.contains("not configured") {
-        AppError(StatusCode::NOT_IMPLEMENTED, msg)
-    } else {
-        AppError(StatusCode::BAD_GATEWAY, msg)
-    }
-}
+
 
 /// Execute one compatibility query and shape its response.
 ///
@@ -887,7 +900,7 @@ async fn run_v2_query(
     body: V2Query,
     metric: crate::doc::DistanceMetric,
 ) -> ApiResult<V2QueryResponse> {
-    let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify_request)?;
+    let (req, exact) = body.into_native(DEFAULT_NPROBE).map_err(classify)?;
     let aggregating = req.aggregate_by.is_some();
     let grouped = !req.group_by.is_empty();
     let ranking = !req.vector.is_empty()
@@ -1085,6 +1098,29 @@ pub fn spawn_collector(state: AppState) {
     });
 }
 
+/// Drop namespace handles nobody has asked for lately.
+///
+/// The registry only ever grew: `forget` runs on DELETE and nowhere else, so a
+/// handle created to serve one request outlived it by the life of the process.
+pub fn spawn_evictor(state: AppState) {
+    let Some(ttl) = resident_idle_ttl() else {
+        tracing::info!("namespace handle eviction is disabled");
+        return;
+    };
+    // A sweep is cheap and never urgent, but sweeping less often than the TTL
+    // would make the TTL a lie.
+    let every = EVICT_SWEEP_INTERVAL.min(ttl);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let n = state.evict_idle(ttl);
+            if n > 0 {
+                tracing::debug!(evicted = n, "dropped idle namespace handles");
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------- router
 
 pub fn router(state: AppState) -> Router {
@@ -1110,13 +1146,33 @@ pub fn router(state: AppState) -> Router {
         // A 512 MB cap mirrors turbopuffer's upsert batch limit and keeps one
         // request from exhausting memory.
         .layer(DefaultBodyLimit::max(512 << 20))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // TraceLayer counts every 5xx as a failure and logs it at ERROR. Two of
+        // ours are not failures: 501 is "this build does not do that" and 503 is
+        // "not right now, retry". Both are answers. Logging them beside real
+        // faults is the same mistake `AppError` already avoids — and `AppError`
+        // has by this point logged each at the level it deserves, so passing
+        // them over here loses nothing.
+        .layer(tower_http::trace::TraceLayer::new_for_http().on_failure(
+            |class: tower_http::classify::ServerErrorsFailureClass,
+             latency: Duration,
+             _: &tracing::Span| {
+                use tower_http::classify::ServerErrorsFailureClass as Class;
+                match class {
+                    Class::StatusCode(s) if !is_incident(s) => {}
+                    Class::StatusCode(s) => {
+                        tracing::error!(status = %s, ?latency, "response failed")
+                    }
+                    Class::Error(e) => tracing::error!(error = %e, ?latency, "response failed"),
+                }
+            },
+        ))
         .with_state(state)
 }
 
 pub async fn serve(state: AppState, addr: &str) -> Result<()> {
     spawn_compactor(state.clone());
     spawn_collector(state.clone());
+    spawn_evictor(state.clone());
     let listener = tokio::net::TcpListener::bind(addr).await?;
     if state.auth.disabled() {
         tracing::warn!(
@@ -2330,6 +2386,236 @@ mod tests {
         )
         .await;
         assert!(status.is_client_error(), "a bad sub-query was tolerated: {status}");
+    }
+
+    #[test]
+    fn refusals_are_not_incidents_but_faults_are() {
+        // TraceLayer counts every 5xx as a failure. Two of ours are answers, and
+        // logging them beside real faults is what teaches an operator to ignore
+        // the level that matters.
+        for s in [StatusCode::NOT_IMPLEMENTED, StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(!is_incident(s), "{s} is a refusal, not an incident");
+        }
+        for s in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(is_incident(s), "{s} is a real fault and must still be logged");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_sized_query_vector_is_a_400_not_a_500() {
+        // It used to be neither: uncompacted it was a 200 with a ranking computed
+        // from a prefix, and compacted it was a 500, because the message did not
+        // happen to contain a word on the keyword list.
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/dim",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [
+                { "id": 1, "vector": [1.0, 0.0, 0.0] },
+                { "id": 2, "vector": [0.0, 1.0, 0.0] }
+            ]})),
+        )
+        .await;
+
+        for compacted in [false, true] {
+            if compacted {
+                call(&state, "POST", "/v1/namespaces/dim/compact", Some(TOKEN_A), None).await;
+            }
+            for wrong in [vec![1.0], vec![1.0, 0.0], vec![1.0; 99]] {
+                let n = wrong.len();
+                let (st, body) = call(
+                    &state,
+                    "POST",
+                    "/v2/namespaces/dim/query",
+                    Some(TOKEN_A),
+                    Some(json!({ "rank_by": ["vector", "ANN", wrong], "top_k": 2 })),
+                )
+                .await;
+                assert_eq!(
+                    st,
+                    StatusCode::BAD_REQUEST,
+                    "compacted={compacted}: a {n}-dim query on a 3-dim namespace gave {st}: {body}"
+                );
+            }
+            // The right size still works, either side of compaction.
+            let (st, _) = call(
+                &state,
+                "POST",
+                "/v2/namespaces/dim/query",
+                Some(TOKEN_A),
+                Some(json!({ "rank_by": ["vector", "ANN", [1.0, 0.0, 0.0]], "top_k": 2 })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "compacted={compacted}: a valid query was refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn error_kinds_decide_the_status_not_the_wording() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/k",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0] }] })),
+        )
+        .await;
+
+        // Recognised, deliberately not built: 501, and it must not read as a fault.
+        let (st, _) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/k/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["v", "Nonesuch", [1.0]], "top_k": 1 })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "unbuilt ranking function");
+
+        // Already there: 409, told apart from a server fault.
+        call(&state, "POST", "/v1/namespaces/k/branch/kb", Some(TOKEN_A), None).await;
+        let (st, _) = call(&state, "POST", "/v1/namespaces/k/branch/kb", Some(TOKEN_A), None).await;
+        assert_eq!(st, StatusCode::CONFLICT, "branching onto an existing namespace");
+
+        // Plain validation: 400 by default, with nothing on any keyword list.
+        let (st, _) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/k",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 2, "vector": [1.0, 0.0, 0.0] }] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "a dimension conflict on write");
+    }
+
+    #[tokio::test]
+    async fn idle_namespace_handles_are_evicted_and_come_back_intact() {
+        let state = test_state();
+        for i in 0..5 {
+            let (st, _) = call(
+                &state,
+                "POST",
+                &format!("/v2/namespaces/ev{i}"),
+                Some(TOKEN_A),
+                Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0], "t": "a" }] })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "seed write failed");
+        }
+        assert_eq!(state.resident.lock().unwrap().len(), 5);
+
+        // Nothing is idle yet, so nothing goes.
+        assert_eq!(state.evict_idle(Duration::from_secs(600)), 0, "evicted a live handle");
+
+        // A zero TTL makes everything idle.
+        assert_eq!(state.evict_idle(Duration::ZERO), 5);
+        assert!(state.resident.lock().unwrap().is_empty());
+
+        // The handle was cache, not truth: the data is still in object storage
+        // and a fresh handle with a fresh committer reaches it.
+        let (st, body) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/ev3/query",
+            Some(TOKEN_A),
+            Some(json!({ "rank_by": ["vector", "ANN", [1.0, 0.0]], "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["rows"][0]["id"], 1, "data did not survive eviction: {body}");
+
+        // And writing through the rebuilt committer still works.
+        let (st, _) = call(
+            &state,
+            "POST",
+            "/v2/namespaces/ev3",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 2, "vector": [0.0, 1.0], "t": "b" }] })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "write after eviction failed");
+    }
+
+    #[test]
+    fn the_idle_ttl_is_configurable_and_can_be_switched_off() {
+        // Serial: these mutate process environment.
+        let restore = std::env::var("FCKDB_RESIDENT_TTL_SECS").ok();
+        for (set, want) in [
+            (None, Some(RESIDENT_IDLE_TTL)),
+            (Some(""), Some(RESIDENT_IDLE_TTL)),
+            (Some("0"), None),
+            (Some("30"), Some(Duration::from_secs(30))),
+            (Some("banana"), Some(RESIDENT_IDLE_TTL)),
+        ] {
+            unsafe {
+                match set {
+                    Some(v) => std::env::set_var("FCKDB_RESIDENT_TTL_SECS", v),
+                    None => std::env::remove_var("FCKDB_RESIDENT_TTL_SECS"),
+                }
+            }
+            assert_eq!(resident_idle_ttl(), want, "FCKDB_RESIDENT_TTL_SECS={set:?}");
+        }
+        unsafe {
+            match restore {
+                Some(v) => std::env::set_var("FCKDB_RESIDENT_TTL_SECS", v),
+                None => std::env::remove_var("FCKDB_RESIDENT_TTL_SECS"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn eviction_never_takes_a_handle_someone_is_holding() {
+        // The one-committer-per-namespace invariant. If a handle in use were
+        // evicted, the next request would build a second committer for the same
+        // namespace and both would write it.
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/held",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0], "t": "a" }] })),
+        )
+        .await;
+
+        let in_flight = state.resident("acme", "held");
+        assert_eq!(state.evict_idle(Duration::ZERO), 0, "evicted a handle a request still holds");
+        assert_eq!(state.resident.lock().unwrap().len(), 1);
+
+        // Once the request is done with it, it can go.
+        drop(in_flight);
+        assert_eq!(state.evict_idle(Duration::ZERO), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_refreshes_its_namespace_against_eviction() {
+        let state = test_state();
+        call(
+            &state,
+            "POST",
+            "/v2/namespaces/warm",
+            Some(TOKEN_A),
+            Some(json!({ "upsert_rows": [{ "id": 1, "vector": [1.0, 0.0], "t": "a" }] })),
+        )
+        .await;
+        // Age it past any plausible TTL, then touch it.
+        for h in state.resident.lock().unwrap().values() {
+            h.last_used.store(0, Ordering::Relaxed);
+        }
+        drop(state.resident("acme", "warm"));
+        assert_eq!(
+            state.evict_idle(Duration::from_secs(600)),
+            0,
+            "a namespace touched just now was treated as idle"
+        );
     }
 
     #[tokio::test]
