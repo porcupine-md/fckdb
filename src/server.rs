@@ -347,6 +347,15 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+/// Whether a 5xx is something an operator should be woken for.
+///
+/// 501 means this build does not do that and 503 means not right now — both are
+/// answers to the caller, and neither becomes true or false because of anything
+/// happening inside the process. Only the rest are incidents.
+fn is_incident(status: StatusCode) -> bool {
+    !matches!(status, StatusCode::NOT_IMPLEMENTED | StatusCode::SERVICE_UNAVAILABLE)
+}
+
 fn bad(msg: impl Into<String>) -> AppError {
     AppError(StatusCode::BAD_REQUEST, msg.into())
 }
@@ -1137,7 +1146,26 @@ pub fn router(state: AppState) -> Router {
         // A 512 MB cap mirrors turbopuffer's upsert batch limit and keeps one
         // request from exhausting memory.
         .layer(DefaultBodyLimit::max(512 << 20))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // TraceLayer counts every 5xx as a failure and logs it at ERROR. Two of
+        // ours are not failures: 501 is "this build does not do that" and 503 is
+        // "not right now, retry". Both are answers. Logging them beside real
+        // faults is the same mistake `AppError` already avoids — and `AppError`
+        // has by this point logged each at the level it deserves, so passing
+        // them over here loses nothing.
+        .layer(tower_http::trace::TraceLayer::new_for_http().on_failure(
+            |class: tower_http::classify::ServerErrorsFailureClass,
+             latency: Duration,
+             _: &tracing::Span| {
+                use tower_http::classify::ServerErrorsFailureClass as Class;
+                match class {
+                    Class::StatusCode(s) if !is_incident(s) => {}
+                    Class::StatusCode(s) => {
+                        tracing::error!(status = %s, ?latency, "response failed")
+                    }
+                    Class::Error(e) => tracing::error!(error = %e, ?latency, "response failed"),
+                }
+            },
+        ))
         .with_state(state)
 }
 
@@ -2358,6 +2386,23 @@ mod tests {
         )
         .await;
         assert!(status.is_client_error(), "a bad sub-query was tolerated: {status}");
+    }
+
+    #[test]
+    fn refusals_are_not_incidents_but_faults_are() {
+        // TraceLayer counts every 5xx as a failure. Two of ours are answers, and
+        // logging them beside real faults is what teaches an operator to ignore
+        // the level that matters.
+        for s in [StatusCode::NOT_IMPLEMENTED, StatusCode::SERVICE_UNAVAILABLE] {
+            assert!(!is_incident(s), "{s} is a refusal, not an incident");
+        }
+        for s in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(is_incident(s), "{s} is a real fault and must still be logged");
+        }
     }
 
     #[tokio::test]
