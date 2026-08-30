@@ -180,6 +180,13 @@ fn truncate(s: &str) -> String {
     if s.len() <= 200 { s.to_string() } else { format!("{}…", &s[..200]) }
 }
 
+/// Everything past the "is it configured" check is the endpoint's failure, not
+/// the caller's and not ours: a refused request, a malformed response, a
+/// timeout. They differ in prose and not in what the client should do about it.
+fn upstream(e: anyhow::Error) -> anyhow::Error {
+    crate::error::kinded(crate::error::Kind::Upstream, format!("{e:#}"))
+}
+
 /// Embed one text, or explain why it cannot be done.
 pub async fn embed_one(
     embedder: Option<&Arc<dyn Embedder>>,
@@ -187,14 +194,17 @@ pub async fn embed_one(
     model: Option<&str>,
 ) -> Result<Vec<f32>> {
     let Some(embedder) = embedder else {
-        bail!(
+        return Err(crate::error::kinded(
+            crate::error::Kind::Unimplemented,
             "native embedding is not configured; set FCKDB_EMBED_URL to an \
-             OpenAI-compatible /v1/embeddings endpoint, or send a vector instead"
-        );
+             OpenAI-compatible /v1/embeddings endpoint, or send a vector instead",
+        ));
     };
     let batch = vec![text.to_string()];
-    let mut vectors = embedder.embed(&batch, model).await?;
-    vectors.pop().ok_or_else(|| anyhow::anyhow!("embedding endpoint returned nothing"))
+    let mut vectors = embedder.embed(&batch, model).await.map_err(upstream)?;
+    vectors
+        .pop()
+        .ok_or_else(|| crate::error::kinded(crate::error::Kind::Upstream, "embedding endpoint returned nothing"))
 }
 
 /// Embed a batch, or explain why it cannot be done.
@@ -207,12 +217,13 @@ pub async fn embed_many(
         return Ok(vec![]);
     }
     let Some(embedder) = embedder else {
-        bail!(
+        return Err(crate::error::kinded(
+            crate::error::Kind::Unimplemented,
             "native embedding is not configured; set FCKDB_EMBED_URL to an \
-             OpenAI-compatible /v1/embeddings endpoint, or send vectors instead"
-        );
+             OpenAI-compatible /v1/embeddings endpoint, or send vectors instead",
+        ));
     };
-    embedder.embed(texts, model).await
+    embedder.embed(texts, model).await.map_err(upstream)
 }
 
 #[cfg(test)]

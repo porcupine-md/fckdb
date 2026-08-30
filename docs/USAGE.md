@@ -35,6 +35,7 @@ and it needs no credentials.
 | `FCKDB_CACHE_PATH` / `FCKDB_CACHE_BYTES` | NVMe read cache. Unset means every query pays cold latency |
 | `FCKDB_EMBED_URL` / `_MODEL` / `_KEY` | OpenAI-compatible embeddings endpoint |
 | `FCKDB_PRICE_*` | override the R2 list prices used by `/metrics` |
+| `FCKDB_RESIDENT_TTL_SECS` | drop a namespace handle after this many idle seconds, default 600. `0` never drops one |
 
 **Leaving both token variables unset disables authentication**, and the server
 logs a warning saying so. Do not expose that port.

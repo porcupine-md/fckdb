@@ -133,17 +133,26 @@ pub fn frame(entries: &[Bytes]) -> Bytes {
     buf.freeze()
 }
 
+/// Split a stored blob back into records.
+///
+/// Every failure here is corruption of something this process wrote, so it is
+/// tagged as ours. Untagged it would inherit the caller-mistake default and tell
+/// a client their request was malformed when the truth is a damaged segment.
 pub fn unframe(blob: &Bytes) -> Result<Vec<Bytes>> {
+    let corrupt = |msg: String| crate::error::kinded(crate::error::Kind::Internal, msg);
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < blob.len() {
         let Some(hdr) = blob.get(pos..pos + 4) else {
-            bail!("truncated frame header at offset {pos}");
+            return Err(corrupt(format!("truncated frame header at offset {pos}")));
         };
         let len = u32::from_le_bytes(hdr.try_into().unwrap()) as usize;
         pos += 4;
         if pos + len > blob.len() {
-            bail!("truncated frame body at {pos}: want {len}, have {}", blob.len() - pos);
+            return Err(corrupt(format!(
+                "truncated frame body at {pos}: want {len}, have {}",
+                blob.len() - pos
+            )));
         }
         out.push(blob.slice(pos..pos + len));
         pos += len;
@@ -553,7 +562,14 @@ impl Namespace {
         unframe(&self.read_immutable(path).await?)
             .with_context(|| format!("unframing {path}"))?
             .iter()
-            .map(|b| Record::decode(b))
+            .map(|b| {
+                Record::decode(b).map_err(|e| {
+                    crate::error::kinded(
+                        crate::error::Kind::Internal,
+                        format!("decoding a record from {path}: {e:#}"),
+                    )
+                })
+            })
             .collect()
     }
 
@@ -869,15 +885,37 @@ impl Namespace {
             f.coerce(&m.schema.attributes)?;
         }
 
+        // Writes have always checked this; queries only did on the indexed path,
+        // so before a namespace was compacted a wrong-sized query vector was
+        // ranked against whatever prefix the two had in common. That returns a
+        // confident order computed from part of a vector, and a one-dimensional
+        // query could reproduce the correct answer exactly — right up until
+        // compaction turned the same request into an error. Checked once here,
+        // where the schema is already in hand, so brute force, the prefilter,
+        // the index and the WAL overlay cannot disagree about it.
+        if !req.vector.is_empty()
+            && let Some(dim) = m.schema.dim
+            && req.vector.len() != dim
+        {
+            bail!(
+                "query vector has {} dimensions, this namespace has {dim}",
+                req.vector.len()
+            );
+        }
+
         // Decide how much of the unindexed tail to read.
         let unindexed_total = m.unindexed_bytes();
         let (wal_entries, truncated) = m.wal_prefix_within(MAX_UNINDEXED_SCAN_BYTES);
         if truncated && req.consistency == Consistency::Strong {
-            bail!(
-                "unindexed WAL is {unindexed_total} bytes, over the {MAX_UNINDEXED_SCAN_BYTES} \
-                 byte scan cap; a strongly consistent answer is not available until compaction \
-                 catches up. Retry with eventual consistency or compact this namespace."
-            );
+            return Err(crate::error::kinded(
+                crate::error::Kind::Unavailable,
+                format!(
+                    "unindexed WAL is {unindexed_total} bytes, over the \
+                     {MAX_UNINDEXED_SCAN_BYTES} byte scan cap; a strongly consistent answer is \
+                     not available until compaction catches up. Retry with eventual consistency \
+                     or compact this namespace."
+                ),
+            ));
         }
         let wal_paths: Vec<Path> = wal_entries.iter().map(|e| self.wal_path(&e.name)).collect();
         let unindexed_records: usize = wal_entries.iter().map(|e| e.records as usize).sum();
@@ -1675,7 +1713,10 @@ impl Namespace {
     pub async fn branch(&self, dest_prefix: &str) -> Result<usize> {
         let (m, _) = self.load().await?;
         if self.store.head(&Path::from(format!("{dest_prefix}/manifest"))).await.is_ok() {
-            bail!("destination namespace {dest_prefix} already exists");
+            return Err(crate::error::kinded(
+                crate::error::Kind::Conflict,
+                format!("destination namespace {dest_prefix} already exists"),
+            ));
         }
 
         let objects: Vec<String> = m.referenced().into_iter().collect();
@@ -1982,7 +2023,11 @@ impl GroupCommit {
         self.tx
             .send((record, config, done))
             .map_err(|_| anyhow::anyhow!("committer stopped"))?;
-        wait.await.context("committer dropped the request")?.map_err(|e| anyhow::anyhow!(e))
+        wait.await
+            .map_err(|_| {
+                crate::error::kinded(crate::error::Kind::Internal, "committer dropped the request")
+            })?
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     pub async fn upsert(&self, doc: Doc) -> Result<u64> {
@@ -2013,7 +2058,15 @@ impl GroupCommit {
 
         let mut seq = 0;
         for w in waits {
-            seq = w.await.context("committer dropped a request")?.map_err(|e| anyhow::anyhow!(e))?;
+            seq = w
+                .await
+                .map_err(|_| {
+                    crate::error::kinded(
+                        crate::error::Kind::Internal,
+                        "committer dropped a request",
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
         Ok(seq)
     }
@@ -3477,6 +3530,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wrong_sized_query_vector_is_refused_before_and_after_compaction() {
+        // Writes always checked this; queries only did on the indexed path. So
+        // before compaction a wrong-sized query was ranked on the prefix the two
+        // lengths shared — and a 1-dim query returned the SAME top hit as the
+        // correct 3-dim one. Nothing looked wrong until compaction turned a
+        // request that had been "working" into an error.
+        let ns = ns("t/dims");
+        for i in 0..40u64 {
+            let f = i as f32;
+            ns.write_records(&[Record::Upsert(Doc::new(i, vec![f, 40.0 - f, 1.0]))])
+                .await
+                .unwrap();
+        }
+
+        for stage in ["uncompacted", "compacted"] {
+            if stage == "compacted" {
+                ns.compact(true).await.unwrap();
+            }
+            let right = ns.query(&QueryRequest::new(vec![1.0, 0.0, 0.0])).await;
+            assert!(right.is_ok(), "{stage}: a correctly sized query was refused");
+
+            for wrong in [vec![1.0], vec![1.0, 0.0], vec![1.0; 99]] {
+                let n = wrong.len();
+                let e = ns.query(&QueryRequest::new(wrong)).await.expect_err(&format!(
+                    "{stage}: a {n}-dim query on a 3-dim namespace was answered"
+                ));
+                assert!(
+                    format!("{e:#}").contains("dimensions"),
+                    "{stage}: unexpected error: {e:#}"
+                );
+                assert!(
+                    !crate::error::is_fault(&e),
+                    "{stage}: the caller's wrong-sized vector read as a server fault"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn strong_consistency_refuses_rather_than_lies() {
         let ns = ns("t/cliff");
         // Craft a manifest whose recorded tail exceeds the scan cap. Sizes live in
@@ -3511,6 +3603,11 @@ mod tests {
         let err = ns.query(&QueryRequest::new(vec![1.0; 4])).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("scan cap"), "unexpected error: {msg}");
+        assert_eq!(
+            crate::error::kind_of(&err),
+            Some(crate::error::Kind::Unavailable),
+            "the 503 now depends on the kind, not on the word \"cap\" surviving a reword"
+        );
 
         // Eventual tolerates it: the tail is dropped and the answer says so,
         // rather than the query failing outright.

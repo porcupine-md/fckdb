@@ -5,6 +5,7 @@ pub mod cache;
 pub mod compat;
 pub mod doc;
 pub mod embed;
+pub mod error;
 pub mod fts;
 pub mod index;
 pub mod ops;
