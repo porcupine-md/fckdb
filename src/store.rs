@@ -706,7 +706,10 @@ impl Namespace {
                 Err(e) => return Err(e.into()),
             }
         }
-        bail!("CAS contention: failed to commit after {MAX_CAS_ATTEMPTS} attempts")
+        Err(crate::error::kinded(
+            crate::error::Kind::Unavailable,
+            format!("CAS contention: failed to commit after {MAX_CAS_ATTEMPTS} attempts"),
+        ))
     }
 
     pub async fn append(&self, data: Bytes) -> Result<(u64, usize)> {
@@ -798,7 +801,10 @@ impl Namespace {
                 Err(e) => return Err(e.into()),
             }
         }
-        bail!("CAS contention: failed to commit after {MAX_CAS_ATTEMPTS} attempts")
+        Err(crate::error::kinded(
+            crate::error::Kind::Unavailable,
+            format!("CAS contention: failed to commit after {MAX_CAS_ATTEMPTS} attempts"),
+        ))
     }
 
     // ------------------------------------------------------------ reads
@@ -1374,7 +1380,10 @@ impl Namespace {
         for attempt in 1..=MAX_CAS_ATTEMPTS {
             let (mut current, version) = self.load().await?;
             if current.shards != consumed_shards {
-                bail!("another compaction committed concurrently; discarding this one");
+                return Err(crate::error::kinded(
+                    crate::error::Kind::Unavailable,
+                    "another compaction committed concurrently; discarding this one",
+                ));
             }
             // Keep WAL entries that arrived while we were compacting.
             current.wal.retain(|e| !consumed.contains(&e.name));
@@ -1418,7 +1427,10 @@ impl Namespace {
                 Err(e) => return Err(e.into()),
             }
         }
-        bail!("compaction could not commit after {MAX_CAS_ATTEMPTS} attempts")
+        Err(crate::error::kinded(
+            crate::error::Kind::Unavailable,
+            format!("compaction could not commit after {MAX_CAS_ATTEMPTS} attempts"),
+        ))
     }
 
     /// Write one shard's segment and indexes.
@@ -1951,7 +1963,7 @@ impl WriteConfig {
 /// Records rather than encoded bytes, because schema inference has to see the
 /// values before they are framed — and it has to see the whole coalesced batch,
 /// so two documents in one commit cannot disagree about a type.
-type Req = (Record, WriteConfig, oneshot::Sender<Result<u64, String>>);
+type Req = (Record, WriteConfig, oneshot::Sender<Result<u64, crate::error::Flat>>);
 
 /// Funnels every write for one namespace through a single committer.
 ///
@@ -2008,7 +2020,7 @@ impl GroupCommit {
                     a.fetch_add(*n, Ordering::Relaxed);
                 }
 
-                let reply = result.map(|(seq, _)| seq).map_err(|e| e.to_string());
+                let reply = result.map(|(seq, _)| seq).map_err(|e| crate::error::Flat::new(&e));
                 for (_, _, done) in waiters {
                     let _ = done.send(reply.clone());
                 }
@@ -2022,12 +2034,14 @@ impl GroupCommit {
         let (done, wait) = oneshot::channel();
         self.tx
             .send((record, config, done))
-            .map_err(|_| anyhow::anyhow!("committer stopped"))?;
+            .map_err(|_| {
+                crate::error::kinded(crate::error::Kind::Internal, "committer stopped")
+            })?;
         wait.await
             .map_err(|_| {
                 crate::error::kinded(crate::error::Kind::Internal, "committer dropped the request")
             })?
-            .map_err(|e| anyhow::anyhow!(e))
+            .map_err(crate::error::Flat::into_error)
     }
 
     pub async fn upsert(&self, doc: Doc) -> Result<u64> {
@@ -2051,7 +2065,9 @@ impl GroupCommit {
                 let (done, wait) = oneshot::channel();
                 self.tx
                     .send((r, config.clone(), done))
-                    .map_err(|_| anyhow::anyhow!("committer stopped"))?;
+                    .map_err(|_| {
+                        crate::error::kinded(crate::error::Kind::Internal, "committer stopped")
+                    })?;
                 Ok::<_, anyhow::Error>(wait)
             })
             .collect::<Result<_>>()?;
@@ -2066,7 +2082,7 @@ impl GroupCommit {
                         "committer dropped a request",
                     )
                 })?
-                .map_err(|e| anyhow::anyhow!(e))?;
+                .map_err(crate::error::Flat::into_error)?;
         }
         Ok(seq)
     }
@@ -3527,6 +3543,46 @@ mod tests {
         let (kept, truncated) = m.wal_prefix_within(10);
         assert!(truncated);
         assert!(kept.is_empty(), "an over-cap first entry must yield an empty prefix");
+    }
+
+    #[tokio::test]
+    async fn a_storage_failure_during_a_write_stays_a_fault() {
+        // The group committer hands one failure to every waiter in a batch, so it
+        // flattens the error to a string — which throws away the source type that
+        // says "storage broke" rather than "your request was wrong". Without the
+        // verdict travelling alongside, an outage reports 400 to every writer.
+        //
+        // A read-only directory is a real store that reads and cannot write, which
+        // is exactly the shape of an outage and needs no fake.
+        let dir = std::env::temp_dir().join(format!("fckdb-ro-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let ns = Arc::new(Namespace::new(store, "t/ro"));
+        let e = GroupCommit::new(ns)
+            .submit(Record::Upsert(Doc::new(1u64, vec![1.0, 0.0])), WriteConfig::default())
+            .await
+            .expect_err("a read-only store accepted a write");
+
+        // The type really is gone by now — that is the whole problem — so the
+        // only thing standing between an outage and a 400 is the carried verdict.
+        assert!(!crate::error::is_fault(&e), "flattening was expected to erase the type");
+        assert_eq!(
+            crate::error::kind_of(&e),
+            Some(crate::error::Kind::Internal),
+            "a storage failure came back looking like the caller's mistake: {e:#}"
+        );
+        assert!(format!("{e:#}").contains("Permission denied"), "the cause was lost: {e:#}");
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&dir, perms);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

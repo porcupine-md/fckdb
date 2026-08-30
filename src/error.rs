@@ -52,6 +52,35 @@ pub fn kinded(kind: Kind, msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(Kinded { kind, msg: msg.into() })
 }
 
+/// A failure flattened for transport, keeping the bit that decides its status.
+///
+/// `anyhow::Error` is neither `Clone` nor cheap to share, and the group committer
+/// has to hand one failure to every waiter in the batch — so it stringifies. That
+/// throws away the source type, which is precisely what tells a storage fault
+/// from a caller's mistake. Carrying the verdict alongside the message keeps the
+/// distinction across the channel.
+#[derive(Debug, Clone)]
+pub struct Flat {
+    pub kind: Option<Kind>,
+    pub fault: bool,
+    pub msg: String,
+}
+
+impl Flat {
+    pub fn new(e: &anyhow::Error) -> Self {
+        Self { kind: kind_of(e), fault: is_fault(e), msg: format!("{e:#}") }
+    }
+
+    pub fn into_error(self) -> anyhow::Error {
+        match self.kind {
+            Some(k) => kinded(k, self.msg),
+            // The type is gone, so say plainly what it told us.
+            None if self.fault => kinded(Kind::Internal, self.msg),
+            None => anyhow::anyhow!(self.msg),
+        }
+    }
+}
+
 /// The kind attached anywhere in the chain, if any.
 pub fn kind_of(e: &anyhow::Error) -> Option<Kind> {
     e.chain().find_map(|c| c.downcast_ref::<Kinded>()).map(|k| k.kind)
@@ -116,6 +145,27 @@ mod tests {
         let e = kinded(Kind::Internal, "committer dropped the request");
         assert!(!is_fault(&e), "RecvError is not a fault type");
         assert_eq!(kind_of(&e), Some(Kind::Internal));
+    }
+
+    #[test]
+    fn flattening_preserves_the_verdict_across_a_channel() {
+        // The committer stringifies, so without this a storage failure during a
+        // write would arrive indistinguishable from a caller's bad JSON.
+        let io = anyhow::Error::new(std::io::Error::other("connection reset"))
+            .context("PUT ns/x/wal/0001");
+        let back = Flat::new(&io).into_error();
+        assert!(
+            is_fault(&back) || kind_of(&back) == Some(Kind::Internal),
+            "a fault flattened to a string stopped looking like a fault"
+        );
+        assert!(back.to_string().contains("PUT ns/x/wal/0001"));
+
+        let mine = anyhow::anyhow!("document 9 has 999 dimensions");
+        let back = Flat::new(&mine).into_error();
+        assert!(!is_fault(&back) && kind_of(&back).is_none(), "a caller mistake became a fault");
+
+        let tagged = kinded(Kind::Unavailable, "CAS contention");
+        assert_eq!(kind_of(&Flat::new(&tagged).into_error()), Some(Kind::Unavailable));
     }
 
     #[test]
